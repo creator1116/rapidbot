@@ -16,11 +16,11 @@ Targets **Minecraft 26.3** (protocol 777).
 | `rapidbot-protocol` | Framing, compression, encryption, packet IDs, packets, async connection |
 | `rapidbot-world` | Block data extracted from the jar, chunk storage, vanilla-exact block collision |
 | `rapidbot-physics` | Player movement ported from vanilla: input, travel, collision, step-up, ground state |
-| `rapidbot-human` | Human input models: mouse strokes, reaction times, fatigue |
+| `rapidbot-human` | Input models: mouse strokes, response delays, fatigue |
 | `rapidbot-auth` | Microsoft login (device code), Xbox/XSTS, Minecraft token and profile, chat keys, session join |
 | `rapidbot` | The crate to depend on: re-exports the public API and a prelude |
 | `rapidbot-recorder` | Records your own mouse and game-key input while you play, and fits a mouse profile to it |
-| `rapidbot-client` | Address resolution, login, then a vanilla-style main thread (frames, ticks, packet queue) running configuration and play; `Controller` trait for bot logic, route finding and a human walker that follows routes, macro-check detection |
+| `rapidbot-client` | Address resolution, login, then a vanilla-style main thread (frames, ticks, packet queue) running configuration and play; `Controller` trait for bot logic, route finding, modeled input, and server-event heuristics |
 
 ## Documentation
 
@@ -43,7 +43,7 @@ struct MyLogic { walker: Walker }
 impl Controller for MyLogic {
     fn tick(&mut self, ctx: &mut TickContext<'_>) {
         // Called once per client tick. Say where to look and what to hold;
-        // the human models and vanilla physics do the rest.
+        // input models and vanilla physics do the rest.
         if self.walker.arrived() {
             self.walker.go_to(Vec3::new(100.0, 64.0, -20.0));
         }
@@ -56,7 +56,7 @@ let config = ClientConfig::new("play.example.net", Account::Offline { name: "Ste
 let mut bot = Bot::spawn(config, MyLogic { walker: Walker::new(1) });
 while let Some(event) = bot.next_event().await {
     match event {
-        BotEvent::Loaded => bot.chat("/home"), // typed at human speed
+        BotEvent::Loaded => bot.chat("/home"), // uses modeled keystroke timing
         BotEvent::Chat { name, text, .. } => println!("<{name:?}> {text}"),
         BotEvent::Check(check) if check.severity > 0.7 => bot.disconnect(),
         _ => {}
@@ -66,7 +66,7 @@ while let Some(event) = bot.next_event().await {
 ```
 
 The walker plans a route (around walls, up steps, down drops, clear of
-lava) and walks it like a person. `ctx.chat(..)` types from inside a
+lava) and follows it using modeled input. `ctx.chat(..)` types from inside a
 controller. `ctx.inventory` is what the player carries and wears (a jump in
 mid-air opens a worn elytra), `ctx.select_slot(n)` presses a hotbar key and
 `ctx.close_container()` closes a screen the server opened. `ctx.crosshair` is
@@ -75,8 +75,8 @@ button, which digs that block at exactly the vanilla speed for the held tool
 (`interact::aim_point` finds where to look to hit a given block).
 `ctx.entities` is every entity where the client shows it, `ctx.target` the
 one under the crosshair, and `ctx.click_attack()` clicks on it;
-`combat::Fighter` does the aiming, approaching and timing of a fight the way
-a person would (see the `fight` example).
+`combat::Fighter` provides aim, approach, and attack-timing behavior (see
+the `fight` example).
 
 Server resource packs are declined by default. Set
 `config.resource_packs = ResourcePackPolicy::Accept` to answer the prompt
@@ -97,7 +97,7 @@ python tools/gen_clip_vectors.py 26.3  # regenerate ray cast test vectors
 cargo test --workspace
 cargo run -p rapidbot-protocol --example ping -- localhost 25565
 cargo run --release -p rapidbot-client --example join -- localhost:25565 Steve   # offline-mode server, idles
-cargo run --release -p rapidbot-client --example walk -- localhost:25565 Walker  # wanders like a person, reports checks
+cargo run --release -p rapidbot-client --example walk -- localhost:25565 Walker  # uses route finding and reports server-event signals
 cargo run --release -p rapidbot-client --example chat -- localhost:25565 Walker "hello" "/msg Walker hi"  # types lines into chat
 cargo run --release -p rapidbot-client --example course -- localhost:25565 Walker 130  # walks +x through water, ladders; glides when wearing an elytra
 cargo run --release -p rapidbot-client --example dig -- localhost:25565 Walker 62 150 60  # digs the listed blocks

@@ -31,9 +31,9 @@ client. Most of the review effort goes into checking that.
    per-frame vs per-tick work, the order of steps in `Minecraft.tick`, one
    TCP write per vanilla flush.
 5. **Two layers, kept apart.** *Vanilla-exact* code is what the client does:
-   ported, cited, pinned. *Human* code (`crates/human`, `nav.rs`,
-   `combat.rs`) is how a person drives it. Bot logic goes through the human
-   layer: aim with `TickContext::aim`, press keys with `set_keys`.
+   ported, cited, pinned. *Input modeling* code (`crates/human`, `nav.rs`,
+   `combat.rs`) converts intent into timed input. Bot logic uses that layer:
+   aim with `TickContext::aim`, press keys with `set_keys`.
 6. **No Azalea or mineflayer code.** The project is from scratch on purpose.
 7. **It is a framework.** Anything a user needs must be reachable from the
    `rapidbot` crate. Examples demonstrate; they do not hold logic.
@@ -52,19 +52,20 @@ cargo build --release --workspace --examples
 - Keep commits focused; say in the message which vanilla behaviour changed.
 - If you add or change something a server can observe, say in the pull
   request which vanilla source it follows and how you checked it.
-- Live-test movement and interaction changes on a local server when you can
-  ([docs/testing.md](docs/testing.md)).
+- Live-test movement and interaction changes on a server you operate or have
+  permission to test ([docs/testing.md](docs/testing.md)).
 
 ## Reporting bugs
 
 The most useful report says what the vanilla client does, what rapidbot does
-instead, and how you saw the difference (a packet capture, a server log, an
-anticheat message). Include the Minecraft and server versions.
+instead, and how you saw the difference (a packet capture, a server log, or
+an alert from a server-side movement validator). Include the Minecraft and
+server versions.
 
 ## Use
 
 Run bots only on servers where you are allowed to. Do not open issues asking
-for help getting around a specific server's rules.
+for help bypassing a server's rules or enforcement.
 
 ## Licence
 

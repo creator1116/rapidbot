@@ -79,9 +79,10 @@ exactly (`crates/world/tests/items.rs`).
 When that is not practical, pin hand-derived values in a unit test and say
 where they come from.
 
-## The human layer is separate
+## Input modeling is separate
 
-If what you are writing is "how a person would do it" rather than "what the
-client does", it belongs in `crates/human` or the client's `nav.rs` /
-`combat.rs`, is not cited to vanilla, and should take its randomness from the
-bot's seeded `Noise` so each account behaves consistently.
+If what you are writing describes modeled input (mouse movement, key timing,
+or navigation) rather than vanilla client behavior, it belongs in
+`crates/human` or the client's `nav.rs` / `combat.rs`. It is not cited to
+vanilla, and should take its randomness from the bot's seeded `Noise` so
+each account behaves consistently.

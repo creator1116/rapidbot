@@ -1,0 +1,10 @@
+[package]
+name = "rapidbot-human"
+description = "Human input models: mouse movement, reaction times, fatigue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rand.workspace = true
+serde.workspace = true

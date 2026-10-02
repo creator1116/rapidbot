@@ -1,0 +1,19 @@
+[package]
+name = "rapidbot"
+description = "Headless Minecraft bots that behave like the vanilla client and the person using it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidbot-auth.workspace = true
+rapidbot-client.workspace = true
+rapidbot-human.workspace = true
+rapidbot-physics.workspace = true
+rapidbot-protocol.workspace = true
+rapidbot-world.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

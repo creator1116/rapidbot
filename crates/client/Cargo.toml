@@ -1,0 +1,31 @@
+[package]
+name = "rapidbot-client"
+description = "The bot client: connection lifecycle, login, configuration and play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidbot-auth.workspace = true
+rapidbot-buf.workspace = true
+rapidbot-human.workspace = true
+rapidbot-nbt.workspace = true
+rapidbot-physics.workspace = true
+rapidbot-protocol.workspace = true
+rapidbot-world.workspace = true
+hickory-resolver.workspace = true
+md-5.workspace = true
+rand.workspace = true
+rsa.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

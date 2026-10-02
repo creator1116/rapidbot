@@ -1,0 +1,11 @@
+[package]
+name = "rapidbot-buf"
+description = "Minecraft wire types: VarInt, strings, UUIDs and the Encode/Decode traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidbot-buf-derive.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

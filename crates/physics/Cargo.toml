@@ -1,0 +1,9 @@
+[package]
+name = "rapidbot-physics"
+description = "Vanilla player movement: input, travel, collision, step-up, ground state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidbot-world.workspace = true

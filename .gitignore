@@ -1,0 +1,13 @@
+/target
+# Mojang jars, generated reports and decompiled source: reference only, never commit.
+/vanilla
+
+# Cached Microsoft/Minecraft credentials.
+/accounts
+
+# Private notes: a separate repository checked out here.
+/internal
+/CLAUDE.md
+
+/logs
+/.idea

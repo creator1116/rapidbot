@@ -1,0 +1,9 @@
+[package]
+name = "rapidbot-nbt"
+description = "Network NBT with Java's modified UTF-8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidbot-buf.workspace = true

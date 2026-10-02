@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+rapidbot = { path = "crates/rapidbot" }
+rapidbot-auth = { path = "crates/auth" }
+rapidbot-buf = { path = "crates/buf" }
+rapidbot-client = { path = "crates/client" }
+rapidbot-human = { path = "crates/human" }
+rapidbot-buf-derive = { path = "crates/buf-derive" }
+rapidbot-nbt = { path = "crates/nbt" }
+rapidbot-physics = { path = "crates/physics" }
+rapidbot-protocol = { path = "crates/protocol" }
+rapidbot-world = { path = "crates/world" }
+
+aes = "0.8"
+base64 = "0.22"
+cfb8 = "0.8"
+# Stock zlib rather than miniz_oxide: vanilla compresses with java.util.zip
+# (zlib, default level), and the compressed bytes are visible to the server.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+hickory-resolver = "0.25"
+md-5 = "0.10"
+proc-macro2 = "1"
+quote = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rsa = { version = "0.9", features = ["sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+syn = { version = "2", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+url = "2"
+webpki-roots = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# Dependencies (zlib especially) are too slow unoptimised: a debug build
+# stalls the main thread while chunks stream in, which skews tick timing.
+[profile.dev.package."*"]
+opt-level = 3

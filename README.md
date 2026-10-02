@@ -114,5 +114,5 @@ write our own implementation, and never commit anything under `vanilla/`.
 
 ## Use and licence
 
-Run bots only on servers where you are allowed to. MIT licensed: see
-[LICENSE](LICENSE).
+Run bots only on servers where you are allowed to. See the
+[Code of Conduct](CODE_OF_CONDUCT.md). MIT licensed: see [LICENSE](LICENSE).

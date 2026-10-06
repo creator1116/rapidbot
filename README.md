@@ -20,7 +20,7 @@ Targets **Minecraft 26.3** (protocol 777).
 | `rapidbot-auth` | Microsoft login (device code), Xbox/XSTS, Minecraft token and profile, chat keys, session join |
 | `rapidbot` | The crate to depend on: re-exports the public API and a prelude |
 | `rapidbot-recorder` | Records your own mouse and game-key input while you play, and fits a mouse profile to it |
-| `rapidbot-client` | Address resolution, login, then a vanilla-style main thread (frames, ticks, packet queue) running configuration and play; `Controller` trait for bot logic, route finding, modeled input, and server-event heuristics |
+| `rapidbot-client` | Address resolution, login, then a vanilla-style main thread (frames, ticks, packet queue) running configuration and play; `Controller` trait, route finding, modeled input, and player/entity state |
 
 ## Documentation
 
@@ -58,7 +58,6 @@ while let Some(event) = bot.next_event().await {
     match event {
         BotEvent::Loaded => bot.chat("/home"), // uses modeled keystroke timing
         BotEvent::Chat { name, text, .. } => println!("<{name:?}> {text}"),
-        BotEvent::Check(check) if check.severity > 0.7 => bot.disconnect(),
         _ => {}
     }
 }
@@ -97,7 +96,7 @@ python tools/gen_clip_vectors.py 26.3  # regenerate ray cast test vectors
 cargo test --workspace
 cargo run -p rapidbot-protocol --example ping -- localhost 25565
 cargo run --release -p rapidbot-client --example join -- localhost:25565 Steve   # offline-mode server, idles
-cargo run --release -p rapidbot-client --example walk -- localhost:25565 Walker  # uses route finding and reports server-event signals
+cargo run --release -p rapidbot-client --example walk -- localhost:25565 Walker  # uses route finding
 cargo run --release -p rapidbot-client --example chat -- localhost:25565 Walker "hello" "/msg Walker hi"  # types lines into chat
 cargo run --release -p rapidbot-client --example course -- localhost:25565 Walker 130  # walks +x through water, ladders; glides when wearing an elytra
 cargo run --release -p rapidbot-client --example dig -- localhost:25565 Walker 62 150 60  # digs the listed blocks

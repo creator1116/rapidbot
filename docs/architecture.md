@@ -65,7 +65,7 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `packs.rs` | Resource pack prompt, download and status packets |
 | `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
 | `combat.rs` | Target approach, aiming, and attack timing |
-| `checks.rs` | Scores selected server-originated events, such as forced rotations, teleports, inventory changes, and nearby player entities; it does not identify player roles |
+| `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
 
 ## Generated data
 

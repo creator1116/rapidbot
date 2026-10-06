@@ -5,8 +5,6 @@ use rapidbot_physics::math::{self, Vec3};
 use rapidbot_physics::{Keys, Player};
 use rapidbot_world::World;
 
-use crate::checks::CheckEvent;
-
 /// Called once per client tick at the point where vanilla handles key
 /// bindings: after the connection tick, before the player moves. Only
 /// called once the client has loaded into the world (until then vanilla
@@ -21,12 +19,7 @@ pub struct TickContext<'a> {
     pub world: &'a World,
     /// Ticks since the client loaded.
     pub tick: u64,
-    /// Things that happened since the last tick that look like a server or
-    /// staff member testing for a macro. See [`crate::checks`].
-    pub events: &'a [CheckEvent],
-    /// Overall concern from recent events, 0 to 1, fading over minutes.
-    pub suspicion: f32,
-    /// Other players within 32 blocks, nearest first.
+    /// Tracked player entities within 32 blocks, nearest first.
     pub players: &'a [crate::entities::NearbyPlayer],
     /// True while the chat box is open (a line is being typed): keys and
     /// mouse do nothing until it is sent.
@@ -46,7 +39,9 @@ pub struct TickContext<'a> {
     pub attack_strength: f32,
     /// The block being broken and its progress, 0 to 1.
     pub breaking: Option<((i32, i32, i32), f32)>,
-    pub(crate) own_id: i32,
+    /// The local player's entity ID, usable with [`crate::entities::Entities`]
+    /// queries such as `players_near`.
+    pub own_id: i32,
     pub(crate) tags: &'a rapidbot_world::tags::Tags,
     pub(crate) actions: &'a mut Actions,
     pub(crate) aim: &'a mut Option<Aim>,
@@ -92,7 +87,15 @@ impl TickContext<'_> {
     /// of the way up its box (0 feet, 1 top). `None` when it cannot be hit
     /// from here: too far, or something in the way.
     pub fn entity_aim_point(&self, id: i32, height: f64) -> Option<Vec3> {
-        crate::interact::entity_aim_point(self.player, self.world, self.entities, self.own_id, self.tags, id, height)
+        crate::interact::entity_aim_point(
+            self.player,
+            self.world,
+            self.entities,
+            self.own_id,
+            self.tags,
+            id,
+            height,
+        )
     }
 
     /// Closes the container screen the server opened (Escape), after the
@@ -125,7 +128,11 @@ impl TickContext<'_> {
     /// following frames (reaction time, a stroke, corrections). `tolerance`
     /// is how many degrees off is good enough.
     pub fn aim(&mut self, yaw: f32, pitch: f32, tolerance: f32) {
-        *self.aim = Some(Aim { yaw, pitch, tolerance });
+        *self.aim = Some(Aim {
+            yaw,
+            pitch,
+            tolerance,
+        });
     }
 
     /// Aims at a point in the world, from the player's eyes.

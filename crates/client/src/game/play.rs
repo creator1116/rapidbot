@@ -2,10 +2,10 @@
 
 use rand::Rng;
 use rapidbot_buf::{ByteArray, Decode, VarInt};
-use rapidbot_protocol::ids::play::clientbound as ids;
-use rapidbot_protocol::packets::play::{GameType, clientbound as cb, serverbound as sb};
 use rapidbot_physics::attributes::Operation;
 use rapidbot_physics::math::Vec3;
+use rapidbot_protocol::ids::play::clientbound as ids;
+use rapidbot_protocol::packets::play::{GameType, clientbound as cb, serverbound as sb};
 use rapidbot_protocol::{Packet, RawPacket, State};
 use rapidbot_world::chunk::Chunk;
 use rapidbot_world::tags::Tags;
@@ -22,12 +22,20 @@ const CLIENT_WAIT_TIMEOUT_MS: i64 = 30_000;
 /// `LevelLoadTracker.ClientState`.
 #[derive(Debug, Clone, Copy)]
 enum LoadState {
-    WaitingForServer { timeout_after: i64 },
+    WaitingForServer {
+        timeout_after: i64,
+    },
     /// Waiting for the render section around the camera to be compiled.
     /// That needs the camera's chunk and its neighbours, then a frame or two
     /// on the render thread; `ready_in_frames` models the latter.
-    WaitingForPlayerChunk { timeout_after: i64, ready_in_frames: Option<u32>, section_ready: bool },
-    Ready { ready_at: i64 },
+    WaitingForPlayerChunk {
+        timeout_after: i64,
+        ready_in_frames: Option<u32>,
+        section_ready: bool,
+    },
+    Ready {
+        ready_at: i64,
+    },
 }
 
 pub(super) struct PlayState {
@@ -56,9 +64,6 @@ pub(super) struct PlayState {
     chat: crate::chat::ChatState,
     /// The server's command tree, for telling which commands get signed.
     commands: crate::commands::CommandTree,
-    /// When we last sent a command: the server's reply to it is expected,
-    /// not a sign of being tested.
-    last_command: Option<std::time::Instant>,
     pub inventory: crate::inventory::Inventory,
     /// `MultiPlayerGameMode.carriedIndex`: the selected slot the server
     /// knows about.
@@ -67,15 +72,21 @@ pub(super) struct PlayState {
 }
 
 impl PlayState {
-    fn new(login: &cb::Login, chat_keys: Option<&rapidbot_auth::ChatKeys>, session: &SessionData) -> Self {
+    fn new(
+        login: &cb::Login,
+        chat_keys: Option<&rapidbot_auth::ChatKeys>,
+        session: &SessionData,
+    ) -> Self {
         // handleLogin: `if (packet.onlineMode()) this.prepareKeyPair();`
         let mut chat = crate::chat::ChatState::new();
         let pending_chat_session = chat_keys.filter(|_| login.online_mode).and_then(|keys| {
             let profile = session.profile.as_ref()?.id;
-            let session_id = chat.start_session(profile, &keys.private_key_pem).or_else(|| {
-                warn!("could not read the chat signing key; chat will be unsigned");
-                None
-            })?;
+            let session_id = chat
+                .start_session(profile, &keys.private_key_pem)
+                .or_else(|| {
+                    warn!("could not read the chat signing key; chat will be unsigned");
+                    None
+                })?;
             Some(sb::ChatSessionUpdate {
                 session_id,
                 expires_at: keys.expires_at,
@@ -108,7 +119,6 @@ impl PlayState {
             pending_chat_session,
             chat,
             commands: Default::default(),
-            last_command: None,
             inventory: Default::default(),
             carried_index: 0,
             game_mode: crate::interact::GameMode::new(),
@@ -126,7 +136,6 @@ impl PlayState {
             .map_or(0, |d| d.as_millis() as i64);
         let outgoing = match line.strip_prefix('/') {
             Some(command) => {
-                self.last_command = Some(std::time::Instant::now());
                 let signable = self.commands.signable_arguments(command);
                 self.chat.command(command, &signable, now)
             }
@@ -142,14 +151,32 @@ impl PlayState {
 
     /// `startWaitingForNewLevel` → `LevelLoadTracker.startClientLoad`.
     fn start_waiting_for_new_level(&mut self) {
-        self.load = Some(LoadState::WaitingForServer { timeout_after: clock::millis() + CLIENT_WAIT_TIMEOUT_MS });
+        self.load = Some(LoadState::WaitingForServer {
+            timeout_after: clock::millis() + CLIENT_WAIT_TIMEOUT_MS,
+        });
     }
 
     /// `ClientPacketListener.tick`: chat session, then level loading.
     /// Returns true on the tick the client becomes loaded.
     /// `Minecraft.pick` and the attack button's share of `handleKeybinds`.
-    pub fn attack_button(&mut self, net: &PacketSender, clicks: u32, down: bool, hit: &crate::interact::Pick) {
-        let Self { player, world, inventory, entities, tags, game_mode, carried_index, game_type, .. } = self;
+    pub fn attack_button(
+        &mut self,
+        net: &PacketSender,
+        clicks: u32,
+        down: bool,
+        hit: &crate::interact::Pick,
+    ) {
+        let Self {
+            player,
+            world,
+            inventory,
+            entities,
+            tags,
+            game_mode,
+            carried_index,
+            game_type,
+            ..
+        } = self;
         let mut hands = crate::interact::Hands {
             player: &mut player.physics,
             world,
@@ -165,7 +192,9 @@ impl PlayState {
             // ensureHasSentCarriedItem()
             if selected != *carried_index {
                 *carried_index = selected;
-                net.send(&sb::SetCarriedItem { slot: selected as i16 });
+                net.send(&sb::SetCarriedItem {
+                    slot: selected as i16,
+                });
             }
         });
     }
@@ -174,7 +203,9 @@ impl PlayState {
         // gameMode.tick() starts with ensureHasSentCarriedItem().
         if self.inventory.selected != self.carried_index {
             self.carried_index = self.inventory.selected;
-            net.send(&sb::SetCarriedItem { slot: self.carried_index as i16 });
+            net.send(&sb::SetCarriedItem {
+                slot: self.carried_index as i16,
+            });
         }
         if let Some(session) = self.pending_chat_session.take() {
             debug!("sending chat session");
@@ -184,7 +215,11 @@ impl PlayState {
         let now = clock::millis();
         // tickClientLoad()
         let load = match load {
-            LoadState::WaitingForPlayerChunk { timeout_after, section_ready, .. } => {
+            LoadState::WaitingForPlayerChunk {
+                timeout_after,
+                section_ready,
+                ..
+            } => {
                 if now > timeout_after {
                     warn!("timed out waiting for the player's chunk, loading anyway");
                     LoadState::Ready { ready_at: now }
@@ -214,13 +249,21 @@ impl PlayState {
 
     /// Render-thread work that happens once per frame.
     pub fn on_frame(&mut self) {
-        let Some(LoadState::WaitingForPlayerChunk { timeout_after, ready_in_frames, section_ready: false }) = self.load
+        let Some(LoadState::WaitingForPlayerChunk {
+            timeout_after,
+            ready_in_frames,
+            section_ready: false,
+        }) = self.load
         else {
             return;
         };
         let ready_in_frames = match ready_in_frames {
             Some(0) => {
-                self.load = Some(LoadState::WaitingForPlayerChunk { timeout_after, ready_in_frames: None, section_ready: true });
+                self.load = Some(LoadState::WaitingForPlayerChunk {
+                    timeout_after,
+                    ready_in_frames: None,
+                    section_ready: true,
+                });
                 return;
             }
             Some(n) => Some(n - 1),
@@ -229,7 +272,11 @@ impl PlayState {
             None if self.camera_neighbourhood_loaded() => Some(rand::thread_rng().gen_range(1..=3)),
             None => None,
         };
-        self.load = Some(LoadState::WaitingForPlayerChunk { timeout_after, ready_in_frames, section_ready: false });
+        self.load = Some(LoadState::WaitingForPlayerChunk {
+            timeout_after,
+            ready_in_frames,
+            section_ready: false,
+        });
     }
 
     fn camera_neighbourhood_loaded(&self) -> bool {
@@ -251,14 +298,17 @@ impl Game {
                     "joined level"
                 );
                 let play = PlayState::new(&login, self.config.account.chat_keys(), &self.session);
-                self.checks = crate::checks::CheckMonitor::new(self.config.account.name());
                 self.key_intent = Default::default();
                 self.link.emit(crate::BotEvent::Spawned {
                     entity_id: login.player_id,
                     dimension: login.spawn.dimension.to_string(),
                 });
                 self.aim = None;
-                debug!(min_y = play.world.height.min_y, height = play.world.height.height, "dimension");
+                debug!(
+                    min_y = play.world.height.min_y,
+                    height = play.world.height.height,
+                    "dimension"
+                );
                 self.play = Some(play);
             }
             cb::Ping::ID => {
@@ -268,16 +318,9 @@ impl Game {
             cb::PlayerPosition::ID => {
                 let pos = packet.decode::<cb::PlayerPosition>()?;
                 let play = play_mut(&mut self.play)?;
-                let before = (play.player.physics.pos, play.player.physics.y_rot, play.player.physics.x_rot);
                 play.player.apply_teleport(&pos.change, pos.relatives);
                 play.game_mode.on_teleport(&self.net);
                 let p = &play.player.physics;
-                if play.client_loaded {
-                    let yaw_change = crate::math::wrap_degrees(p.y_rot - before.1);
-                    if self.checks.teleport(before.0, p.pos, yaw_change, p.x_rot - before.2) {
-                        self.mouse.disturb();
-                    }
-                }
                 debug!(
                     x = p.pos.x,
                     y = p.pos.y,
@@ -300,20 +343,26 @@ impl Game {
             cb::PlayerRotation::ID => {
                 let rot = packet.decode::<cb::PlayerRotation>()?;
                 let play = play_mut(&mut self.play)?;
-                let loaded = play.client_loaded;
                 let p = &mut play.player.physics;
-                let before = (p.y_rot, p.x_rot);
-                p.y_rot = if rot.relative_y { p.y_rot + rot.y_rot } else { rot.y_rot };
+                p.y_rot = if rot.relative_y {
+                    p.y_rot + rot.y_rot
+                } else {
+                    rot.y_rot
+                };
                 p.x_rot = crate::math::clamp_f32(
-                    if rot.relative_x { p.x_rot + rot.x_rot } else { rot.x_rot },
+                    if rot.relative_x {
+                        p.x_rot + rot.x_rot
+                    } else {
+                        rot.x_rot
+                    },
                     -90.0,
                     90.0,
                 );
-                self.net.send(&sb::MovePlayerRot { y_rot: p.y_rot, x_rot: p.x_rot, flags: 0 });
-                if loaded {
-                    self.checks.forced_rotation(crate::math::wrap_degrees(p.y_rot - before.0), p.x_rot - before.1);
-                    self.mouse.disturb();
-                }
+                self.net.send(&sb::MovePlayerRot {
+                    y_rot: p.y_rot,
+                    x_rot: p.x_rot,
+                    flags: 0,
+                });
             }
             cb::GameEvent::ID => {
                 let event = packet.decode::<cb::GameEvent>()?;
@@ -332,9 +381,6 @@ impl Game {
                         let mut id: &[u8] = &[event.param as u8];
                         play.game_type = GameType::decode(&mut id)?;
                         play.player.physics.spectator = play.game_type == GameType::Spectator;
-                        if play.client_loaded {
-                            self.checks.game_mode_changed();
-                        }
                     }
                     _ => {}
                 }
@@ -342,31 +388,37 @@ impl Game {
             cb::LevelChunkWithLight::ID => {
                 let packet = packet.decode::<cb::LevelChunkWithLight>()?;
                 let play = play_mut(&mut self.play)?;
-                let chunk = Chunk::read_packet(&packet.data.0, Registry::get().state_count(), play.biome_count)?;
+                let chunk = Chunk::read_packet(
+                    &packet.data.0,
+                    Registry::get().state_count(),
+                    play.biome_count,
+                )?;
                 play.world.insert_chunk(packet.x, packet.z, chunk);
             }
             cb::ForgetLevelChunk::ID => {
                 let forget = packet.decode::<cb::ForgetLevelChunk>()?;
-                play_mut(&mut self.play)?.world.remove_chunk(forget.x(), forget.z());
+                play_mut(&mut self.play)?
+                    .world
+                    .remove_chunk(forget.x(), forget.z());
             }
             cb::BlockUpdate::ID => {
                 let update = packet.decode::<cb::BlockUpdate>()?;
                 let (x, y, z) = rapidbot_world::unpack_block_pos(update.pos);
                 let play = play_mut(&mut self.play)?;
-                let changed = play.world.block_state(x, y, z) != Some(update.state as u32);
                 // setServerVerifiedBlockState: a predicted block waits for its ack.
                 let ours = play.game_mode.server_block((x, y, z), update.state as u32);
                 if !ours {
                     play.world.set_block_state(x, y, z, update.state as u32);
                 }
-                if play.client_loaded && !ours {
-                    self.checks.block_changed((x, y, z), play.player.physics.pos, changed);
-                }
             }
             cb::BlockChangedAck::ID => {
                 let sequence = packet.decode::<cb::BlockChangedAck>()?.sequence;
                 let play = play_mut(&mut self.play)?;
-                play.game_mode.block_changed_ack(sequence, &mut play.world, &mut play.player.physics);
+                play.game_mode.block_changed_ack(
+                    sequence,
+                    &mut play.world,
+                    &mut play.player.physics,
+                );
             }
             cb::SectionBlocksUpdate::ID => {
                 let update = packet.decode::<cb::SectionBlocksUpdate>()?;
@@ -378,15 +430,11 @@ impl Game {
                     let rel = (v & 0xfff) as i32;
                     let (x, z, y) = (rel >> 8 & 15, rel >> 4 & 15, rel & 15);
                     let pos = (sx * 16 + x, sy * 16 + y, sz * 16 + z);
-                    let changed = play.world.block_state(pos.0, pos.1, pos.2) != Some(state);
                     if play.game_mode.server_block(pos, state) {
                         // Our own predicted change coming back.
                         continue;
                     }
                     play.world.set_block_state(pos.0, pos.1, pos.2, state);
-                    if play.client_loaded {
-                        self.checks.block_changed(pos, play.player.physics.pos, changed);
-                    }
                 }
             }
             cb::UpdateAttributes::ID => {
@@ -395,11 +443,18 @@ impl Game {
                 if update.entity_id != play.player.id {
                     // Of other entities only the size matters to us.
                     for snapshot in update.attributes {
-                        let Some(info) = Registry::get().attribute(snapshot.attribute as u32) else { continue };
+                        let Some(info) = Registry::get().attribute(snapshot.attribute as u32)
+                        else {
+                            continue;
+                        };
                         if info.name != "minecraft:scale" {
                             continue;
                         }
-                        let mut instance = rapidbot_physics::attributes::Instance::new(snapshot.base, info.min, info.max);
+                        let mut instance = rapidbot_physics::attributes::Instance::new(
+                            snapshot.base,
+                            info.min,
+                            info.max,
+                        );
                         for m in &snapshot.modifiers {
                             if let Some(op) = Operation::from_id(m.operation) {
                                 instance.add_modifier(&m.id.normalized(), m.amount, op);
@@ -409,13 +464,26 @@ impl Game {
                     }
                 } else {
                     for snapshot in update.attributes {
-                        let Some(info) = Registry::get().attribute(snapshot.attribute as u32) else { continue };
+                        let Some(info) = Registry::get().attribute(snapshot.attribute as u32)
+                        else {
+                            continue;
+                        };
                         let modifiers: Vec<(String, f64, Operation)> = snapshot
                             .modifiers
                             .into_iter()
-                            .filter_map(|m| Some((m.id.normalized().into_owned(), m.amount, Operation::from_id(m.operation)?)))
+                            .filter_map(|m| {
+                                Some((
+                                    m.id.normalized().into_owned(),
+                                    m.amount,
+                                    Operation::from_id(m.operation)?,
+                                ))
+                            })
                             .collect();
-                        play.player.physics.attributes.apply_snapshot(&info.name, snapshot.base, &modifiers);
+                        play.player.physics.attributes.apply_snapshot(
+                            &info.name,
+                            snapshot.base,
+                            &modifiers,
+                        );
                     }
                 }
             }
@@ -423,12 +491,8 @@ impl Game {
                 let a = packet.decode::<cb::PlayerAbilities>()?;
                 let play = play_mut(&mut self.play)?;
                 let abilities = &mut play.player.physics.abilities;
-                let flying = a.flags & 2 != 0;
-                if play.client_loaded && flying != abilities.flying {
-                    self.checks.flight_changed(flying);
-                }
                 abilities.invulnerable = a.flags & 1 != 0;
-                abilities.flying = flying;
+                abilities.flying = a.flags & 2 != 0;
                 abilities.may_fly = a.flags & 4 != 0;
                 abilities.instabuild = a.flags & 8 != 0;
                 abilities.flying_speed = a.flying_speed;
@@ -462,9 +526,6 @@ impl Game {
                     let v = Vec3::new(motion.movement.x, motion.movement.y, motion.movement.z);
                     debug!(x = v.x, y = v.y, z = v.z, "velocity set");
                     play.player.physics.delta_movement = v;
-                    if play.client_loaded {
-                        self.checks.velocity(v, false);
-                    }
                 }
             }
             cb::Explode::ID => {
@@ -473,43 +534,43 @@ impl Game {
                 if let Some(k) = explode.player_knockback {
                     let v = Vec3::new(k.x, k.y, k.z);
                     play.player.physics.delta_movement = play.player.physics.delta_movement.add(v);
-                    if play.client_loaded {
-                        self.checks.velocity(v, true);
-                    }
                 }
             }
             cb::PlayerLookAt::ID => {
                 let look = packet.decode::<cb::PlayerLookAt>()?;
                 let play = play_mut(&mut self.play)?;
                 let p = &mut play.player.physics;
-                let before = (p.y_rot, p.x_rot);
                 p.look_at(look.from_anchor == 1, Vec3::new(look.x, look.y, look.z));
-                if play.client_loaded {
-                    self.checks.look_at(crate::math::wrap_degrees(p.y_rot - before.0), p.x_rot - before.1);
-                    self.mouse.disturb();
-                }
             }
             cb::SetHeldSlot::ID => {
-                let slot = packet.decode::<cb::SetHeldSlot>()?.slot;
-                play_mut(&mut self.play)?.inventory.set_held_slot(&packet.body)?;
+                packet.decode::<cb::SetHeldSlot>()?;
+                play_mut(&mut self.play)?
+                    .inventory
+                    .set_held_slot(&packet.body)?;
                 self.slot_press = None;
-                self.checks.held_slot_changed(slot);
             }
             cb::OpenScreen::ID => {
-                play_mut(&mut self.play)?.inventory.open_screen(&packet.body)?;
-                self.checks.screen_opened();
+                play_mut(&mut self.play)?
+                    .inventory
+                    .open_screen(&packet.body)?;
             }
             ids::CONTAINER_CLOSE => {
                 play_mut(&mut self.play)?.inventory.close_container();
                 self.close_press = None;
             }
             ids::CONTAINER_SET_CONTENT => {
-                if let Err(e) = play_mut(&mut self.play)?.inventory.set_content(&packet.body) {
+                if let Err(e) = play_mut(&mut self.play)?
+                    .inventory
+                    .set_content(&packet.body)
+                {
                     warn!("could not read container contents: {e}");
                 }
             }
             ids::SET_PLAYER_INVENTORY => {
-                if let Err(e) = play_mut(&mut self.play)?.inventory.set_player_inventory(&packet.body) {
+                if let Err(e) = play_mut(&mut self.play)?
+                    .inventory
+                    .set_player_inventory(&packet.body)
+                {
                     warn!("could not read an inventory slot: {e}");
                 }
             }
@@ -522,38 +583,41 @@ impl Game {
                 let chat = packet.decode::<cb::SystemChat>()?;
                 let text = crate::text::nbt_to_plain(&chat.content);
                 debug!(overlay = chat.overlay, "system chat: {text}");
-                let reply = self.play.as_ref().and_then(|p| p.last_command).is_some_and(|at| at.elapsed().as_secs_f64() < 3.0);
-                if !reply {
-                    self.checks.message(&text);
-                }
-                self.link.emit(crate::BotEvent::SystemMessage { text, overlay: chat.overlay });
-            }
-            cb::HurtAnimation::ID => {
-                let hurt = packet.decode::<cb::HurtAnimation>()?;
-                if self.play.as_ref().is_some_and(|p| p.player.id == hurt.entity_id) {
-                    self.checks.damaged();
-                }
-            }
-            cb::DamageEvent::ID => {
-                let damage = packet.decode::<cb::DamageEvent>()?;
-                if self.play.as_ref().is_some_and(|p| p.player.id == damage.entity_id) {
-                    self.checks.damaged();
-                }
+                self.link.emit(crate::BotEvent::SystemMessage {
+                    text,
+                    overlay: chat.overlay,
+                });
             }
             ids::ADD_ENTITY => {
-                play_mut(&mut self.play)?.entities.add_entity(&packet.body)?;
+                play_mut(&mut self.play)?
+                    .entities
+                    .add_entity(&packet.body)?;
             }
-            ids::REMOVE_ENTITIES => play_mut(&mut self.play)?.entities.remove_entities(&packet.body)?,
+            ids::REMOVE_ENTITIES => play_mut(&mut self.play)?
+                .entities
+                .remove_entities(&packet.body)?,
             ids::MOVE_ENTITY_POS | ids::MOVE_ENTITY_POS_ROT => {
-                play_mut(&mut self.play)?.entities.move_entity(&packet.body, packet.id == ids::MOVE_ENTITY_POS_ROT)?
+                play_mut(&mut self.play)?
+                    .entities
+                    .move_entity(&packet.body, packet.id == ids::MOVE_ENTITY_POS_ROT)?
             }
-            ids::MOVE_ENTITY_ROT => play_mut(&mut self.play)?.entities.rotate_entity(&packet.body)?,
-            ids::ENTITY_POSITION_SYNC => play_mut(&mut self.play)?.entities.position_sync(&packet.body)?,
-            ids::TELEPORT_ENTITY => play_mut(&mut self.play)?.entities.teleport_entity(&packet.body)?,
+            ids::MOVE_ENTITY_ROT => play_mut(&mut self.play)?
+                .entities
+                .rotate_entity(&packet.body)?,
+            ids::ENTITY_POSITION_SYNC => play_mut(&mut self.play)?
+                .entities
+                .position_sync(&packet.body)?,
+            ids::TELEPORT_ENTITY => play_mut(&mut self.play)?
+                .entities
+                .teleport_entity(&packet.body)?,
             ids::PLAYER_INFO_UPDATE => {
-                play_mut(&mut self.play)?.entities.player_info_update(&packet.body)?;
+                play_mut(&mut self.play)?
+                    .entities
+                    .player_info_update(&packet.body)?;
             }
-            ids::PLAYER_INFO_REMOVE => play_mut(&mut self.play)?.entities.player_info_remove(&packet.body)?,
+            ids::PLAYER_INFO_REMOVE => play_mut(&mut self.play)?
+                .entities
+                .player_info_remove(&packet.body)?,
             ids::UPDATE_MOB_EFFECT | ids::REMOVE_MOB_EFFECT => {
                 let mut body = packet.body.as_slice();
                 let entity = VarInt::decode(&mut body)?.0;
@@ -561,11 +625,12 @@ impl Game {
                 let play = play_mut(&mut self.play)?;
                 if entity == play.player.id {
                     if let Some(name) = Registry::get().mob_effects.get(effect as usize) {
-                        let amplifier = if packet.id == ids::UPDATE_MOB_EFFECT { Some(VarInt::decode(&mut body)?.0) } else { None };
+                        let amplifier = if packet.id == ids::UPDATE_MOB_EFFECT {
+                            Some(VarInt::decode(&mut body)?.0)
+                        } else {
+                            None
+                        };
                         play.player.physics.effects.set(name, amplifier);
-                        if let (Some(amplifier), true) = (amplifier, play.client_loaded) {
-                            self.checks.effect_applied(name, amplifier);
-                        }
                     }
                 }
             }
@@ -581,20 +646,12 @@ impl Game {
             }
             ids::CONTAINER_SET_SLOT => {
                 let mut body = packet.body.as_slice();
-                let container = VarInt::decode(&mut body)?.0;
+                let _container = VarInt::decode(&mut body)?.0;
                 let _state = VarInt::decode(&mut body)?;
-                let slot = i16::decode(&mut body)?;
+                let _slot = i16::decode(&mut body)?;
                 let play = play_mut(&mut self.play)?;
-                // The same item in the same number is wear from our own
-                // use (a sword losing durability), not someone's doing.
-                let own = container == 0 && slot >= 0;
-                let stack = |inventory: &crate::inventory::Inventory| inventory.get(slot as usize).map(|s| (s.item, s.count));
-                let before = stack(&play.inventory);
                 if let Err(e) = play.inventory.set_slot(&packet.body) {
                     warn!("could not read an item stack: {e}");
-                }
-                if !(own && before.is_some() && before == stack(&play.inventory)) {
-                    self.checks.inventory_changed(slot);
                 }
             }
             ids::PLAYER_CHAT => {
@@ -603,21 +660,28 @@ impl Game {
                 // A broken chat chain disconnects, as vanilla does.
                 let message = play
                     .chat
-                    .player_chat(&packet.body, |sender| entities.player_info(sender).is_some())
+                    .player_chat(&packet.body, |sender| {
+                        entities.player_info(sender).is_some()
+                    })
                     .map_err(|e| ClientError::Protocol(e.to_string()))?;
                 if let Some(offset) = message.ack {
                     self.net.send(&sb::ChatAck { offset });
                 }
-                let from = entities.player_info(&message.sender).map(|i| i.name.clone());
+                let from = entities
+                    .player_info(&message.sender)
+                    .map(|i| i.name.clone());
                 debug!(?from, "chat: {}", message.text);
-                // Our own lines come back too.
-                if self.session.profile.as_ref().is_none_or(|p| p.id != message.sender) {
-                    self.checks.message_from(&message.text, from.as_deref());
-                }
-                self.link.emit(crate::BotEvent::Chat { sender: message.sender, name: from, text: message.text });
+                self.link.emit(crate::BotEvent::Chat {
+                    sender: message.sender,
+                    name: from,
+                    text: message.text,
+                });
             }
             ids::DELETE_CHAT => {
-                play_mut(&mut self.play)?.chat.delete_chat(&packet.body).map_err(|e| ClientError::Protocol(e.to_string()))?;
+                play_mut(&mut self.play)?
+                    .chat
+                    .delete_chat(&packet.body)
+                    .map_err(|e| ClientError::Protocol(e.to_string()))?;
             }
             ids::COMMANDS => match crate::commands::CommandTree::decode(&packet.body) {
                 Ok(tree) => play_mut(&mut self.play)?.commands = tree,
@@ -627,7 +691,6 @@ impl Game {
                 let mut body = packet.body.as_slice();
                 let text = crate::text::nbt_to_plain(&rapidbot_nbt::Tag::decode(&mut body)?);
                 debug!("message: {text}");
-                self.checks.message(&text);
             }
             cb::UpdateTags::ID => {
                 let payload = packet.decode::<cb::UpdateTags>()?.data.0;
@@ -654,15 +717,18 @@ impl Game {
                 self.close_press = None;
                 play.game_type = respawn.spawn.game_type;
                 play.player.physics.spectator = play.game_type == GameType::Spectator;
-                play.player.physics.fast_lava = fast_lava(&self.session, respawn.spawn.dimension_type);
+                play.player.physics.fast_lava =
+                    fast_lava(&self.session, respawn.spawn.dimension_type);
                 play.client_loaded = false;
                 play.death_time = 0;
                 play.respawn_in = None;
                 play.start_waiting_for_new_level();
                 self.aim = None;
                 self.key_intent = Default::default();
-                self.checks = crate::checks::CheckMonitor::new(self.config.account.name());
-                self.link.emit(crate::BotEvent::Spawned { entity_id: play.player.id, dimension });
+                self.link.emit(crate::BotEvent::Spawned {
+                    entity_id: play.player.id,
+                    dimension,
+                });
             }
             cb::CustomPayload::ID => {
                 let payload = packet.decode::<cb::CustomPayload>()?;
@@ -690,7 +756,10 @@ impl Game {
             }
             cb::Transfer::ID => {
                 let t = packet.decode::<cb::Transfer>()?;
-                return Err(ClientError::Transfer { host: t.host, port: t.port });
+                return Err(ClientError::Transfer {
+                    host: t.host,
+                    port: t.port,
+                });
             }
             cb::StartConfiguration::ID => {
                 // handleConfigurationStart: drop the level, switch to
@@ -700,20 +769,25 @@ impl Game {
                 self.net.send(&sb::ConfigurationAcknowledged);
             }
             other => {
-                if State::Play.packet_name(rapidbot_protocol::Direction::Clientbound, other).is_none() {
+                if State::Play
+                    .packet_name(rapidbot_protocol::Direction::Clientbound, other)
+                    .is_none()
+                {
                     warn!(id = other, "unknown play packet");
                 }
             }
         }
         Ok(())
     }
-
 }
 
 /// `SynchedEntityData.assignValues` for the parts of our own player that
 /// movement depends on: the shared flags (ID 0) and the pose (ID 6). Values
 /// come in ascending ID order; everything before the pose is a simple type.
-fn apply_own_entity_data(player: &mut rapidbot_physics::Player, body: &[u8]) -> Result<(), ClientError> {
+fn apply_own_entity_data(
+    player: &mut rapidbot_physics::Player,
+    body: &[u8],
+) -> Result<(), ClientError> {
     use crate::entities::DataValue;
     use rapidbot_physics::Pose;
     for (index, value) in crate::entities::decode_entity_data(body)? {
@@ -744,7 +818,8 @@ fn apply_own_entity_data(player: &mut rapidbot_physics::Player, body: &[u8]) -> 
 }
 
 fn play_mut(play: &mut Option<PlayState>) -> Result<&mut PlayState, ClientError> {
-    play.as_mut().ok_or_else(|| ClientError::Protocol("play packet before login".into()))
+    play.as_mut()
+        .ok_or_else(|| ClientError::Protocol("play packet before login".into()))
 }
 
 fn registry_len(session: &SessionData, name: &str) -> usize {
@@ -792,7 +867,11 @@ fn dimension_height(session: &SessionData, id: i32) -> DimensionHeight {
         return DimensionHeight::OVERWORLD;
     };
     if let Some(rapidbot_nbt::Tag::Compound(c)) = &entry.data {
-        let get = |k: &str| c.get(k).and_then(rapidbot_nbt::Tag::as_i64).map(|v| v as i32);
+        let get = |k: &str| {
+            c.get(k)
+                .and_then(rapidbot_nbt::Tag::as_i64)
+                .map(|v| v as i32)
+        };
         if let (Some(min_y), Some(height)) = (get("min_y"), get("height")) {
             return DimensionHeight { min_y, height };
         }

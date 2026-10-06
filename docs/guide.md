@@ -69,7 +69,6 @@ keyboard and mouse. It gets a `TickContext`.
 | `ctx.target` | The entity under the crosshair, within reach |
 | `ctx.breaking` | The block being dug and its progress |
 | `ctx.attack_strength` | The attack charge, 0 to 1 |
-| `ctx.events`, `ctx.suspicion` | Heuristic events derived from server packets since last tick, and their accumulated score |
 | `ctx.chat_open` | True while a chat line is being typed |
 
 ## What a controller can do
@@ -99,7 +98,7 @@ path; reserve it for tests.
 
 - `nav::Walker`: `go_to(point)`, then `tick(ctx)` every tick. It plans a
   route (around walls, up steps, down drops, clear of lava) and follows it
-  using modeled input. Check `arrived()`, `gave_up()`, `interrupted()`.
+  using modeled input. Check `arrived()` and `gave_up()`.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
   approaches, keeps the crosshair on the target and clicks when the attack
   charge is back.
@@ -130,15 +129,21 @@ Keep that file private (`accounts/` is gitignored).
   settings the server is told about.
 - `auto_respawn`: click "Respawn" after dying.
 
-## Checks
+## Player and entity data
 
-`CheckEvent`s summarize selected server-originated events, such as forced
-rotations, teleports, inventory changes, or nearby player-entity arrivals.
-They are heuristics over packets the client receives; they do not identify a
-player's role or detect observation that produces no server-visible event.
-Events arrive in `ctx.events` and as `BotEvent::Check`, each with a
-`severity`. Applications can use them for diagnostics or their own
-state-management policy; `Walker` stops on severe events by default.
+`ctx.players` contains tracked player entities within
+`entities::NEARBY_PLAYER_RADIUS` (32 blocks), nearest
+first. Each `NearbyPlayer` includes its entity ID, UUID, interpolated
+position, distance, and optional `PlayerInfo` received from the server's
+player list (name, listed state, game mode, and latency). Missing player
+information means the server has not provided a current player-list entry;
+it is not a role or identity classification.
+
+For a different radius or players outside the default range, use
+`ctx.entities.players_near(ctx.player.pos, radius, ctx.own_id)`. Use
+`ctx.entities.players()` to iterate every player entity currently tracked by
+the client. The framework exposes state; application-specific meaning and
+policy are left to the package user.
 
 ## What is not there yet
 

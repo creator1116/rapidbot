@@ -11,10 +11,10 @@ use rapidbot_buf::{BoundedString, ByteArray, Decode, DecodeError, VarInt};
 use rapidbot_physics::math::{self, Vec3};
 use rapidbot_protocol::packets::login::ProfileProperty;
 use rapidbot_protocol::packets::play::{LpVec3, PositionMoveRotation};
+use rapidbot_world::Registry;
 use rapidbot_world::item::ItemStack;
 use rapidbot_world::registry::{EntityKind, Interpolation};
 use rapidbot_world::tags::Tags;
-use rapidbot_world::Registry;
 use uuid::Uuid;
 
 /// `Pose` IDs.
@@ -27,6 +27,9 @@ pub mod pose {
     pub const CROUCHING: i32 = 5;
     pub const DYING: i32 = 7;
 }
+
+/// Default radius used for [`crate::controller::TickContext::players`].
+pub const NEARBY_PLAYER_RADIUS: f64 = 32.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PosRot {
@@ -59,7 +62,13 @@ impl PositionPath {
 
     /// `PositionPath.STREAM_CODEC`.
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
-        let vec3 = |buf: &mut &[u8]| -> Result<Vec3, DecodeError> { Ok(Vec3::new(f64::decode(buf)?, f64::decode(buf)?, f64::decode(buf)?)) };
+        let vec3 = |buf: &mut &[u8]| -> Result<Vec3, DecodeError> {
+            Ok(Vec3::new(
+                f64::decode(buf)?,
+                f64::decode(buf)?,
+                f64::decode(buf)?,
+            ))
+        };
         // ByIdMap with OutOfBoundsStrategy.ZERO.
         if VarInt::decode(buf)?.0 != 1 {
             return Ok(PositionPath::Linear(vec3(buf)?));
@@ -103,7 +112,11 @@ impl Default for Stepped {
 
 fn lerp_vec(from: Vec3, to: Vec3, a: f64) -> Vec3 {
     // Vec3.lerp: Mth.lerp(a, from, to) per axis.
-    Vec3::new(from.x + a * (to.x - from.x), from.y + a * (to.y - from.y), from.z + a * (to.z - from.z))
+    Vec3::new(
+        from.x + a * (to.x - from.x),
+        from.y + a * (to.y - from.y),
+        from.z + a * (to.z - from.z),
+    )
 }
 
 /// `Mth.rotLerp(float, float, float)`.
@@ -113,7 +126,10 @@ fn rot_lerp(a: f32, from: f32, to: f32) -> f32 {
 
 impl Stepped {
     fn add_step(&mut self, pos: Vec3, y_rot: f32, x_rot: f32, tick_offset: i32) {
-        self.remaining_steps.push_back(Step { at: PosRot { pos, y_rot, x_rot }, tick_offset });
+        self.remaining_steps.push_back(Step {
+            at: PosRot { pos, y_rot, x_rot },
+            tick_offset,
+        });
         self.remaining_ticks += tick_offset as f32;
     }
 
@@ -242,7 +258,13 @@ impl Entity {
     pub fn dimensions(&self) -> (f32, f32) {
         let info = self.info();
         let (width, height, _) = Registry::get().entity_dimensions[self.type_id];
-        let scaled = |w: f32, h: f32| if self.scale != 1.0 { (w * self.scale, h * self.scale) } else { (w, h) };
+        let scaled = |w: f32, h: f32| {
+            if self.scale != 1.0 {
+                (w * self.scale, h * self.scale)
+            } else {
+                (w, h)
+            }
+        };
         if !info.living {
             return (width, height);
         }
@@ -275,11 +297,18 @@ impl Entity {
         let (width, height) = self.dimensions();
         let w = (width / 2.0) as f64;
         let h = height as f64;
-        ([self.pos.x - w, self.pos.y, self.pos.z - w], [self.pos.x + w, self.pos.y + h, self.pos.z + w])
+        (
+            [self.pos.x - w, self.pos.y, self.pos.z - w],
+            [self.pos.x + w, self.pos.y + h, self.pos.z + w],
+        )
     }
 
     fn redirectable(&self, tags: &Tags) -> bool {
-        tags.contains("minecraft:entity_type", "minecraft:redirectable_projectile", self.type_id as u32)
+        tags.contains(
+            "minecraft:entity_type",
+            "minecraft:redirectable_projectile",
+            self.type_id as u32,
+        )
     }
 
     /// `Entity.isPickable`. Entities whose box is not the plain one around
@@ -302,12 +331,24 @@ impl Entity {
         if info.is("Projectile") {
             return self.redirectable(tags) && !(info.is("AbstractArrow") && self.in_ground);
         }
-        ["AbstractBoat", "AbstractMinecart", "PrimedTnt", "FallingBlockEntity", "EndCrystal"].iter().any(|c| info.is(c))
+        [
+            "AbstractBoat",
+            "AbstractMinecart",
+            "PrimedTnt",
+            "FallingBlockEntity",
+            "EndCrystal",
+        ]
+        .iter()
+        .any(|c| info.is(c))
     }
 
     /// `Entity.getPickRadius`: pickable projectiles have a generous box.
     pub fn pick_radius(&self, tags: &Tags) -> f32 {
-        if self.info().is("Projectile") && self.is_pickable(tags) { 1.0 } else { 0.0 }
+        if self.info().is("Projectile") && self.is_pickable(tags) {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// `Entity.isAttackable`.
@@ -316,7 +357,15 @@ impl Entity {
         if info.is("AbstractArrow") {
             return self.redirectable(tags);
         }
-        !["ExperienceOrb", "ItemEntity", "FallingBlockEntity", "FireworkRocketEntity", "EyeOfEnder"].iter().any(|c| info.is(c))
+        ![
+            "ExperienceOrb",
+            "ItemEntity",
+            "FallingBlockEntity",
+            "FireworkRocketEntity",
+            "EyeOfEnder",
+        ]
+        .iter()
+        .any(|c| info.is(c))
     }
 
     /// `Entity.hurtClient` for a player's attack: whether the client
@@ -324,7 +373,9 @@ impl Entity {
     /// vehicles; for mobs only the server knows.
     pub fn hurt_client(&self) -> bool {
         let info = self.info();
-        ["Player", "VehicleEntity", "ShulkerBullet", "EndCrystal"].iter().any(|c| info.is(c))
+        ["Player", "VehicleEntity", "ShulkerBullet", "EndCrystal"]
+            .iter()
+            .any(|c| info.is(c))
     }
 
     fn interval(&self) -> i32 {
@@ -365,7 +416,11 @@ impl Entity {
         let current = match (active, interpolation) {
             (true, Interpolation::Stepped) => self.stepped.target,
             (true, _) => self.linear.0,
-            _ => PosRot { pos: self.pos, y_rot: self.y_rot, x_rot: self.x_rot },
+            _ => PosRot {
+                pos: self.pos,
+                y_rot: self.y_rot,
+                x_rot: self.x_rot,
+            },
         };
         let path = path.unwrap_or(PositionPath::Linear(current.pos));
         let (y_rot, x_rot) = rot.unwrap_or((current.y_rot, current.x_rot));
@@ -378,7 +433,11 @@ impl Entity {
             self.snap_to(end, y_rot, x_rot);
             return;
         }
-        let wanted = PosRot { pos: end, y_rot, x_rot };
+        let wanted = PosRot {
+            pos: end,
+            y_rot,
+            x_rot,
+        };
         if active && current == wanted {
             return;
         }
@@ -387,7 +446,11 @@ impl Entity {
             _ => {
                 // SteppedInterpolationHandler.startInterpolating.
                 if !active {
-                    self.stepped.last_step = PosRot { pos: self.pos, y_rot: self.y_rot, x_rot: self.x_rot };
+                    self.stepped.last_step = PosRot {
+                        pos: self.pos,
+                        y_rot: self.y_rot,
+                        x_rot: self.x_rot,
+                    };
                     self.stepped.current_step_ticks = 1.0;
                 }
                 if end == self.stepped.target.pos {
@@ -412,8 +475,11 @@ impl Entity {
                 }
                 let alpha = 1.0 / remaining as f64;
                 self.pos = lerp_vec(self.pos, target.pos, alpha);
-                self.y_rot = (self.y_rot as f64 + alpha * math::wrap_degrees(target.y_rot - self.y_rot) as f64) as f32;
-                self.x_rot = (self.x_rot as f64 + alpha * (target.x_rot as f64 - self.x_rot as f64)) as f32;
+                self.y_rot = (self.y_rot as f64
+                    + alpha * math::wrap_degrees(target.y_rot - self.y_rot) as f64)
+                    as f32;
+                self.x_rot =
+                    (self.x_rot as f64 + alpha * (target.x_rot as f64 - self.x_rot as f64)) as f32;
                 self.linear.1 = remaining - 1;
             }
             Interpolation::Stepped => {
@@ -451,6 +517,9 @@ pub struct NearbyPlayer {
     pub id: i32,
     pub pos: Vec3,
     pub distance: f64,
+    /// Tab-list metadata supplied by the server, if available. Missing
+    /// metadata only means no player-info entry is currently stored.
+    pub info: Option<PlayerInfo>,
 }
 
 /// `EntityHitResult`: the entity under the crosshair and where the ray
@@ -571,7 +640,11 @@ fn steps(v: f64) -> i64 {
 }
 
 fn apply_delta(base: f64, delta: i16) -> f64 {
-    if delta == 0 { base } else { (steps(base) + delta as i64) as f64 / 4096.0 }
+    if delta == 0 {
+        base
+    } else {
+        (steps(base) + delta as i64) as f64 / 4096.0
+    }
 }
 
 /// `AABB.clip`: where the segment first enters the box.
@@ -579,7 +652,11 @@ fn clip_box(min: [f64; 3], max: [f64; 3], from: [f64; 3], to: [f64; 3]) -> Optio
     let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let mut scale = 1.0;
     rapidbot_world::raycast::box_entry(min, max, from, &mut scale, None, d)?;
-    Some([from[0] + scale * d[0], from[1] + scale * d[1], from[2] + scale * d[2]])
+    Some([
+        from[0] + scale * d[0],
+        from[1] + scale * d[1],
+        from[2] + scale * d[2],
+    ])
 }
 
 impl Entities {
@@ -591,6 +668,12 @@ impl Entities {
         self.by_id.values()
     }
 
+    /// All currently tracked player entities, independent of tab-list
+    /// membership or distance from the local player.
+    pub fn players(&self) -> impl Iterator<Item = &Entity> {
+        self.by_id.values().filter(|entity| entity.is_player())
+    }
+
     pub fn player_info(&self, uuid: &Uuid) -> Option<&PlayerInfo> {
         self.players.get(uuid)
     }
@@ -600,12 +683,15 @@ impl Entities {
         self.players.iter()
     }
 
-    /// The name of a player entity, from the tab list.
+    /// The name of a player entity, when the server has supplied player
+    /// information for it.
     pub fn name_of(&self, entity: &Entity) -> Option<&str> {
         self.players.get(&entity.uuid).map(|p| p.name.as_str())
     }
 
-    /// Other players within `radius` blocks of `from`, nearest first.
+    /// Other currently tracked player entities within `radius` blocks of
+    /// `from`, nearest first. Available player-list metadata is copied into
+    /// each result without interpreting its meaning.
     pub fn players_near(&self, from: Vec3, radius: f64, own_id: i32) -> Vec<NearbyPlayer> {
         let mut out: Vec<NearbyPlayer> = self
             .by_id
@@ -615,11 +701,16 @@ impl Entities {
                 let (dx, dy, dz) = (e.pos.x - from.x, e.pos.y - from.y, e.pos.z - from.z);
                 let distance = (dx * dx + dy * dy + dz * dz).sqrt();
                 (distance <= radius).then(|| NearbyPlayer {
-                    name: self.players.get(&e.uuid).map(|p| p.name.clone()).unwrap_or_default(),
+                    name: self
+                        .players
+                        .get(&e.uuid)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default(),
                     uuid: e.uuid,
                     id: e.id,
                     pos: e.pos,
                     distance,
+                    info: self.players.get(&e.uuid).cloned(),
                 })
             })
             .collect();
@@ -629,7 +720,11 @@ impl Entities {
 
     /// `EntitySelector.CAN_BE_PICKED`: not a spectator, and pickable.
     pub fn can_be_picked(&self, entity: &Entity, tags: &Tags) -> bool {
-        let spectator = entity.is_player() && self.players.get(&entity.uuid).is_some_and(|p| p.game_mode == 3);
+        let spectator = entity.is_player()
+            && self
+                .players
+                .get(&entity.uuid)
+                .is_some_and(|p| p.game_mode == 3);
         !spectator && entity.is_pickable(tags)
     }
 
@@ -665,13 +760,21 @@ impl Entities {
             let contains = (0..3).all(|i| from[i] >= min[i] && from[i] < max[i]);
             if contains {
                 if nearest >= 0.0 {
-                    hovered = Some(EntityHit { id: entity.id, location: clip.unwrap_or(from) });
+                    hovered = Some(EntityHit {
+                        id: entity.id,
+                        location: clip.unwrap_or(from),
+                    });
                     nearest = 0.0;
                 }
             } else if let Some(location) = clip {
-                let distance: f64 = (0..3).map(|i| (location[i] - from[i]) * (location[i] - from[i])).sum();
+                let distance: f64 = (0..3)
+                    .map(|i| (location[i] - from[i]) * (location[i] - from[i]))
+                    .sum();
                 if distance < nearest || nearest == 0.0 {
-                    hovered = Some(EntityHit { id: entity.id, location });
+                    hovered = Some(EntityHit {
+                        id: entity.id,
+                        location,
+                    });
                     nearest = distance;
                 }
             }
@@ -696,7 +799,9 @@ impl Entities {
         let _movement = LpVec3::decode(buf)?;
         let x_rot = unpack_degrees(i8::decode(buf)?);
         let y_rot = unpack_degrees(i8::decode(buf)?);
-        let Some(kind) = Registry::get().entity_types.get(type_id) else { return Ok(None) };
+        let Some(kind) = Registry::get().entity_types.get(type_id) else {
+            return Ok(None);
+        };
         self.by_id.insert(
             id,
             Entity {
@@ -737,10 +842,16 @@ impl Entities {
         let id = VarInt::decode(buf)?.0;
         let properties = VarInt::decode(buf)?.0;
         let step_count = (properties as u32 >> 1) as usize;
-        let Some(entity) = self.by_id.get_mut(&id) else { return Ok(()) };
+        let Some(entity) = self.by_id.get_mut(&id) else {
+            return Ok(());
+        };
         let delta = |buf: &mut &[u8], base: Vec3| -> Result<Vec3, DecodeError> {
             let (xa, ya, za) = (i16::decode(buf)?, i16::decode(buf)?, i16::decode(buf)?);
-            Ok(Vec3::new(apply_delta(base.x, xa), apply_delta(base.y, ya), apply_delta(base.z, za)))
+            Ok(Vec3::new(
+                apply_delta(base.x, xa),
+                apply_delta(base.y, ya),
+                apply_delta(base.z, za),
+            ))
         };
         // VecDelta.decode.
         let path = if step_count == 0 {
@@ -755,7 +866,14 @@ impl Entities {
             }
             PositionPath::Stepped(steps)
         };
-        let rot = if has_rotation { Some((unpack_degrees(i8::decode(buf)?), unpack_degrees(i8::decode(buf)?))) } else { None };
+        let rot = if has_rotation {
+            Some((
+                unpack_degrees(i8::decode(buf)?),
+                unpack_degrees(i8::decode(buf)?),
+            ))
+        } else {
+            None
+        };
         entity.base = path.end();
         entity.move_or_interpolate_to(Some(path), rot);
         Ok(())
@@ -766,7 +884,10 @@ impl Entities {
         let buf = &mut body;
         let id = VarInt::decode(buf)?.0;
         let _on_ground = bool::decode(buf)?;
-        let rot = (unpack_degrees(i8::decode(buf)?), unpack_degrees(i8::decode(buf)?));
+        let rot = (
+            unpack_degrees(i8::decode(buf)?),
+            unpack_degrees(i8::decode(buf)?),
+        );
         if let Some(entity) = self.by_id.get_mut(&id) {
             entity.move_or_interpolate_to(None, Some(rot));
         }
@@ -779,10 +900,16 @@ impl Entities {
         let id = VarInt::decode(buf)?.0;
         let path = PositionPath::decode(buf)?;
         let (y_rot, x_rot) = (f32::decode(buf)?, f32::decode(buf)?);
-        let Some(entity) = self.by_id.get_mut(&id) else { return Ok(()) };
+        let Some(entity) = self.by_id.get_mut(&id) else {
+            return Ok(());
+        };
         let pos = path.end();
         entity.base = pos;
-        let (dx, dy, dz) = (entity.pos.x - pos.x, entity.pos.y - pos.y, entity.pos.z - pos.z);
+        let (dx, dy, dz) = (
+            entity.pos.x - pos.x,
+            entity.pos.y - pos.y,
+            entity.pos.z - pos.z,
+        );
         if dx * dx + dy * dy + dz * dz > 4096.0 {
             entity.snap_to(pos, y_rot, x_rot);
         } else {
@@ -797,18 +924,33 @@ impl Entities {
         let id = VarInt::decode(buf)?.0;
         let change = PositionMoveRotation::decode(buf)?;
         let relatives = i32::decode(buf)?;
-        let Some(entity) = self.by_id.get_mut(&id) else { return Ok(()) };
+        let Some(entity) = self.by_id.get_mut(&id) else {
+            return Ok(());
+        };
         // PositionMoveRotation.calculateAbsolute against where it is now.
-        let rel = |bit: i32, current: f64, v: f64| if relatives & bit != 0 { current + v } else { v };
+        let rel =
+            |bit: i32, current: f64, v: f64| if relatives & bit != 0 { current + v } else { v };
         let pos = Vec3::new(
             rel(1, entity.pos.x, change.position.x),
             rel(2, entity.pos.y, change.position.y),
             rel(4, entity.pos.z, change.position.z),
         );
-        let y_rot = if relatives & 8 != 0 { entity.y_rot + change.y_rot } else { change.y_rot };
-        let x_rot = if relatives & 16 != 0 { entity.x_rot + change.x_rot } else { change.x_rot };
+        let y_rot = if relatives & 8 != 0 {
+            entity.y_rot + change.y_rot
+        } else {
+            change.y_rot
+        };
+        let x_rot = if relatives & 16 != 0 {
+            entity.x_rot + change.x_rot
+        } else {
+            change.x_rot
+        };
         let x_rot = x_rot.clamp(-90.0, 90.0);
-        let (dx, dy, dz) = (entity.pos.x - pos.x, entity.pos.y - pos.y, entity.pos.z - pos.z);
+        let (dx, dy, dz) = (
+            entity.pos.x - pos.x,
+            entity.pos.y - pos.y,
+            entity.pos.z - pos.z,
+        );
         if dx * dx + dy * dy + dz * dz > 4096.0 {
             entity.snap_to(pos, y_rot, x_rot);
         } else {
@@ -820,15 +962,21 @@ impl Entities {
     /// `ClientboundSetEntityDataPacket` for another entity: `body` starts
     /// after the entity ID.
     pub(crate) fn set_entity_data(&mut self, id: i32, body: &[u8]) -> Result<(), DecodeError> {
-        let Some(entity) = self.by_id.get_mut(&id) else { return Ok(()) };
+        let Some(entity) = self.by_id.get_mut(&id) else {
+            return Ok(());
+        };
         let info = entity.info();
         for (index, value) in decode_entity_data(body)? {
             match (index, value) {
                 (0, DataValue::Byte(flags)) => entity.flags = flags,
                 (6, DataValue::Pose(pose)) => entity.pose = pose,
                 (9, DataValue::Float(health)) if info.living => entity.health = Some(health),
-                (15, DataValue::Byte(flags)) if info.is("ArmorStand") => entity.armor_stand_flags = flags,
-                (10, DataValue::Bool(in_ground)) if info.is("AbstractArrow") => entity.in_ground = in_ground,
+                (15, DataValue::Byte(flags)) if info.is("ArmorStand") => {
+                    entity.armor_stand_flags = flags
+                }
+                (10, DataValue::Bool(in_ground)) if info.is("AbstractArrow") => {
+                    entity.in_ground = in_ground
+                }
                 _ => {}
             }
         }
@@ -903,7 +1051,11 @@ mod tests {
     use rapidbot_buf::Encode;
 
     fn type_id(name: &str) -> i32 {
-        Registry::get().entity_types.iter().position(|n| n == name).unwrap() as i32
+        Registry::get()
+            .entity_types
+            .iter()
+            .position(|n| n == name)
+            .unwrap() as i32
     }
 
     fn add(e: &mut Entities, id: i32, kind: &str, pos: [f64; 3]) {
@@ -941,24 +1093,54 @@ mod tests {
         let mut e = Entities::default();
         let uuid = Uuid::from_u128(42);
 
-        let mut info = vec![1u8 | 4, 1];
+        let mut info = vec![1u8 | 4 | 8 | 16, 1];
         uuid.encode(&mut info);
-        "Admin".encode(&mut info);
+        "PlayerOne".encode(&mut info);
         info.push(0); // no properties
         info.push(3); // spectator
-        assert_eq!(e.player_info_update(&info).unwrap(), ["Admin"]);
+        info.push(1); // listed
+        VarInt(73).encode(&mut info);
+        assert_eq!(e.player_info_update(&info).unwrap(), ["PlayerOne"]);
 
         add(&mut e, 42, "minecraft:player", [5.0, 64.0, 0.0]);
         assert!(e.get(42).unwrap().is_player());
 
         let near = e.players_near(Vec3::new(0.0, 64.0, 0.0), 10.0, 1);
         assert_eq!(near.len(), 1);
-        assert_eq!((near[0].name.as_str(), near[0].id), ("Admin", 42));
+        assert_eq!((near[0].name.as_str(), near[0].id), ("PlayerOne", 42));
         assert_eq!(near[0].distance, 5.0);
+        let player_info = near[0].info.as_ref().unwrap();
+        assert_eq!(player_info.name, "PlayerOne");
+        assert_eq!(player_info.game_mode, 3);
+        assert!(player_info.listed);
+        assert_eq!(player_info.latency, 73);
         assert!(e.players_near(Vec3::new(0.0, 64.0, 0.0), 3.0, 1).is_empty());
-        assert!(e.players_near(Vec3::new(0.0, 64.0, 0.0), 10.0, 42).is_empty());
+        assert!(
+            e.players_near(Vec3::new(0.0, 64.0, 0.0), 10.0, 42)
+                .is_empty()
+        );
         // A spectator cannot be picked.
         assert!(!e.can_be_picked(e.get(42).unwrap(), &Tags::default()));
+        assert_eq!(
+            e.players().map(|entity| entity.id).collect::<Vec<_>>(),
+            [42]
+        );
+    }
+
+    #[test]
+    fn player_entity_without_player_list_metadata_is_still_queryable() {
+        let mut entities = Entities::default();
+        add(&mut entities, 7, "minecraft:player", [2.0, 64.0, 0.0]);
+        add(&mut entities, 8, "minecraft:zombie", [1.0, 64.0, 0.0]);
+
+        let players: Vec<_> = entities.players().collect();
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].id, 7);
+
+        let nearby = entities.players_near(Vec3::new(0.0, 64.0, 0.0), 10.0, 1);
+        assert_eq!(nearby.len(), 1);
+        assert!(nearby[0].name.is_empty());
+        assert!(nearby[0].info.is_none());
     }
 
     /// A player (update interval 2) moved two blocks: the client gets there
@@ -1007,10 +1189,15 @@ mod tests {
         assert_eq!(e.get(7).unwrap().dimensions(), (0.6, 1.8));
         // Flags (byte), a custom name (optional component: absent), pose
         // crouching, health.
-        let data = [0u8, 0, 0x02, 2, 6, 0, 6, 20, 5, 9, 3, 0x41, 0x20, 0, 0, 0xff];
+        let data = [
+            0u8, 0, 0x02, 2, 6, 0, 6, 20, 5, 9, 3, 0x41, 0x20, 0, 0, 0xff,
+        ];
         e.set_entity_data(7, &data).unwrap();
         let player = e.get(7).unwrap();
-        assert_eq!((player.flags, player.pose, player.health), (2, pose::CROUCHING, Some(10.0)));
+        assert_eq!(
+            (player.flags, player.pose, player.health),
+            (2, pose::CROUCHING, Some(10.0))
+        );
         assert_eq!(player.dimensions(), (0.6, 1.5));
         let (min, max) = player.bounding_box();
         assert_eq!((min[0], max[1]), (-(0.3f32 as f64), 64.0 + 1.5));
@@ -1030,15 +1217,27 @@ mod tests {
         let from = [0.0, 65.0, 0.0];
         // Items and (untagged) arrows are passed through; the nearer zombie
         // is hit on its near face.
-        let hit = e.pick(1, from, [6.0, 65.0, 0.0], search, 36.0, &tags).unwrap();
+        let hit = e
+            .pick(1, from, [6.0, 65.0, 0.0], search, 36.0, &tags)
+            .unwrap();
         assert_eq!(hit.id, 7);
         assert_eq!(hit.location, [3.0 - 0.3f32 as f64, 65.0, 0.0]);
         // Not beyond the distance limit, and never the player itself.
-        assert!(e.pick(1, from, [6.0, 65.0, 0.0], search, 4.0, &tags).is_none());
-        assert_eq!(e.pick(7, from, [6.0, 65.0, 0.0], search, 36.0, &tags).unwrap().id, 8);
+        assert!(
+            e.pick(1, from, [6.0, 65.0, 0.0], search, 4.0, &tags)
+                .is_none()
+        );
+        assert_eq!(
+            e.pick(7, from, [6.0, 65.0, 0.0], search, 36.0, &tags)
+                .unwrap()
+                .id,
+            8
+        );
         // From inside a box: that entity, at the eye. (Vanilla lets a later
         // entity further along the ray replace it, so keep the ray short.)
-        let inside = e.pick(1, [3.0, 65.0, 0.0], [3.2, 65.0, 0.0], search, 36.0, &tags).unwrap();
+        let inside = e
+            .pick(1, [3.0, 65.0, 0.0], [3.2, 65.0, 0.0], search, 36.0, &tags)
+            .unwrap();
         assert_eq!((inside.id, inside.location), (7, [3.0, 65.0, 0.0]));
         // What the client counts as a landed hit.
         assert!(!e.get(7).unwrap().hurt_client());

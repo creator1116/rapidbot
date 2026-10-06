@@ -66,7 +66,7 @@ cargo run --release -p rapidbot-client --example fight -- localhost:25565 Walker
 |---|---|
 | `ping` | Server list ping |
 | `join` | Joins and idles (offline name, or `--microsoft accounts/main.json`) |
-| `walk` | Uses route finding and logs server-event heuristic signals |
+| `walk` | Demonstrates route finding and timed input |
 | `chat` | Types the given lines into chat |
 | `course` | Walks along +x through water and ladders; glides when wearing an elytra |
 | `dig` | Digs the listed blocks from where it stands |

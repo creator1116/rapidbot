@@ -69,13 +69,12 @@ keyboard and mouse. It gets a `TickContext`.
 | `ctx.target` | The entity under the crosshair, within reach |
 | `ctx.breaking` | The block being dug and its progress |
 | `ctx.attack_strength` | The attack charge, 0 to 1 |
-| `ctx.events`, `ctx.suspicion` | Suspected checks since last tick, and a running level of concern |
 | `ctx.chat_open` | True while a chat line is being typed |
 
 ## What a controller can do
 
-A controller states intent. Hands with human timing carry it out, and what
-happens is whatever the vanilla client would do with that input.
+A controller states intent. The input model turns it into timed mouse,
+keyboard, and click events; the vanilla simulation processes those events.
 
 | Call | Effect |
 |---|---|
@@ -92,14 +91,14 @@ Things act on the crosshair, as in the game, so aim first. Helpers find
 where to look: `interact::aim_point` for a block,
 `ctx.entity_aim_point(id, height)` for an entity.
 
-`ctx.snap_look` sets the view instantly. It exists for tests; no person
-turns like that.
+`ctx.snap_look` sets the view instantly and bypasses the modeled mouse-input
+path; reserve it for tests.
 
 ## Ready-made behaviour
 
 - `nav::Walker`: `go_to(point)`, then `tick(ctx)` every tick. It plans a
-  route (around walls, up steps, down drops, clear of lava) and walks it
-  like a person. Check `arrived()`, `gave_up()`, `interrupted()`.
+  route (around walls, up steps, down drops, clear of lava) and follows it
+  using modeled input. Check `arrived()` and `gave_up()`.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
   approaches, keeps the crosshair on the target and clicks when the attack
   charge is back.
@@ -122,21 +121,29 @@ Keep that file private (`accounts/` is gitignored).
 
 - `resource_packs`: `Decline` (default) or `Accept`. Accepted packs are
   really downloaded, with the request the Java client sends.
-- `human_seed`: seeds the human models. One seed per account keeps its
-  "handwriting" consistent between sessions.
+- `human_seed`: seeds input-model randomness. One seed per account keeps
+  its generated input profile consistent between sessions.
 - `mouse_profile`: a profile fitted from your own play by
   `rapidbot-recorder`.
 - `mouse`, `display`, `information`: sensitivity, frame rate and the client
   settings the server is told about.
 - `auto_respawn`: click "Respawn" after dying.
 
-## Checks
+## Player and entity data
 
-`CheckEvent`s report things that look like someone testing whether a player
-is a person: a sudden teleport or rotation, items appearing, a staff member
-arriving. They arrive in `ctx.events` and as `BotEvent::Check`, each with a
-`severity`. What to do about them (pause, answer, leave) is your bot's
-decision; `Walker` stops on severe ones by default.
+`ctx.players` contains tracked player entities within
+`entities::NEARBY_PLAYER_RADIUS` (32 blocks), nearest
+first. Each `NearbyPlayer` includes its entity ID, UUID, interpolated
+position, distance, and optional `PlayerInfo` received from the server's
+player list (name, listed state, game mode, and latency). Missing player
+information means the server has not provided a current player-list entry;
+it is not a role or identity classification.
+
+For a different radius or players outside the default range, use
+`ctx.entities.players_near(ctx.player.pos, radius, ctx.own_id)`. Use
+`ctx.entities.players()` to iterate every player entity currently tracked by
+the client. The framework exposes state; application-specific meaning and
+policy are left to the package user.
 
 ## What is not there yet
 

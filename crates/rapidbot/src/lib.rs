@@ -1,17 +1,15 @@
-//! rapidbot: headless Minecraft Java Edition bots that look like the vanilla
-//! client, driven the way a person drives it.
+//! rapidbot: a headless Minecraft Java Edition client framework modeling
+//! vanilla protocol, timing, and gameplay behavior.
 //!
 //! This crate is the one to depend on. It re-exports the pieces:
 //!
 //! - [`Bot`], [`ClientConfig`], [`Account`]: connect and run a bot.
 //! - [`Controller`] / [`TickContext`]: your logic, called once per client
 //!   tick. Say where to look ([`TickContext::aim`]) and which keys to hold
-//!   ([`TickContext::set_keys`]); the human models move the mouse and
-//!   fingers, and vanilla-exact physics moves the player.
-//! - [`nav::Walker`]: walking to a point like a person, with reactions to
-//!   suspected macro checks.
-//! - [`BotEvent`] / [`CheckEvent`]: lifecycle and "someone may be testing
-//!   this player" events.
+//!   ([`TickContext::set_keys`]); input models produce timed input and
+//!   vanilla-exact physics moves the player.
+//! - [`nav::Walker`]: route finding and movement using modeled input.
+//! - [`BotEvent`]: lifecycle, chat, and connection events.
 //! - [`auth`]: Microsoft account login for online-mode servers.
 //!
 //! ```no_run
@@ -30,20 +28,15 @@
 //! let config = ClientConfig::new("localhost:25565", Account::Offline { name: "Steve".into() });
 //! let mut bot = Bot::spawn(config, Forward);
 //! while let Some(event) = bot.next_event().await {
-//!     if let BotEvent::Check(check) = &event {
-//!         if check.severity > 0.7 {
-//!             bot.disconnect();
-//!         }
-//!     }
 //! }
 //! # }
 //! ```
 
 pub use rapidbot_auth as auth;
 pub use rapidbot_client::{
-    Account, Bot, BotEvent, CheckEvent, CheckKind, ClientConfig, ClientError, Controller, DisplaySettings, Idle, Keys,
-    MouseSettings, ResourcePackPolicy, TickContext, chat, checks, combat, commands, controller, entities, interact, inventory, math, nav, path, run,
-    run_with,
+    Account, Bot, BotEvent, ClientConfig, ClientError, Controller, DisplaySettings, Idle, Keys,
+    MouseSettings, ResourcePackPolicy, TickContext, chat, combat, commands, controller, entities,
+    interact, inventory, math, nav, path, run, run_with,
 };
 pub use rapidbot_human as human;
 pub use rapidbot_physics as physics;
@@ -55,6 +48,6 @@ pub mod prelude {
     pub use crate::math::Vec3;
     pub use crate::nav::Walker;
     pub use crate::{
-        Account, Bot, BotEvent, CheckEvent, CheckKind, ClientConfig, ClientError, Controller, Keys, TickContext,
+        Account, Bot, BotEvent, ClientConfig, ClientError, Controller, Keys, TickContext,
     };
 }

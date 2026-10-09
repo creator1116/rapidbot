@@ -18,9 +18,6 @@ struct Digger {
 
 impl Controller for Digger {
     fn tick(&mut self, ctx: &mut TickContext<'_>) {
-        for event in ctx.events {
-            tracing::warn!(severity = event.severity, "check: {:?}", event.kind);
-        }
         if ctx.tick < 40 {
             return;
         }
@@ -31,7 +28,11 @@ impl Controller for Digger {
             }
         }
         let registry = Registry::get();
-        let solid = |p: &(i32, i32, i32)| !registry.state(ctx.world.block_state_or_air(p.0, p.1, p.2)).is_air;
+        let solid = |p: &(i32, i32, i32)| {
+            !registry
+                .state(ctx.world.block_state_or_air(p.0, p.1, p.2))
+                .is_air
+        };
         let Some(target) = self.targets.iter().copied().find(solid) else {
             ctx.hold_attack(false);
             ctx.stop_aiming();
@@ -70,18 +71,29 @@ impl Controller for Digger {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let mut args = std::env::args().skip(1);
     let address = args.next().unwrap_or_else(|| "localhost".into());
     let name = args.next().unwrap_or_else(|| "Walker".into());
     let numbers: Vec<i32> = args.filter_map(|v| v.parse().ok()).collect();
     let controller = Digger {
-        targets: numbers.chunks_exact(3).map(|c| (c[0], c[1], c[2])).collect(),
-        slot: std::env::var("RAPIDBOT_SLOT").ok().and_then(|v| v.parse().ok()),
+        targets: numbers
+            .chunks_exact(3)
+            .map(|c| (c[0], c[1], c[2]))
+            .collect(),
+        slot: std::env::var("RAPIDBOT_SLOT")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         started: None,
         done: false,
     };
-    let reason = rapidbot_client::run_with(ClientConfig::new(address, Account::Offline { name }), controller).await;
+    let reason = rapidbot_client::run_with(
+        ClientConfig::new(address, Account::Offline { name }),
+        controller,
+    )
+    .await;
     tracing::warn!("connection ended: {reason}");
 }

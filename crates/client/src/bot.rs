@@ -8,7 +8,6 @@
 //! let mut bot = Bot::spawn(config, Idle);
 //! while let Some(event) = bot.next_event().await {
 //!     match event {
-//!         BotEvent::Check(check) if check.severity > 0.6 => bot.disconnect(),
 //!         BotEvent::Disconnected(reason) => println!("left: {reason}"),
 //!         _ => {}
 //!     }
@@ -22,7 +21,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::checks::CheckEvent;
 use crate::{ClientConfig, ClientError, Controller};
 
 /// What a running bot reports to its owner.
@@ -38,12 +36,13 @@ pub enum BotEvent {
     /// "Respawn" after a human delay.
     Died,
     /// A player said something in chat (signed or not).
-    Chat { sender: Uuid, name: Option<String>, text: String },
+    Chat {
+        sender: Uuid,
+        name: Option<String>,
+        text: String,
+    },
     /// A server message: command feedback, broadcasts, plugin chat.
     SystemMessage { text: String, overlay: bool },
-    /// Something that looks like a macro check. The controller sees these
-    /// too, in `TickContext::events`.
-    Check(CheckEvent),
     /// The connection ended. Always the last event.
     Disconnected(String),
 }
@@ -82,7 +81,11 @@ impl Bot {
         let (tx, events) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let chat = Arc::new(Mutex::new(Vec::new()));
-        let link = BotLink { events: tx.clone(), stop: stop.clone(), chat: chat.clone() };
+        let link = BotLink {
+            events: tx.clone(),
+            stop: stop.clone(),
+            chat: chat.clone(),
+        };
         let task = tokio::spawn(async move {
             let reason = match crate::run_inner(config, Box::new(controller), link).await {
                 Ok(reason) | Err(reason) => reason,
@@ -90,7 +93,12 @@ impl Bot {
             let _ = tx.send(BotEvent::Disconnected(reason.to_string()));
             reason
         });
-        Self { events, stop, chat, task }
+        Self {
+            events,
+            stop,
+            chat,
+            task,
+        }
     }
 
     /// The next event, or `None` once the bot has finished and all events
@@ -115,6 +123,8 @@ impl Bot {
 
     /// Waits for the bot to finish and returns why.
     pub async fn wait(self) -> ClientError {
-        self.task.await.unwrap_or_else(|e| ClientError::Protocol(format!("bot task failed: {e}")))
+        self.task
+            .await
+            .unwrap_or_else(|e| ClientError::Protocol(format!("bot task failed: {e}")))
     }
 }

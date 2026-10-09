@@ -15,7 +15,7 @@ everything else is an implementation layer.
 | `rapidbot-nbt` | Network NBT with Java's modified UTF-8 |
 | `rapidbot-world` | Block and item data extracted from the game, chunks, tags, collision shapes, item stacks and components, block ray cast |
 | `rapidbot-physics` | Player movement ported from vanilla, attributes, `Mth`/`Vec3` |
-| `rapidbot-human` | Not vanilla: mouse strokes, reaction times, key timing, typing, fatigue; seeded per account |
+| `rapidbot-human` | Input models: mouse strokes, response delays, key timing, typing, fatigue; seeded per account |
 | `rapidbot-auth` | Microsoft device code → Xbox → XSTS → Minecraft token, chat keys, session join |
 | `rapidbot-recorder` | Windows raw-input recorder (game keys only, only while Minecraft is focused) and an analyser that fits a mouse profile |
 
@@ -25,13 +25,12 @@ everything else is an implementation layer.
 pinned in tests: packet bytes, tick order, movement maths, dig speed, the
 crosshair ray cast, entity interpolation.
 
-**Human.** How a person operates that client: where the mouse goes and how
-fast, when a finger lands on a key, how long a click lasts, how a route is
-walked. This lives in `crates/human` and in `nav.rs` / `combat.rs` of the
-client.
+**Input model.** How intent is translated into mouse, keyboard, and click
+events over time, including reaction delays and movement along a route. This
+lives in `crates/human` and in `nav.rs` / `combat.rs` of the client.
 
 Bot logic never writes rotation or packets directly. It states intent ("look
-there", "hold forward", "click"), the human layer turns that into input over
+there", "hold forward", "click"), the input model turns that into events over
 the following frames, and the vanilla layer turns input into what the server
 sees.
 
@@ -42,7 +41,7 @@ Like the vanilla client, a bot has network tasks and one main thread.
 - `net.rs` reader and writer tasks decode frames and queue packets. A few
   packets are answered on the network side, as vanilla does.
 - The main thread (`game/mod.rs`) runs frames. Each frame it drains the
-  packet queue, polls input (the human models run here, per frame), and runs
+  packet queue, polls input (the input models run here, per frame), and runs
   as many 50 ms ticks as are due.
 - A tick follows `Minecraft.tick`: connection tick, crosshair pick, key
   bindings (the `Controller` runs here), player tick, position packets,
@@ -64,9 +63,9 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `interact.rs` | Crosshair pick, digging, block-change predictions, attacking |
 | `chat.rs`, `commands.rs` | Chat sending and signing, last-seen tracking, the server's command tree |
 | `packs.rs` | Resource pack prompt, download and status packets |
-| `path.rs`, `nav.rs` | A* route finding; a walker that follows routes like a person |
-| `combat.rs` | A fighter: aim, approach, click timing |
-| `checks.rs` | Notices things that look like someone testing the player (teleports, sudden items, staff nearby) |
+| `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
+| `combat.rs` | Target approach, aiming, and attack timing |
+| `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
 
 ## Generated data
 

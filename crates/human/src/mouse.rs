@@ -137,7 +137,10 @@ impl Stroke {
         let len = self.plan_x.hypot(self.plan_y).max(1e-9);
         let (nx, ny) = (-self.plan_y / len, self.plan_x / len);
         let lateral = self.bow * (std::f64::consts::PI * s).sin();
-        (self.plan_x * s + nx * lateral, self.plan_y * s + ny * lateral)
+        (
+            self.plan_x * s + nx * lateral,
+            self.plan_y * s + ny * lateral,
+        )
     }
 }
 
@@ -146,10 +149,15 @@ enum Phase {
     /// Hand resting or holding an aim that is good enough.
     Rest,
     /// Noticed something to do; nothing moves yet.
-    Reacting { remaining: f64 },
+    Reacting {
+        remaining: f64,
+    },
     Moving(Stroke),
     /// Pause after a stroke, before deciding whether to correct.
-    Settling { remaining: f64, corrections: u8 },
+    Settling {
+        remaining: f64,
+        corrections: u8,
+    },
     /// Smoothly following a small or slowly moving error.
     Pursuit,
     /// A small aimless movement while resting.
@@ -210,8 +218,10 @@ impl MouseModel {
     /// Sets (or clears) what the player wants to look at. Cheap to call
     /// every tick with a slowly changing aim.
     pub fn set_target(&mut self, target: Option<Aim>) {
-        if let (Some(new), Some(planned), Phase::Moving(_)) = (target, self.planned_for, self.phase) {
-            let moved = wrap_degrees((new.yaw - planned.yaw) as f64).hypot((new.pitch - planned.pitch) as f64);
+        if let (Some(new), Some(planned), Phase::Moving(_)) = (target, self.planned_for, self.phase)
+        {
+            let moved = wrap_degrees((new.yaw - planned.yaw) as f64)
+                .hypot((new.pitch - planned.pitch) as f64);
             // The goal jumped mid-stroke: the hand keeps going until the
             // change has been noticed, then redirects.
             if moved > 3.0 && self.replan_in.is_none() {
@@ -226,23 +236,18 @@ impl MouseModel {
         self.target
     }
 
-    /// Something outside the player's control changed the view (a teleport
-    /// or forced rotation). Whatever the hand was doing is abandoned; after
-    /// a startled reaction time it re-aims like any other movement.
-    pub fn disturb(&mut self) {
-        let rt = self.reaction() * self.noise.uniform(1.2, 2.2);
-        self.phase = Phase::Reacting { remaining: rt };
-        self.replan_in = None;
-        self.planned_for = None;
-    }
-
     /// True while a stroke or pursuit is under way.
     pub fn is_moving(&self) -> bool {
         matches!(self.phase, Phase::Moving(_) | Phase::Pursuit)
     }
 
     fn reaction(&mut self) -> f64 {
-        reaction_time(&mut self.noise, self.profile.reaction_median, self.profile.reaction_sigma, self.fatigue.level())
+        reaction_time(
+            &mut self.noise,
+            self.profile.reaction_median,
+            self.profile.reaction_sigma,
+            self.fatigue.level(),
+        )
     }
 
     fn plan(&mut self, err_x: f64, err_y: f64, deg_per_count: f64, corrections: u8) -> Stroke {
@@ -251,19 +256,28 @@ impl MouseModel {
         let amplitude_deg = err_x.hypot(err_y) * deg_per_count;
 
         let gain = if corrections == 0 {
-            self.noise.gaussian(self.profile.gain_mean - 0.05 * fatigue, self.profile.gain_sd * noise_factor)
+            self.noise.gaussian(
+                self.profile.gain_mean - 0.05 * fatigue,
+                self.profile.gain_sd * noise_factor,
+            )
         } else {
             // Corrections are small and better calibrated.
-            self.noise.gaussian(0.985, self.profile.gain_sd * 0.7 * noise_factor)
+            self.noise
+                .gaussian(0.985, self.profile.gain_sd * 0.7 * noise_factor)
         }
         .clamp(0.7, 1.2);
-        let angle = self.noise.gaussian(0.0, self.profile.direction_sd * noise_factor).to_radians();
+        let angle = self
+            .noise
+            .gaussian(0.0, self.profile.direction_sd * noise_factor)
+            .to_radians();
         let (sin, cos) = angle.sin_cos();
         let plan_x = (err_x * cos - err_y * sin) * gain;
         let plan_y = (err_y * cos + err_x * sin) * gain;
 
-        let fitts = self.profile.fitts_a + self.profile.fitts_b * (amplitude_deg / self.profile.target_width + 1.0).log2();
-        let duration = (fitts / self.fatigue.speed_factor() * self.noise.lognormal(1.0, 0.12)).max(0.06);
+        let fitts = self.profile.fitts_a
+            + self.profile.fitts_b * (amplitude_deg / self.profile.target_width + 1.0).log2();
+        let duration =
+            (fitts / self.fatigue.speed_factor() * self.noise.lognormal(1.0, 0.12)).max(0.06);
         let length = plan_x.hypot(plan_y);
         Stroke {
             plan_x,
@@ -303,12 +317,18 @@ impl MouseModel {
         stroke.done_y = py;
         // Signal-dependent noise: faster movement, more scatter.
         let sd = self.profile.noise_ratio * self.fatigue.noise_factor() * step_x.hypot(step_y);
-        (step_x + self.noise.gaussian(0.0, sd), step_y + self.noise.gaussian(0.0, sd))
+        (
+            step_x + self.noise.gaussian(0.0, sd),
+            step_y + self.noise.gaussian(0.0, sd),
+        )
     }
 
     fn tremor(&mut self, dt: f64) -> (f64, f64) {
         let sd = self.profile.tremor * self.fatigue.noise_factor() * (dt * 60.0).sqrt();
-        (self.noise.gaussian(0.0, sd), self.noise.gaussian(0.0, sd * 0.7))
+        (
+            self.noise.gaussian(0.0, sd),
+            self.noise.gaussian(0.0, sd * 0.7),
+        )
     }
 
     /// Advances one frame and returns the mouse counts `(dx, dy)` it
@@ -323,7 +343,8 @@ impl MouseModel {
                 t.tolerance.max(0.05) as f64 / deg_per_count,
             )
         });
-        let off_target = |tol_scale: f64| error.is_some_and(|(ex, ey, tol)| ex.hypot(ey) > tol * tol_scale);
+        let off_target =
+            |tol_scale: f64| error.is_some_and(|(ex, ey, tol)| ex.hypot(ey) > tol * tol_scale);
         let pursuit_limit = self.profile.pursuit_limit / deg_per_count;
 
         if let Some(remaining) = self.replan_in {
@@ -346,7 +367,9 @@ impl MouseModel {
                     self.phase = if ex.hypot(ey) < pursuit_limit {
                         Phase::Pursuit
                     } else {
-                        Phase::Reacting { remaining: self.reaction() }
+                        Phase::Reacting {
+                            remaining: self.reaction(),
+                        }
                     };
                     (0.0, 0.0)
                 } else {
@@ -374,17 +397,27 @@ impl MouseModel {
             Phase::Moving(mut stroke) => {
                 let step = self.advance(&mut stroke, dt);
                 self.phase = if stroke.elapsed >= stroke.duration {
-                    let pause = self.noise.lognormal(self.profile.settle_median, 0.3) * (1.0 + 0.3 * self.fatigue.level());
-                    Phase::Settling { remaining: pause, corrections: stroke.corrections }
+                    let pause = self.noise.lognormal(self.profile.settle_median, 0.3)
+                        * (1.0 + 0.3 * self.fatigue.level());
+                    Phase::Settling {
+                        remaining: pause,
+                        corrections: stroke.corrections,
+                    }
                 } else {
                     Phase::Moving(stroke)
                 };
                 step
             }
-            Phase::Settling { remaining, corrections } => {
+            Phase::Settling {
+                remaining,
+                corrections,
+            } => {
                 let remaining = remaining - dt;
                 if remaining > 0.0 {
-                    self.phase = Phase::Settling { remaining, corrections };
+                    self.phase = Phase::Settling {
+                        remaining,
+                        corrections,
+                    };
                 } else if off_target(1.0) && corrections < 3 {
                     let (ex, ey, _) = error.unwrap();
                     let stroke = self.plan(ex, ey, deg_per_count, corrections + 1);
@@ -403,13 +436,16 @@ impl MouseModel {
                         (0.0, 0.0)
                     } else if distance > pursuit_limit * 1.5 {
                         // Too far to follow smoothly: needs a proper stroke.
-                        self.phase = Phase::Reacting { remaining: self.reaction() * 0.6 };
+                        self.phase = Phase::Reacting {
+                            remaining: self.reaction() * 0.6,
+                        };
                         (0.0, 0.0)
                     } else {
                         // First-order lag of about 130 ms.
                         let k = 1.0 - (-dt * self.fatigue.speed_factor() / 0.13).exp();
                         let (tx, ty) = self.tremor(dt);
-                        let sd = self.profile.noise_ratio * self.fatigue.noise_factor() * distance * k;
+                        let sd =
+                            self.profile.noise_ratio * self.fatigue.noise_factor() * distance * k;
                         (
                             ex * k + self.noise.gaussian(0.0, sd) + tx * 0.5,
                             ey * k + self.noise.gaussian(0.0, sd) + ty * 0.5,
@@ -423,7 +459,11 @@ impl MouseModel {
             },
             Phase::Fidget(mut stroke) => {
                 let step = self.advance(&mut stroke, dt);
-                self.phase = if stroke.elapsed >= stroke.duration { Phase::Rest } else { Phase::Fidget(stroke) };
+                self.phase = if stroke.elapsed >= stroke.duration {
+                    Phase::Rest
+                } else {
+                    Phase::Fidget(stroke)
+                };
                 step
             }
         };
@@ -464,9 +504,17 @@ mod tests {
         let mut m = MouseModel::new(seed);
         // No fidgets, so the first motion is the reaction to the target.
         m.next_fidget = f64::MAX;
-        m.set_target(Some(Aim { yaw: target_yaw, pitch: 0.0, tolerance: 1.0 }));
+        m.set_target(Some(Aim {
+            yaw: target_yaw,
+            pitch: 0.0,
+            tolerance: 1.0,
+        }));
         let (mut yaw, mut pitch) = (0.0f32, 0.0f32);
-        let mut run = Run { yaw: vec![], first_motion: None, max_speed: 0.0 };
+        let mut run = Run {
+            yaw: vec![],
+            first_motion: None,
+            max_speed: 0.0,
+        };
         for i in 0..(seconds / DT) as usize {
             let (dx, dy) = m.frame(DT, yaw, pitch, DPC);
             if (dx, dy) != (0, 0) && run.first_motion.is_none() {
@@ -488,8 +536,16 @@ mod tests {
             let end = *run.yaw.last().unwrap();
             assert!((end - 90.0).abs() < 2.5, "seed {seed}: ended at {end}");
             // A person flicks at a few hundred degrees per second, not thousands.
-            assert!(run.max_speed < 900.0, "seed {seed}: {} deg/s", run.max_speed);
-            assert!(run.max_speed > 100.0, "seed {seed}: {} deg/s", run.max_speed);
+            assert!(
+                run.max_speed < 900.0,
+                "seed {seed}: {} deg/s",
+                run.max_speed
+            );
+            assert!(
+                run.max_speed > 100.0,
+                "seed {seed}: {} deg/s",
+                run.max_speed
+            );
         }
     }
 
@@ -515,48 +571,26 @@ mod tests {
             }
             // Where the first stroke stopped: first frame pair with no motion after moving.
             let moved = run.yaw.iter().position(|y| *y > 5.0).unwrap();
-            let stop = run.yaw[moved..].windows(3).position(|w| w[0] == w[1] && w[1] == w[2]).map(|i| run.yaw[moved + i]);
+            let stop = run.yaw[moved..]
+                .windows(3)
+                .position(|w| w[0] == w[1] && w[1] == w[2])
+                .map(|i| run.yaw[moved + i]);
             if stop.is_some_and(|y| y < 59.0) {
                 under += 1;
             }
         }
         assert!(over > 10, "overshoots: {over}");
         assert!(under > 10, "undershoots: {under}");
-        assert!(under > over / 2, "undershoot should be common: {under} vs {over}");
+        assert!(
+            under > over / 2,
+            "undershoot should be common: {under} vs {over}"
+        );
     }
 
     #[test]
     fn deterministic_per_seed_and_different_between_seeds() {
         assert_eq!(turn(7, 90.0, 2.0).yaw, turn(7, 90.0, 2.0).yaw);
         assert_ne!(turn(7, 90.0, 2.0).yaw, turn(8, 90.0, 2.0).yaw);
-    }
-
-    #[test]
-    fn disturbance_is_not_corrected_instantly() {
-        for seed in 0..40 {
-            let mut m = MouseModel::new(seed);
-            m.next_fidget = f64::MAX;
-            m.set_target(Some(Aim { yaw: 0.0, pitch: 0.0, tolerance: 1.0 }));
-            let (mut yaw, mut pitch) = (0.0f32, 0.0f32);
-            for _ in 0..30 {
-                let (dx, dy) = m.frame(DT, yaw, pitch, DPC);
-                apply(&mut yaw, &mut pitch, dx, dy);
-            }
-            // The server snaps the head 70 degrees away.
-            yaw = 70.0;
-            m.disturb();
-            let mut frames_still = 0;
-            loop {
-                let (dx, dy) = m.frame(DT, yaw, pitch, DPC);
-                if (dx, dy) != (0, 0) {
-                    break;
-                }
-                frames_still += 1;
-                assert!(frames_still < 300, "seed {seed}: never reacted");
-            }
-            let delay = frames_still as f64 * DT;
-            assert!(delay >= 0.13, "seed {seed}: corrected after only {delay}s");
-        }
     }
 
     #[test]
@@ -571,7 +605,10 @@ mod tests {
             }
         }
         assert!(silent < total, "a resting hand still fidgets sometimes");
-        assert!(silent as f64 > total as f64 * 0.9, "{silent}/{total} silent");
+        assert!(
+            silent as f64 > total as f64 * 0.9,
+            "{silent}/{total} silent"
+        );
     }
 
     #[test]
@@ -579,7 +616,10 @@ mod tests {
         let mean_duration = |fatigue: f64| {
             let mut m = MouseModel::with_profile(5, MouseProfile::default());
             m.fatigue.set_level(fatigue);
-            (0..200).map(|_| m.plan(400.0, 0.0, DPC, 0).duration).sum::<f64>() / 200.0
+            (0..200)
+                .map(|_| m.plan(400.0, 0.0, DPC, 0).duration)
+                .sum::<f64>()
+                / 200.0
         };
         assert!(mean_duration(0.9) > mean_duration(0.0) * 1.15);
     }
@@ -592,12 +632,19 @@ mod tests {
         let mut max_step = 0;
         // The target drifts at 10 degrees per second.
         for i in 0..240 {
-            m.set_target(Some(Aim { yaw: i as f32 * DT as f32 * 10.0, pitch: 0.0, tolerance: 0.5 }));
+            m.set_target(Some(Aim {
+                yaw: i as f32 * DT as f32 * 10.0,
+                pitch: 0.0,
+                tolerance: 0.5,
+            }));
             let (dx, dy) = m.frame(DT, yaw, pitch, DPC);
             max_step = max_step.max(dx.abs());
             apply(&mut yaw, &mut pitch, dx, dy);
         }
         assert!((yaw - 40.0).abs() < 4.0, "lagging at {yaw}");
-        assert!(max_step < 12, "pursuit should have no flicks, saw {max_step} counts");
+        assert!(
+            max_step < 12,
+            "pursuit should have no flicks, saw {max_step} counts"
+        );
     }
 }

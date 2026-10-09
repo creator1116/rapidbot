@@ -1,7 +1,7 @@
 //! Walks a straight obstacle course in the +x direction: through water (it
 //! holds jump to stay afloat), up ladders, and opening an elytra when it
 //! finds itself falling while wearing one. For checking fluid,
-//! climbing and gliding physics against a server and its anticheat.
+//! climbing and gliding physics against a local server.
 //!
 //!     cargo run --release -p rapidbot-client --example course -- localhost:25565 Walker 130
 //!
@@ -24,9 +24,6 @@ struct Course {
 
 impl Controller for Course {
     fn tick(&mut self, ctx: &mut TickContext<'_>) {
-        for event in ctx.events {
-            tracing::warn!(severity = event.severity, "check: {:?}", event.kind);
-        }
         if ctx.tick == 40 {
             if let Some(slot) = self.slot {
                 ctx.select_slot(slot);
@@ -38,7 +35,12 @@ impl Controller for Course {
         let p = &*ctx.player;
         if ctx.tick % 100 == 0 {
             let held = ctx.inventory.held().map_or("nothing", |s| s.name());
-            tracing::info!(slot = ctx.inventory.selected, held, can_glide = ctx.inventory.can_glide(), "inventory");
+            tracing::info!(
+                slot = ctx.inventory.selected,
+                held,
+                can_glide = ctx.inventory.can_glide(),
+                "inventory"
+            );
         }
         if ctx.tick % 20 == 0 {
             tracing::info!(
@@ -58,14 +60,23 @@ impl Controller for Course {
             ctx.stop_aiming();
             return;
         }
-        let mut keys = Keys { forward: true, sprint: self.sprint, ..Keys::default() };
+        let mut keys = Keys {
+            forward: true,
+            sprint: self.sprint,
+            ..Keys::default()
+        };
         // Afloat: a person holds space in water (unless diving to swim).
         // A swimmer pressed against the pool's edge needs it too.
         if p.in_water && (!self.sprint || p.horizontal_collision) {
             keys.jump = true;
         }
         // Falling with an elytra on: tap jump to open it.
-        if ctx.inventory.can_glide() && !p.on_ground && !p.fall_flying && !p.in_water && p.fall_distance > 3.0 && self.open_glider == 0
+        if ctx.inventory.can_glide()
+            && !p.on_ground
+            && !p.fall_flying
+            && !p.in_water
+            && p.fall_distance > 3.0
+            && self.open_glider == 0
         {
             self.open_glider = 4;
         }
@@ -91,7 +102,9 @@ impl Controller for Course {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let mut args = std::env::args().skip(1);
     let address = args.next().unwrap_or_else(|| "localhost".into());
@@ -100,10 +113,19 @@ async fn main() {
     let controller = Course {
         stop_x,
         sprint: std::env::var_os("RAPIDBOT_SPRINT").is_some(),
-        slot: std::env::var("RAPIDBOT_SLOT").ok().and_then(|v| v.parse().ok()),
+        slot: std::env::var("RAPIDBOT_SLOT")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         open_glider: 0,
-        pitch: std::env::var("RAPIDBOT_GLIDE_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(12.0),
+        pitch: std::env::var("RAPIDBOT_GLIDE_PITCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.0),
     };
-    let reason = rapidbot_client::run_with(ClientConfig::new(address, Account::Offline { name }), controller).await;
+    let reason = rapidbot_client::run_with(
+        ClientConfig::new(address, Account::Offline { name }),
+        controller,
+    )
+    .await;
     tracing::warn!("connection ended: {reason}");
 }

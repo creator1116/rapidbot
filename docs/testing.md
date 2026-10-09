@@ -25,10 +25,12 @@ interaction changes, run it against a local server.
 A vanilla 26.3 server works for basic checks. Set `online-mode=false` and
 `white-list=false` in `server.properties`.
 
-To test against an anticheat, use a Paper server with an anticheat plugin
-and ViaVersion (anticheats often trail the newest game version; ViaVersion
-lets the 26.3 client join an older server). Turn on the anticheat's verbose
-or alert output so flags appear in the console.
+To compare movement behavior with a server-side movement validator, use a
+Paper server with a validator plugin and ViaVersion (validators may trail
+the newest game version; ViaVersion lets the 26.3 client join an older
+server). Enable its diagnostic or alert output. Only run these tests on a
+server you operate or have explicit permission to test; validator output is
+compatibility evidence, not authorization to bypass server rules.
 
 Enable RCON to script the server from tests:
 
@@ -64,7 +66,7 @@ cargo run --release -p rapidbot-client --example fight -- localhost:25565 Walker
 |---|---|
 | `ping` | Server list ping |
 | `join` | Joins and idles (offline name, or `--microsoft accounts/main.json`) |
-| `walk` | Wanders like a person and logs suspected checks |
+| `walk` | Demonstrates route finding and timed input |
 | `chat` | Types the given lines into chat |
 | `course` | Walks along +x through water and ladders; glides when wearing an elytra |
 | `dig` | Digs the listed blocks from where it stands |
@@ -73,9 +75,9 @@ cargo run --release -p rapidbot-client --example fight -- localhost:25565 Walker
 ## What to look for
 
 - The server keeps the bot connected and does not move it back.
-- The anticheat console shows no flags. Run with nothing heavy alongside:
-  a busy machine makes ticks irregular, which shows up as timer flags that
-  are not the bot's doing.
+- The validator reports no movement discrepancies. Run with nothing heavy
+  alongside: a busy machine makes ticks irregular, which can produce timer
+  alerts unrelated to movement calculations.
 - The effect happened on the server (the block is gone, the mob is dead),
   not only in the bot's own view.
 

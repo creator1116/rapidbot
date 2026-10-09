@@ -33,20 +33,19 @@ async fn main() {
 
     let (goal_tx, goals) = mpsc::channel();
     let config = ClientConfig::new(address, Account::Offline { name });
-    let mut bot = Bot::spawn(config, Remote { walker: Walker::new(1), goals });
+    let mut bot = Bot::spawn(
+        config,
+        Remote {
+            walker: Walker::new(1),
+            goals,
+        },
+    );
 
     while let Some(event) = bot.next_event().await {
         match event {
             BotEvent::Loaded => {
                 // Your program decides what the bot does.
                 let _ = goal_tx.send(Vec3::new(10.0, 0.0, 10.0));
-            }
-            BotEvent::Check(check) => {
-                println!("possible check: {:?} (severity {:.2})", check.kind, check.severity);
-                if check.severity >= 0.8 {
-                    println!("leaving to be safe");
-                    bot.disconnect();
-                }
             }
             BotEvent::Disconnected(reason) => println!("disconnected: {reason}"),
             other => println!("{other:?}"),

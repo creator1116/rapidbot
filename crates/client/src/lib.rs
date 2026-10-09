@@ -6,9 +6,8 @@
 pub mod address;
 mod bot;
 pub mod chat;
-pub mod combat;
-pub mod checks;
 pub mod clock;
+pub mod combat;
 pub mod commands;
 pub mod controller;
 pub mod crypto;
@@ -19,9 +18,9 @@ pub mod inventory;
 mod login;
 pub mod mouse;
 pub mod nav;
+mod net;
 mod packs;
 pub mod path;
-mod net;
 pub mod text;
 
 use std::collections::HashMap;
@@ -36,11 +35,10 @@ use tracing::info;
 use uuid::Uuid;
 
 pub use bot::{Bot, BotEvent};
-pub use checks::{CheckEvent, CheckKind};
 pub use controller::{Controller, Idle, TickContext};
+pub use game::{DisplaySettings, LocalPlayer};
 pub use mouse::MouseSettings;
 pub use rapidbot_human as human;
-pub use game::{DisplaySettings, LocalPlayer};
 pub use rapidbot_physics::{Keys, math};
 pub use rapidbot_world as world;
 
@@ -227,7 +225,10 @@ async fn run_inner(
     let mut session = SessionData::default();
     let (profile, session_id) = login::login(&mut connection, &config, &mut session).await?;
     info!(name = %profile.name.0, uuid = %profile.id, "logged in");
-    link.emit(BotEvent::LoggedIn { name: profile.name.0.clone(), uuid: profile.id });
+    link.emit(BotEvent::LoggedIn {
+        name: profile.name.0.clone(),
+        uuid: profile.id,
+    });
     session.profile = Some(profile);
     session.session_id = Some(session_id);
 

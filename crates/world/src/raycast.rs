@@ -3,8 +3,9 @@
 //! uses (`Entity.pick`).
 
 use crate::aabb::Axis;
+use crate::fluid::{self, FluidKind};
 use crate::shape::Shape;
-use crate::{Registry, World};
+use crate::{Registry, Tags, World};
 
 /// `Direction`, in vanilla's order (the ordinal goes on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,4 +268,48 @@ pub fn clip(world: &World, from: [f64; 3], to: [f64; 3]) -> BlockHit {
         let direction = Direction::approximate_nearest(from[0] - to[0], from[1] - to[1], from[2] - to[2]);
         BlockHit { pos: (floor(to[0]), floor(to[1]), floor(to[2])), location: to, direction, inside: false, miss: true }
     })
+}
+
+fn segment_intersects_box(from: [f64; 3], to: [f64; 3], min: [f64; 3], max: [f64; 3]) -> bool {
+    let mut entry = 0.0f64;
+    let mut exit = 1.0f64;
+    for axis in 0..3 {
+        let delta = to[axis] - from[axis];
+        if delta == 0.0 {
+            if from[axis] < min[axis] || from[axis] > max[axis] {
+                return false;
+            }
+            continue;
+        }
+        let first = (min[axis] - from[axis]) / delta;
+        let second = (max[axis] - from[axis]) / delta;
+        entry = entry.max(first.min(second));
+        exit = exit.min(first.max(second));
+        if entry > exit {
+            return false;
+        }
+    }
+    true
+}
+
+/// `ClipContext.Block.FALLDAMAGE_RESETTING` with `ClipContext.Fluid.WATER`.
+pub fn fall_damage_resetting(world: &World, tags: &Tags, from: [f64; 3], to: [f64; 3]) -> bool {
+    let registry = Registry::get();
+    traverse_blocks(from, to, |(x, y, z)| {
+        let state_id = world.block_state_or_air(x, y, z);
+        let block = registry.block_of(state_id);
+        let resetting_block = tags.block_is("minecraft:fall_damage_resetting", block.id)
+            || matches!(block.name.as_str(), "minecraft:end_gateway" | "minecraft:end_portal");
+        if resetting_block && segment_intersects_box(from, to, [x as f64, y as f64, z as f64], [x as f64 + 1.0, y as f64 + 1.0, z as f64 + 1.0]) {
+            return Some(());
+        }
+
+        let fluid = fluid::fluid_at(world, x, y, z)?;
+        if fluid.kind != FluidKind::Water {
+            return None;
+        }
+        let height = fluid::height(world, fluid, x, y, z) as f64;
+        segment_intersects_box(from, to, [x as f64, y as f64, z as f64], [x as f64 + 1.0, y as f64 + height, z as f64 + 1.0]).then_some(())
+    })
+    .is_some()
 }

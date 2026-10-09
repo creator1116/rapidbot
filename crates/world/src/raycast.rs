@@ -2,10 +2,13 @@
 //! `ClipContext.Block.OUTLINE` and no fluids, which is what the crosshair
 //! uses (`Entity.pick`).
 
+use std::sync::OnceLock;
+
 use crate::aabb::Axis;
 use crate::fluid::{self, FluidKind};
 use crate::shape::Shape;
-use crate::{Registry, Tags, World};
+use crate::tags::Tags;
+use crate::{Registry, World};
 
 /// `Direction`, in vanilla's order (the ordinal goes on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -270,26 +273,15 @@ pub fn clip(world: &World, from: [f64; 3], to: [f64; 3]) -> BlockHit {
     })
 }
 
-fn segment_intersects_box(from: [f64; 3], to: [f64; 3], min: [f64; 3], max: [f64; 3]) -> bool {
-    let mut entry = 0.0f64;
-    let mut exit = 1.0f64;
-    for axis in 0..3 {
-        let delta = to[axis] - from[axis];
-        if delta == 0.0 {
-            if from[axis] < min[axis] || from[axis] > max[axis] {
-                return false;
-            }
-            continue;
-        }
-        let first = (min[axis] - from[axis]) / delta;
-        let second = (max[axis] - from[axis]) / delta;
-        entry = entry.max(first.min(second));
-        exit = exit.min(first.max(second));
-        if entry > exit {
-            return false;
-        }
-    }
-    true
+fn full_block_shape() -> &'static Shape {
+    static SHAPE: OnceLock<Shape> = OnceLock::new();
+    SHAPE.get_or_init(|| {
+        Shape::new(
+            [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],
+            vec![true],
+            true,
+        )
+    })
 }
 
 /// `ClipContext.Block.FALLDAMAGE_RESETTING` with `ClipContext.Fluid.WATER`.
@@ -300,7 +292,7 @@ pub fn fall_damage_resetting(world: &World, tags: &Tags, from: [f64; 3], to: [f6
         let block = registry.block_of(state_id);
         let resetting_block = tags.block_is("minecraft:fall_damage_resetting", block.id)
             || matches!(block.name.as_str(), "minecraft:end_gateway" | "minecraft:end_portal");
-        if resetting_block && segment_intersects_box(from, to, [x as f64, y as f64, z as f64], [x as f64 + 1.0, y as f64 + 1.0, z as f64 + 1.0]) {
+        if resetting_block && full_block_shape().clip(from, to, (x, y, z)).is_some() {
             return Some(());
         }
 
@@ -309,7 +301,12 @@ pub fn fall_damage_resetting(world: &World, tags: &Tags, from: [f64; 3], to: [f6
             return None;
         }
         let height = fluid::height(world, fluid, x, y, z) as f64;
-        segment_intersects_box(from, to, [x as f64, y as f64, z as f64], [x as f64 + 1.0, y as f64 + height, z as f64 + 1.0]).then_some(())
+        let shape = Shape::new(
+            [vec![0.0, 1.0], vec![0.0, height], vec![0.0, 1.0]],
+            vec![true],
+            false,
+        );
+        shape.clip(from, to, (x, y, z)).map(|_| ())
     })
     .is_some()
 }

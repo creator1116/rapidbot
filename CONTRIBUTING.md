@@ -2,7 +2,7 @@
 
 Thanks for helping. rapidbot is a Minecraft Java Edition client written from
 scratch in Rust; its one hard requirement is that it behaves like the vanilla
-client. Most of the review effort goes into checking that.
+client. Most of the review effort goes into checking that. 
 
 By participating, you agree to follow the project's
 [Code of Conduct](CODE_OF_CONDUCT.md).

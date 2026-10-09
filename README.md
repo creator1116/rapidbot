@@ -2,7 +2,7 @@
 
 A headless Minecraft Java Edition bot framework in Rust, built from scratch to
 behave exactly like the vanilla client: byte-exact on the wire, tick-exact in
-physics and timing.
+physics and timing. 
 
 Targets **Minecraft 26.3** (protocol 777).
 
@@ -115,3 +115,5 @@ write our own implementation, and never commit anything under `vanilla/`.
 
 Run bots only on servers where you are allowed to. See the
 [Code of Conduct](CODE_OF_CONDUCT.md). MIT licensed: see [LICENSE](LICENSE).
+
+https://ace.nether.bio

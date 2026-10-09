@@ -1147,7 +1147,18 @@ impl Player {
         let movement = self.collide(ctx, delta);
         let movement_length = movement.length_sqr();
         if movement_length > 1.0e-7 || delta.length_sqr() - movement_length < 1.0e-7 {
-            // (Fall-distance reset by raycast when moving >= 1 block/tick: TODO.)
+            if self.fall_distance != 0.0 && movement_length >= 1.0 {
+                let check_distance = movement_length.sqrt().min(8.0);
+                let check_to = self.pos.add(movement.normalize().scale(check_distance));
+                if rapidbot_world::raycast::fall_damage_resetting(
+                    ctx.world,
+                    ctx.tags,
+                    [self.pos.x, self.pos.y, self.pos.z],
+                    [check_to.x, check_to.y, check_to.z],
+                ) {
+                    self.fall_distance = 0.0;
+                }
+            }
             let new_pos = self.pos.add(movement);
             self.movements.push((self.pos, new_pos, Some(delta)));
             self.set_pos(new_pos);

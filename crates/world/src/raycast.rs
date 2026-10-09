@@ -2,8 +2,12 @@
 //! `ClipContext.Block.OUTLINE` and no fluids, which is what the crosshair
 //! uses (`Entity.pick`).
 
+use std::sync::OnceLock;
+
 use crate::aabb::Axis;
+use crate::fluid::{self, FluidKind};
 use crate::shape::Shape;
+use crate::tags::Tags;
 use crate::{Registry, World};
 
 /// `Direction`, in vanilla's order (the ordinal goes on the wire).
@@ -267,4 +271,42 @@ pub fn clip(world: &World, from: [f64; 3], to: [f64; 3]) -> BlockHit {
         let direction = Direction::approximate_nearest(from[0] - to[0], from[1] - to[1], from[2] - to[2]);
         BlockHit { pos: (floor(to[0]), floor(to[1]), floor(to[2])), location: to, direction, inside: false, miss: true }
     })
+}
+
+fn full_block_shape() -> &'static Shape {
+    static SHAPE: OnceLock<Shape> = OnceLock::new();
+    SHAPE.get_or_init(|| {
+        Shape::new(
+            [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],
+            vec![true],
+            true,
+        )
+    })
+}
+
+/// `ClipContext.Block.FALLDAMAGE_RESETTING` with `ClipContext.Fluid.WATER`.
+pub fn fall_damage_resetting(world: &World, tags: &Tags, from: [f64; 3], to: [f64; 3]) -> bool {
+    let registry = Registry::get();
+    traverse_blocks(from, to, |(x, y, z)| {
+        let state_id = world.block_state_or_air(x, y, z);
+        let block = registry.block_of(state_id);
+        let resetting_block = tags.block_is("minecraft:fall_damage_resetting", block.id)
+            || matches!(block.name.as_str(), "minecraft:end_gateway" | "minecraft:end_portal");
+        if resetting_block && full_block_shape().clip(from, to, (x, y, z)).is_some() {
+            return Some(());
+        }
+
+        let fluid = fluid::fluid_at(world, x, y, z)?;
+        if fluid.kind != FluidKind::Water {
+            return None;
+        }
+        let height = fluid::height(world, fluid, x, y, z) as f64;
+        let shape = Shape::new(
+            [vec![0.0, 1.0], vec![0.0, height], vec![0.0, 1.0]],
+            vec![true],
+            false,
+        );
+        shape.clip(from, to, (x, y, z)).map(|_| ())
+    })
+    .is_some()
 }

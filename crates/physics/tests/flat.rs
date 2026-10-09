@@ -80,6 +80,44 @@ fn falls_with_vanilla_velocities() {
     assert_eq!(p.pos.y, 64.0);
 }
 
+fn player_falling_through(world: &World, tags: &Tags, velocity: f64) -> Player {
+    let mut p = player_at(0.5, 70.0, 0.5);
+    p.fall_distance = 5.0;
+    p.delta_movement = Vec3::new(0.0, velocity, 0.0);
+    p.tick(world, tags);
+    p
+}
+
+#[test]
+fn fast_fall_through_water_resets_accumulated_fall_distance() {
+    let mut world = flat_world("minecraft:stone");
+    world.set_block_state(0, 68, 0, state("minecraft:water"));
+    let tags = Tags::default();
+    let p = player_falling_through(&world, &tags, -2.0);
+    assert!(p.fall_distance < 3.0, "fall distance {}", p.fall_distance);
+}
+
+#[test]
+fn fast_fall_through_resetting_block_resets_accumulated_fall_distance() {
+    let mut world = flat_world("minecraft:stone");
+    let hay = state("minecraft:hay_block");
+    world.set_block_state(0, 68, 0, hay);
+    let mut tags = Tags::default();
+    let block = Registry::get().block_of(hay).id;
+    tags.insert("minecraft:block", "minecraft:fall_damage_resetting", block);
+    let p = player_falling_through(&world, &tags, -2.0);
+    assert!(p.fall_distance < 3.0, "fall distance {}", p.fall_distance);
+}
+
+#[test]
+fn slow_fall_does_not_reset_accumulated_fall_distance() {
+    let mut world = flat_world("minecraft:stone");
+    world.set_block_state(0, 69, 0, state("minecraft:water"));
+    let tags = Tags::default();
+    let p = player_falling_through(&world, &tags, -0.5);
+    assert!(p.fall_distance > 5.0, "fall distance {}", p.fall_distance);
+}
+
 fn run_forward(sprint: bool, ticks: usize) -> Player {
     let world = flat_world("minecraft:stone");
     let tags = Tags::default();

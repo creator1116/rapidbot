@@ -56,7 +56,7 @@ impl Container {
     }
 
     /// `PalettedContainer.read` with the block-state `Strategy`.
-    fn read_block_states(buf: &mut &[u8], global_bits: u32) -> Result<Self, DecodeError> {
+    fn read_block_states(buf: &mut &[u8], global_bits: u32, state_count: usize) -> Result<Self, DecodeError> {
         let bits = u8::decode(buf)? as u32;
         match bits {
             0 => {
@@ -72,9 +72,30 @@ impl Container {
                 Ok(Container::Packed { palette: Some(palette), bits: storage_bits, data })
             }
             // Global palette: stored at the in-memory width of the registry.
-            _ => Ok(Container::Packed { palette: None, bits: global_bits, data: read_longs(buf, global_bits)? }),
+            _ => {
+                let data = read_longs(buf, global_bits)?;
+                validate_global_states(&data, global_bits, state_count)?;
+                Ok(Container::Packed { palette: None, bits: global_bits, data })
+            }
         }
     }
+}
+
+fn validate_global_states(data: &[u64], bits: u32, state_count: usize) -> Result<(), DecodeError> {
+    if bits == 0 || bits > 64 {
+        return Err(DecodeError::Custom("invalid global block state bit width".into()));
+    }
+    let per_long = (64 / bits) as usize;
+    let mask = u64::MAX >> (64 - bits);
+    for index in 0..SECTION_VOLUME {
+        let word = data[index / per_long];
+        let shift = (index % per_long) as u32 * bits;
+        let raw = (word >> shift) & mask;
+        if usize::try_from(raw).map_or(true, |id| id >= state_count) {
+            return Err(DecodeError::Custom(format!("global block state ID {raw} exceeds registry size {state_count}")));
+        }
+    }
+    Ok(())
 }
 
 fn read_palette(buf: &mut &[u8]) -> Result<Vec<StateId>, DecodeError> {
@@ -152,7 +173,7 @@ impl Chunk {
         while !buf.is_empty() {
             let _non_empty = i16::decode(&mut buf)?;
             let _fluids = i16::decode(&mut buf)?;
-            let states = Container::read_block_states(&mut buf, state_bits)?;
+            let states = Container::read_block_states(&mut buf, state_bits, state_count)?;
             skip_biomes(&mut buf, biome_bits)?;
             sections.push(Section { states });
         }
@@ -214,5 +235,24 @@ mod tests {
         s.set(3, 1, 7, 42);
         assert_eq!(s.get(3, 1, 7), 42);
         assert_eq!(s.get(3, 0, 7), 1);
+    }
+
+    #[test]
+    fn global_palette_ids_must_exist_in_registry() {
+        let read = |first_state: u64| {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.push(9); // global palette; registry size 17 uses 5-bit IDs
+            let longs = SECTION_VOLUME.div_ceil(64 / 5);
+            for index in 0..longs {
+                buf.extend_from_slice(&(if index == 0 { first_state } else { 0 }).to_be_bytes());
+            }
+            buf.extend_from_slice(&[0, 0]); // single-value biome container
+            Chunk::read_sections(&buf, 17, 64)
+        };
+
+        assert_eq!(read(16).unwrap().sections[0].get(0, 0, 0), 16);
+        assert!(matches!(read(17), Err(DecodeError::Custom(_))));
     }
 }

@@ -4,7 +4,8 @@
 //! bot logic, and it only decides *where* to go. [`crate::nav::Walker`]
 //! turns the result into mouse and key input.
 //!
-//! Not handled yet: doors, breaking or placing blocks.
+//! Not handled yet: breaking or placing blocks. Doors are opened on the way
+//! through, but not broken.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -14,6 +15,8 @@ use rapidbot_physics::math::Vec3;
 use rapidbot_world::collision::block_collisions;
 use rapidbot_world::fluid::{self, FluidKind};
 use rapidbot_world::{Aabb, Axis, Registry, World};
+
+use crate::door::{self, Door};
 
 /// Player box: 0.6 wide, 1.8 tall.
 const HALF_WIDTH: f64 = 0.3;
@@ -145,6 +148,17 @@ pub fn surface(world: &World, x: i32, y: i32, z: i32) -> Option<f64> {
     let registry = Registry::get();
     let here = world.block_state(x, y, z)?;
     let here_shape = registry.collision_shape(here);
+    // An open door's own shape is a thin panel at the side, so it is not a
+    // surface to stand on. The floor below the door is.
+    let open_door = if let Some(door) = door::at(world, x, y, z)
+        && door.open
+        && door.is_lower((x, y, z))
+    {
+        let below = world.block_state(x, y - 1, z)?;
+        Some((door.standing_height(world)?, below))
+    } else {
+        None
+    };
     // Only the top water cell, and only when the water is deep enough to
     // swim: one-deep water is handled as wading on the block below.
     let water_surface = if here_shape.is_none()
@@ -157,7 +171,9 @@ pub fn surface(world: &World, x: i32, y: i32, z: i32) -> Option<f64> {
     } else {
         None
     };
-    let (s, floor) = if let Some(s) = water_surface {
+    let (s, floor) = if let Some((s, floor)) = open_door {
+        (s, floor)
+    } else if let Some(s) = water_surface {
         (s, here)
     } else if climbable_at(world, x, y, z) {
         (y as f64, here)
@@ -248,6 +264,8 @@ pub struct Waypoint {
     pub surface: f64,
     /// Reached by a sprint jump over a gap, from the previous waypoint.
     pub jump: bool,
+    /// The door to open here, if this is the lower half of one.
+    pub door: Option<Door>,
 }
 
 impl Waypoint {
@@ -338,7 +356,7 @@ impl Search {
     pub fn step(&mut self, world: &World, budget: usize) -> Option<Path> {
         for _ in 0..budget {
             let Some(Reverse((_, id))) = self.open.pop() else {
-                return Some(self.path());
+                return Some(self.path(world));
             };
             let node = &mut self.nodes[id as usize];
             if node.closed {
@@ -348,7 +366,7 @@ impl Search {
             let (cell, surface, cost) = (node.cell, node.surface, node.cost);
             if self.goal.reached(cell, surface) {
                 self.best = id;
-                return Some(self.path());
+                return Some(self.path(world));
             }
             let best = &self.nodes[self.best as usize];
             let (h, best_h) = (self.goal.estimate(cell), self.goal.estimate(best.cell));
@@ -357,7 +375,7 @@ impl Search {
             }
             self.expanded += 1;
             if self.expanded >= self.limit {
-                return Some(self.path());
+                return Some(self.path(world));
             }
             self.expand(world, id, cell, surface, cost);
         }
@@ -368,6 +386,7 @@ impl Search {
         let (x, y, z) = cell;
         for (dx, dz) in CARDINALS {
             // The highest place in the next column that can be got to.
+            let mut stepped = false;
             for ny in (y - 4..=y + 1).rev() {
                 let Some(s2) = self.surface(world, (x + dx, ny, z + dz)) else {
                     continue;
@@ -393,7 +412,17 @@ impl Search {
                     1.0 - d * 0.4
                 };
                 self.relax(world, id, (x + dx, ny, z + dz), s2, cost + step_cost);
+                stepped = true;
                 break;
+            }
+            if !stepped {
+                // A closed door has no ordinary surface. Treat it as a
+                // place to stand once it has been opened.
+                for ny in [y + 1, y, y - 1] {
+                    if self.door_step(world, id, (x + dx, ny, z + dz), s, cost) {
+                        break;
+                    }
+                }
             }
         }
         for (dx, dz) in DIAGONALS {
@@ -409,6 +438,7 @@ impl Search {
                 let high = s.max(s2);
                 let side_ok = |cx: i32, cz: i32| {
                     column_free(world, cx, cz, high, high + HEIGHT)
+                        && door::at(world, cx, high.floor() as i32, cz).is_none()
                         && (trait_at(world, cx, high.floor() as i32, cz)
                             | trait_at(world, cx, high.floor() as i32 - 1, cz))
                             & DANGER
@@ -423,6 +453,41 @@ impl Search {
         }
         self.gap_jumps(world, id, cell, s, cost);
         self.climb(world, id, cell, cost);
+    }
+
+    /// A closed door is a passable place after a right click. Add it as a
+    /// neighbour only when it is the lower half and can be opened by hand.
+    fn door_step(
+        &mut self,
+        world: &World,
+        parent: u32,
+        target: (i32, i32, i32),
+        from_s: f64,
+        cost: f64,
+    ) -> bool {
+        let Some(door) = door::at(world, target.0, target.1, target.2) else {
+            return false;
+        };
+        if !door.is_lower(target) || !door.can_open() {
+            return false;
+        }
+        let Some(s2) = door.standing_height(world) else {
+            return false;
+        };
+        let d = s2 - from_s;
+        if d > JUMP || d < -MAX_DROP {
+            return false;
+        }
+        if d > STEP {
+            let source = self.nodes[parent as usize].cell;
+            if !column_free(world, source.0, source.2, s2, s2 + HEIGHT) {
+                return false;
+            }
+        } else if d < -1.0e-6 && !column_free(world, target.0, target.2, s2, from_s + HEIGHT) {
+            return false;
+        }
+        self.relax(world, parent, target, s2, cost + 1.5);
+        true
     }
 
     /// Sprint jumps across a short gap. The takeoff and landing are block
@@ -450,6 +515,11 @@ impl Search {
                     break;
                 }
                 if !column_free(world, cx, cz, s, s + JUMP_HEADROOM) {
+                    break;
+                }
+                // A closed door blocks the flight path even though its thin
+                // panel leaves the column's centre clear.
+                if door::at(world, cx, y, cz).is_some_and(|d| !d.open) {
                     break;
                 }
                 let (lx, lz) = (x + dx * distance, z + dz * distance);
@@ -554,15 +624,18 @@ impl Search {
         self.open.push(Reverse(((f * 1024.0) as u64, id)));
     }
 
-    fn path(&self) -> Path {
+    fn path(&self, world: &World) -> Path {
         let mut points = Vec::new();
         let mut id = self.best;
         while id != NO_PARENT {
             let node = &self.nodes[id as usize];
+            let door = door::at(world, node.cell.0, node.cell.1, node.cell.2)
+                .filter(|door| door.is_lower(node.cell));
             points.push(Waypoint {
                 cell: node.cell,
                 surface: node.surface,
                 jump: false,
+                door,
             });
             id = node.parent;
         }
@@ -605,6 +678,15 @@ pub fn line_walkable(world: &World, from: Vec3, to: Vec3) -> bool {
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
         let (x, z) = (from.x + dx * t, from.z + dz * t);
+        let (cx, cz) = (x.floor() as i32, z.floor() as i32);
+        // Do not cut through a closed door: the thin panel leaves the column
+        // centre clear, so collision alone would let a line do it.
+        if [cell_y, cell_y + 1]
+            .iter()
+            .any(|&y| door::at(world, cx, y, cz).is_some_and(|door| !door.open))
+        {
+            return false;
+        }
         if !level(x, z) {
             return false;
         }
@@ -648,6 +730,14 @@ mod tests {
             .unwrap() as u32
     }
 
+    /// Replace both halves of the door at (x, y, z) with a fresh one.
+    fn set_door(world: &mut World, x: i32, y: i32, z: i32, name: &str, open: bool) {
+        let properties =
+            |half: &str| format!("facing=north,half={half},hinge=left,open={open},powered=false");
+        world.set_block_state(x, y, z, state(name, &properties("lower")));
+        world.set_block_state(x, y + 1, z, state(name, &properties("upper")));
+    }
+
     /// Stone floor with its top at y = 64 over x, z in -32..48.
     fn flat() -> World {
         let mut world = World::new(DimensionHeight::OVERWORLD);
@@ -679,6 +769,67 @@ mod tests {
         assert!(
             path.points.iter().all(|p| !p.jump),
             "diagonals are not gap jumps"
+        );
+    }
+
+    #[test]
+    fn walks_through_a_closed_wooden_door() {
+        let mut world = flat();
+        // A solid two-high wall right across the loaded world, with one
+        // wooden door in it.
+        for x in -32..=47 {
+            for y in 64..=65 {
+                world.set_block_state(x, y, 4, 1);
+            }
+        }
+        set_door(&mut world, 0, 64, 4, "minecraft:oak_door", false);
+        assert_eq!(surface(&world, 0, 64, 4), None);
+
+        let path = find(&world, start(), Goal::Column { x: 0, z: 10 }, 20_000).unwrap();
+        assert!(path.complete, "did not plan through the door");
+        let door = path
+            .points
+            .iter()
+            .find(|p| p.door.is_some())
+            .expect("no door waypoint");
+        assert_eq!(door.cell, (0, 64, 4));
+        assert!(!door.door.unwrap().open);
+        assert!(
+            path.points
+                .iter()
+                .filter(|p| p.cell.2 == 4)
+                .all(|p| p.cell.0 == 0),
+            "crossed the wall outside the door: {:?}",
+            path.points
+        );
+
+        // Once open, the doorway is an ordinary surface.
+        set_door(&mut world, 0, 64, 4, "minecraft:oak_door", true);
+        assert_eq!(surface(&world, 0, 64, 4), Some(64.0));
+        let path = find(&world, start(), Goal::Column { x: 0, z: 10 }, 20_000).unwrap();
+        assert!(path.complete);
+        assert!(
+            path.points
+                .iter()
+                .any(|p| p.cell == (0, 64, 4) && p.door.is_some_and(|d| d.open))
+        );
+    }
+
+    #[test]
+    fn an_iron_door_is_not_a_route() {
+        let mut world = flat();
+        for x in -32..=47 {
+            for y in 64..=65 {
+                world.set_block_state(x, y, 4, 1);
+            }
+        }
+        set_door(&mut world, 0, 64, 4, "minecraft:iron_door", false);
+        let path = find(&world, start(), Goal::Column { x: 0, z: 10 }, 20_000).unwrap();
+        assert!(!path.complete, "planned through a closed iron door");
+        assert!(
+            path.points.iter().all(|p| p.cell.2 != 4),
+            "reached the wall: {:?}",
+            path.points
         );
     }
 

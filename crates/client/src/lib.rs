@@ -11,6 +11,7 @@ pub mod combat;
 pub mod commands;
 pub mod controller;
 pub mod crypto;
+pub mod door;
 pub mod entities;
 mod game;
 pub mod interact;

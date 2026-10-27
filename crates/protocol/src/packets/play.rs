@@ -863,6 +863,30 @@ pub mod serverbound {
     pub struct Punch;
     packet!(Punch, play, serverbound, PUNCH);
 
+    /// `ServerboundUseItemOnPacket`: a right click on a block.
+    ///
+    /// The fields are in the packet's order. `hand` is an
+    /// `InteractionHand`: 0 main hand, 1 off hand. `direction` is a
+    /// `Direction` ordinal, and the cursor is measured from the block's
+    /// corner. `sequence` acknowledges predicted block changes; zero means
+    /// no prediction.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct UseItemOn {
+        #[var]
+        pub hand: i32,
+        pub pos: i64,
+        #[var]
+        pub direction: i32,
+        pub cursor_x: f32,
+        pub cursor_y: f32,
+        pub cursor_z: f32,
+        pub inside: bool,
+        pub world_border: bool,
+        #[var]
+        pub sequence: i32,
+    }
+    packet!(UseItemOn, play, serverbound, USE_ITEM_ON);
+
     /// `ServerboundSetCarriedItemPacket`: the selected hotbar slot, 0 to 8.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
     pub struct SetCarriedItem {
@@ -942,6 +966,33 @@ mod tests {
                 Err(rapidbot_buf::DecodeError::InvalidDiscriminant { ty: "optional game type", value }) if value == wire
             ));
         }
+    }
+
+    #[test]
+    fn use_item_on_uses_vanilla_field_order() {
+        let packet = serverbound::UseItemOn {
+            hand: 0,
+            pos: 0x0000_0040_0000_0002,
+            direction: 5,
+            cursor_x: 0.25,
+            cursor_y: 0.5,
+            cursor_z: 0.75,
+            inside: false,
+            world_border: false,
+            sequence: 7,
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        // Hand first (VarInt), then the packed BlockPos as a long.
+        assert_eq!(bytes[0], 0);
+        assert_eq!(&bytes[1..9], &packet.pos.to_be_bytes());
+        // Direction is a VarInt too, then the three cursor floats.
+        assert_eq!(bytes[9], 5);
+        assert_eq!(&bytes[10..14], &packet.cursor_x.to_be_bytes());
+        assert_eq!(&bytes[14..18], &packet.cursor_y.to_be_bytes());
+        assert_eq!(&bytes[18..22], &packet.cursor_z.to_be_bytes());
+        assert_eq!(&bytes[22..24], &[0, 0]);
+        assert_eq!(bytes[24], 7);
+        assert_eq!(bytes.len(), 25);
     }
 
     #[test]

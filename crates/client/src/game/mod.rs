@@ -562,6 +562,9 @@ impl Game {
             } else {
                 let clicks = std::mem::take(&mut self.attack_clicks);
                 play.attack_button(&self.net, clicks, self.attack_down, &pick);
+                if actions.use_block {
+                    play.use_block(&self.net, &pick.block);
+                }
             }
             if actions.close_container
                 && self.close_press.is_none()

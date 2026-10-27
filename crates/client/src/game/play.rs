@@ -199,6 +199,28 @@ impl PlayState {
         });
     }
 
+    /// Right-clicks a block: `MultiPlayerGameMode.useItemOn`, without local
+    /// block prediction. The server answers with block updates, which the
+    /// world applies when they arrive.
+    pub fn use_block(&self, net: &PacketSender, hit: &rapidbot_world::raycast::BlockHit) {
+        if hit.miss || self.game_type == GameType::Spectator {
+            return;
+        }
+        let (x, y, z) = hit.pos;
+        net.send(&sb::UseItemOn {
+            // InteractionHand.MAIN_HAND
+            hand: 0,
+            pos: rapidbot_world::pack_block_pos(x, y, z),
+            direction: hit.direction as i32,
+            cursor_x: (hit.location[0] - x as f64) as f32,
+            cursor_y: (hit.location[1] - y as f64) as f32,
+            cursor_z: (hit.location[2] - z as f64) as f32,
+            inside: hit.inside,
+            world_border: false,
+            sequence: 0,
+        });
+    }
+
     pub fn listener_tick(&mut self, net: &PacketSender) -> bool {
         // gameMode.tick() starts with ensureHasSentCarriedItem().
         if self.inventory.selected != self.carried_index {

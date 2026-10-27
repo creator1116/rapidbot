@@ -4,15 +4,17 @@
 //! [`crate::path`] (a moment of standing still, spread over a few ticks),
 //! then follows it using the mouse and keyboard input models, cutting across
 //! open ground instead of following the grid and hopping up blocks. Routes
-//! sprint-jump short gaps, cross deep water by swimming at the surface, and
-//! climb ladders and vines. Where no route can be planned (in mid-air, or
-//! from under water) it heads straight for the goal.
+//! sprint-jump short gaps, cross deep water by swimming at the surface,
+//! climb ladders and vines, and open closed wooden doors on the way through.
+//! Where no route can be planned (in mid-air, or from under water) it heads
+//! straight for the goal.
 
 use rapidbot_human::Noise;
 use rapidbot_physics::Keys;
 use rapidbot_physics::math::{Vec3, wrap_degrees};
 
 use crate::controller::{TickContext, angles_to};
+use crate::door::{self, Door};
 use crate::path::{self, Goal, Path, Search};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,6 +40,15 @@ enum Plan {
     },
     /// No route: straight at the goal.
     Straight,
+}
+
+/// While stopped at a closed door, waiting for the server to open it.
+struct DoorWait {
+    door: Door,
+    ticks: u32,
+    /// A right click has been sent; wait for the server's block update
+    /// rather than toggling the door closed again if it is slow.
+    clicked: bool,
 }
 
 /// Places a search may examine before settling for the nearest it found.
@@ -79,6 +90,8 @@ pub struct Walker {
     replans: u32,
     /// Whether the goal's height matters.
     exact: bool,
+    /// The door being opened, if the next waypoint is one.
+    door_wait: Option<DoorWait>,
 }
 
 impl Walker {
@@ -94,6 +107,7 @@ impl Walker {
             plan: Plan::None,
             replans: 0,
             exact: false,
+            door_wait: None,
             goal: None,
             state: State::Idle,
             gaze_pitch: 8.0,
@@ -119,6 +133,7 @@ impl Walker {
         self.exact = exact;
         self.plan = Plan::None;
         self.replans = 0;
+        self.door_wait = None;
         self.best_distance = f64::MAX;
         self.stalled_ticks = 0;
         self.gave_up = false;
@@ -131,6 +146,7 @@ impl Walker {
     pub fn stop(&mut self) {
         self.goal = None;
         self.plan = Plan::None;
+        self.door_wait = None;
         self.state = State::Idle;
     }
 
@@ -157,6 +173,7 @@ impl Walker {
     fn give_up(&mut self, ctx: &mut TickContext<'_>) {
         self.goal = None;
         self.plan = Plan::None;
+        self.door_wait = None;
         self.gave_up = true;
         self.state = State::Idle;
         ctx.set_keys(Keys::default());
@@ -192,6 +209,7 @@ impl Walker {
 
         match &mut self.plan {
             Plan::None => {
+                self.door_wait = None;
                 // Routes start from the ground: wait out a fall. Someone
                 // holding a ladder can be planned from where they are.
                 if !ctx.player.on_ground && !ctx.player.in_water && !on_climbable(ctx) {
@@ -260,6 +278,42 @@ impl Walker {
     }
 
     fn follow(&mut self, ctx: &mut TickContext<'_>) {
+        // The next waypoint may be a closed door. Stop and open it before
+        // steering, so the walker does not keep pushing into the panel.
+        let next_door = match &self.plan {
+            Plan::Following { path, next, .. } if *next < path.points.len() => {
+                path.points[*next].door
+            }
+            _ => None,
+        };
+        // A closed door ahead caps the waypoints that may be ticked off, so
+        // walking up against the panel's near side cannot "reach" the door
+        // cell and skip the click.
+        let first_closed = match &self.plan {
+            Plan::Following { path, next, .. } => path.points[*next..]
+                .iter()
+                .position(|w| {
+                    w.door.is_some_and(|door| {
+                        !door::at(ctx.world, door.lower.0, door.lower.1, door.lower.2)
+                            .is_some_and(|current| current.open)
+                    })
+                })
+                .map(|i| *next + i),
+            _ => None,
+        };
+        if self
+            .door_wait
+            .as_ref()
+            .is_some_and(|wait| Some(wait.door.lower) != next_door.map(|door| door.lower))
+        {
+            self.door_wait = None;
+        }
+        if let Some(door) = next_door
+            && self.open_door(ctx, door)
+        {
+            return;
+        }
+
         let Plan::Following {
             path,
             next,
@@ -273,7 +327,12 @@ impl Walker {
         let flat = |a: Vec3| ((a.x - pos.x).powi(2) + (a.z - pos.z).powi(2)).sqrt();
 
         // Tick off waypoints: the one aimed for, or any on the way to it.
-        let reach = (*target + 1).min(path.points.len());
+        // Stop before a closed door: the door itself is not reached until it
+        // has been opened.
+        let limit = first_closed
+            .unwrap_or(path.points.len())
+            .min(path.points.len());
+        let reach = (*target + 1).min(path.points.len()).min(limit).max(*next);
         if let Some(i) = (*next..reach).rev().find(|&i| {
             let w = path.points[i].pos();
             flat(w) < 0.4 && pos.y - w.y > -0.05 && pos.y - w.y < 1.3
@@ -287,6 +346,7 @@ impl Walker {
         if *next >= path.points.len() {
             // At the end: the last few steps to the exact spot, or, if the
             // path stopped short, another look from here.
+            self.door_wait = None;
             self.plan = if path.complete {
                 Plan::Straight
             } else {
@@ -305,10 +365,14 @@ impl Walker {
             && path.points[*next..(*next + 8).min(path.points.len())]
                 .iter()
                 .any(|w| {
-                    path::surface(ctx.world, w.cell.0, w.cell.1, w.cell.2)
-                        .is_none_or(|s| (s - w.surface).abs() > 0.01)
+                    // A door is opened on arrival, so its closed shape is
+                    // expected. A door that has gone is caught at the door.
+                    w.door.is_none()
+                        && path::surface(ctx.world, w.cell.0, w.cell.1, w.cell.2)
+                            .is_none_or(|s| (s - w.surface).abs() > 0.01)
                 });
         if off_route || broken {
+            self.door_wait = None;
             self.plan = Plan::None;
             return;
         }
@@ -318,7 +382,7 @@ impl Walker {
         if *retarget_in == 0 || *target < *next {
             *target = *next;
             if ctx.player.on_ground {
-                for j in *next..(*next + 8).min(path.points.len()) {
+                for j in *next..(*next + 8).min(path.points.len()).min(limit) {
                     let w = path.points[j];
                     if (w.surface - pos.y).abs() > 0.01 {
                         break;
@@ -360,6 +424,7 @@ impl Walker {
         let to_next = flat(path.points[*next].pos());
         if self.stalled(to_next) {
             self.replans += 1;
+            self.door_wait = None;
             if self.replans > 2 {
                 self.give_up(ctx);
             } else {
@@ -368,6 +433,72 @@ impl Walker {
             return;
         }
         self.steer(ctx, aim_at, run.min(open + 3.0), false, jump_ahead);
+    }
+
+    /// Deals with the closed door at the next waypoint. Returns true while
+    /// the walker should stand still (opening or waiting for the update),
+    /// false when the door is already open and walking can continue.
+    fn open_door(&mut self, ctx: &mut TickContext<'_>, planned: Door) -> bool {
+        let Some(current) = door::at(ctx.world, planned.lower.0, planned.lower.1, planned.lower.2)
+        else {
+            self.plan = Plan::None;
+            self.door_wait = None;
+            return true;
+        };
+        if current.open {
+            self.door_wait = None;
+            return false;
+        }
+        if !current.can_open() {
+            // Iron, or held closed by redstone: this route is not usable.
+            self.plan = Plan::None;
+            self.door_wait = None;
+            return true;
+        }
+
+        // Stand still, and do not carry a jump over from the last stretch.
+        self.jump_hold = 0;
+        self.jump_in = None;
+        ctx.set_keys(Keys::default());
+
+        let wait = match &mut self.door_wait {
+            Some(wait) if wait.door.lower == current.lower => wait,
+            _ => {
+                self.door_wait = Some(DoorWait {
+                    door: current,
+                    ticks: 0,
+                    clicked: false,
+                });
+                self.door_wait.as_mut().expect("just set")
+            }
+        };
+        wait.ticks = wait.ticks.saturating_add(1);
+        if let Some(aim) = current.aim_point(ctx.world) {
+            ctx.aim_at(aim, 2.0);
+        }
+
+        // The crosshair is the pick from before this tick's mouse movement.
+        // Click only when it is actually on the door; wait for the human
+        // mouse model to settle if it is not.
+        let hit = ctx.crosshair;
+        let on_door = !hit.miss && (hit.pos == current.lower || hit.pos == current.upper);
+        if on_door && !wait.clicked {
+            ctx.click_use();
+            wait.clicked = true;
+        }
+
+        // No update after six seconds: think again, and eventually give up.
+        if wait.ticks > 120 {
+            self.door_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return true;
+        }
+        true
     }
 
     /// Turns towards `target` and holds the keys to get there. `distance`
@@ -470,6 +601,7 @@ mod tests {
         chat: std::collections::VecDeque<String>,
         inventory: crate::inventory::Inventory,
         actions: crate::controller::Actions,
+        use_clicks: u32,
     }
 
     impl Sim {
@@ -500,10 +632,22 @@ mod tests {
                 chat: Default::default(),
                 inventory: Default::default(),
                 actions: Default::default(),
+                use_clicks: 0,
             }
         }
 
+        fn set_door(&mut self, x: i32, y: i32, z: i32, name: &str, open: bool) {
+            let properties = |half: &str| {
+                format!("facing=north,half={half},hinge=left,open={open},powered=false")
+            };
+            self.world
+                .set_block_state(x, y, z, state(name, &properties("lower")));
+            self.world
+                .set_block_state(x, y + 1, z, state(name, &properties("upper")));
+        }
+
         fn step(&mut self) {
+            self.actions = Default::default();
             let crosshair = crate::interact::pick_block(&self.player, &self.world);
             let entities = crate::entities::Entities::default();
             let mut ctx = TickContext {
@@ -526,6 +670,33 @@ mod tests {
                 chat: &mut self.chat,
             };
             self.walker.tick(&mut ctx);
+
+            // Stand in for the server's use handler: if the walker clicked
+            // while the crosshair was on a door, open both halves. The real
+            // server replies with block updates on a later tick.
+            if self.actions.use_block {
+                self.use_clicks += 1;
+                if !crosshair.miss
+                    && let Some(door) = door::at(
+                        &self.world,
+                        crosshair.pos.0,
+                        crosshair.pos.1,
+                        crosshair.pos.2,
+                    )
+                    && (crosshair.pos == door.lower || crosshair.pos == door.upper)
+                {
+                    let block = Registry::get()
+                        .state(
+                            self.world
+                                .block_state(door.lower.0, door.lower.1, door.lower.2)
+                                .unwrap(),
+                        )
+                        .block;
+                    let name = Registry::get().blocks[block as usize].name.clone();
+                    self.set_door(door.lower.0, door.lower.1, door.lower.2, &name, true);
+                }
+            }
+
             // No keyboard model here: fingers follow at once.
             self.player.held_keys = self.keys;
             self.tick += 1;
@@ -582,6 +753,70 @@ mod tests {
         assert!((p.x - 0.5).hypot(p.z - 20.0) < 0.6);
         // About 27 blocks of walking; a detour, not a crawl along the grid.
         assert!(ticks < 260, "took {ticks} ticks");
+    }
+
+    #[test]
+    fn opens_a_wooden_door_and_walks_through() {
+        let mut sim = Sim::new();
+        for x in -32..48 {
+            for y in 64..=65 {
+                sim.world.set_block_state(x, y, 8, 1);
+            }
+        }
+        sim.set_door(0, 64, 8, "minecraft:oak_door", false);
+        sim.walker.go_to(Vec3::new(0.5, 64.0, 14.5));
+        let mut ticks = 0;
+        while !sim.walker.arrived() {
+            sim.step();
+            ticks += 1;
+            assert!(ticks < 900, "never got through, at {:?}", sim.player.pos);
+        }
+        assert!(!sim.walker.gave_up());
+        assert!(sim.use_clicks > 0, "never clicked the door");
+        let door = door::at(&sim.world, 0, 64, 8).expect("door is still there");
+        assert!(door.open, "door did not stay open");
+        assert!(sim.player.pos.z > 8.5, "at {:?}", sim.player.pos);
+    }
+
+    #[test]
+    fn an_open_door_is_walked_through_without_a_click() {
+        let mut sim = Sim::new();
+        for x in -32..48 {
+            for y in 64..=65 {
+                sim.world.set_block_state(x, y, 8, 1);
+            }
+        }
+        sim.set_door(0, 64, 8, "minecraft:oak_door", true);
+        sim.walker.go_to(Vec3::new(0.5, 64.0, 14.5));
+        let mut ticks = 0;
+        while !sim.walker.arrived() {
+            sim.step();
+            ticks += 1;
+            assert!(ticks < 900, "never got through, at {:?}", sim.player.pos);
+        }
+        assert!(!sim.walker.gave_up());
+        assert_eq!(sim.use_clicks, 0, "clicked an already open door");
+        assert!(sim.player.pos.z > 8.5, "at {:?}", sim.player.pos);
+    }
+
+    #[test]
+    fn gives_up_at_a_closed_iron_door() {
+        let mut sim = Sim::new();
+        for x in -32..48 {
+            for y in 64..=65 {
+                sim.world.set_block_state(x, y, 8, 1);
+            }
+        }
+        sim.set_door(0, 64, 8, "minecraft:iron_door", false);
+        sim.walker.go_to(Vec3::new(0.5, 64.0, 14.5));
+        for _ in 0..900 {
+            sim.step();
+        }
+        assert!(sim.walker.gave_up());
+        assert_eq!(sim.use_clicks, 0, "tried to open an iron door");
+        // The panel can be entered from the open middle of the block, but
+        // it cannot be crossed.
+        assert!(sim.player.pos.z < 8.8, "at {:?}", sim.player.pos);
     }
 
     #[test]

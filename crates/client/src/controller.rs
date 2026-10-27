@@ -55,6 +55,7 @@ pub(crate) struct Actions {
     pub select_slot: Option<u8>,
     pub attack: Option<bool>,
     pub click: bool,
+    pub use_block: bool,
     pub close_container: bool,
 }
 
@@ -81,6 +82,13 @@ impl TickContext<'_> {
     /// asked for while one is under way is ignored.
     pub fn click_attack(&mut self) {
         self.actions.click = true;
+    }
+
+    /// Right-clicks the block under the crosshair: opens a door, presses a
+    /// button, and so on. Aim first. Uses the block hit from this tick, so
+    /// a click while the crosshair is in mid-turn may miss.
+    pub fn click_use(&mut self) {
+        self.actions.use_block = true;
     }
 
     /// A point to aim at for the crosshair to land on an entity, `height`

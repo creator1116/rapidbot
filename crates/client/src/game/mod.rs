@@ -65,6 +65,8 @@ pub(crate) struct Game {
     attack_intent: bool,
     attack_down: bool,
     attack_clicks: u32,
+    /// The use button's held state, carried between ticks.
+    use_intent: bool,
     /// Ticks until the finger lets go of a `click_attack`.
     click_release: Option<u32>,
     /// Ticks until Escape closes the open container screen.
@@ -134,6 +136,7 @@ impl Game {
             attack_intent: false,
             attack_down: false,
             attack_clicks: 0,
+            use_intent: false,
             click_release: None,
             close_press: None,
             packs: None,
@@ -240,6 +243,7 @@ impl Game {
         if self.chat_frame(dt) {
             // KeyMapping.releaseAll() when the screen opened.
             self.attack_down = false;
+            self.use_intent = false;
             return;
         }
         let Some(play) = self.play.as_mut() else {
@@ -431,7 +435,10 @@ impl Game {
             // deferred packets, which we never defer.
             return;
         };
-        // gameMode.tick() → connection.tick() → ClientPacketListener.tick()
+        // Minecraft.tick: the right-click delay, then gameMode.tick()
+        // (connection.tick() would come next but has nothing to do here)
+        // → ClientPacketListener.tick().
+        play.game_mode.tick();
         if play.listener_tick(&self.net) {
             self.link.emit(BotEvent::Loaded);
         }
@@ -440,6 +447,7 @@ impl Game {
         if dead {
             // Death screen: no keybinds. The entity ticks for 20 more ticks
             // (LocalPlayer.tickDeath), then is removed.
+            self.use_intent = false;
             if play.client_loaded && play.death_time < 20 {
                 play.player.physics.held_keys = Keys::default();
                 play.player.physics.tick(&play.world, &play.tags);
@@ -507,6 +515,9 @@ impl Game {
             }
             // The glide check in aiStep reads the equipment slots.
             play.player.physics.has_elytra = play.inventory.can_glide();
+            // Once the server says an item is in use, its UseEffects come
+            // from the hand that started it.
+            play.player.sync_use_effects(&play.inventory);
             let mut actions = crate::controller::Actions::default();
             let attack_strength = play.game_mode.attack_strength(&play.player.physics, 0.5);
             let mut ctx = TickContext {
@@ -554,17 +565,26 @@ impl Game {
                 self.attack_intent = true;
                 self.click_release = Some((seconds * 20.0).ceil() as u32);
             }
+            // A fresh press starts a use at once; holding repeats it after
+            // the right-click delay, and letting go releases an item.
+            let mut use_clicked = false;
+            if let Some(down) = actions.use_item {
+                use_clicked = down && !self.use_intent;
+                self.use_intent = down;
+            }
             // The attack button: startAttack per click, then continueAttack.
             if screen_open {
                 // `missTime = 10000`; clicks go to the screen.
                 play.game_mode.screen_open();
                 self.attack_clicks = 0;
+                self.use_intent = false;
             } else {
                 let clicks = std::mem::take(&mut self.attack_clicks);
                 play.attack_button(&self.net, clicks, self.attack_down, &pick);
                 if actions.use_block {
                     play.use_block(&self.net, &pick.block);
                 }
+                play.use_button(&self.net, &pick, self.use_intent, use_clicked);
             }
             if actions.close_container
                 && self.close_press.is_none()

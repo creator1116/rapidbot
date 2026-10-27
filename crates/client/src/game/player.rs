@@ -91,6 +91,23 @@ impl LocalPlayer {
         new
     }
 
+    /// `LocalPlayer.onSyncedDataUpdated` for the living flags: once the
+    /// server says we are using an item, read its `UseEffects` from the
+    /// hand that started the use.
+    pub fn sync_use_effects(&mut self, inventory: &crate::inventory::Inventory) {
+        if !self.physics.using_item {
+            return;
+        }
+        let stack = if self.physics.using_item_offhand {
+            inventory.offhand()
+        } else {
+            inventory.held()
+        };
+        let effects = stack.map(|s| s.use_effects()).unwrap_or_default();
+        self.physics
+            .set_use_effects(effects.can_sprint, effects.speed_multiplier);
+    }
+
     /// `ClientPacketListener.setValuesFromPositionPacket` (not interpolated)
     /// using `PositionMoveRotation.calculateAbsolute`.
     pub fn apply_teleport(&mut self, change: &PositionMoveRotation, relatives: i32) {

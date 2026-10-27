@@ -56,6 +56,7 @@ pub(crate) struct Actions {
     pub attack: Option<bool>,
     pub click: bool,
     pub use_block: bool,
+    pub use_item: Option<bool>,
     pub close_container: bool,
 }
 
@@ -86,9 +87,28 @@ impl TickContext<'_> {
 
     /// Right-clicks the block under the crosshair: opens a door, presses a
     /// button, and so on. Aim first. Uses the block hit from this tick, so
-    /// a click while the crosshair is in mid-turn may miss.
+    /// a click while the crosshair is in mid-turn may miss. This only uses
+    /// blocks; [`TickContext::hold_use`] is the full use button.
     pub fn click_use(&mut self) {
         self.actions.use_block = true;
+    }
+
+    /// Presses or lets go of the use button (right mouse). Held in the air
+    /// it uses the item in the main hand, then the off hand; held on a
+    /// block it right-clicks the block every few ticks. Aim first.
+    ///
+    /// A use in progress, such as a drawn bow or a raised shield, ends
+    /// when the button is let go. The server is the authority on whether
+    /// an item started using: watch [`TickContext::using_item`].
+    pub fn hold_use(&mut self, down: bool) {
+        self.actions.use_item = Some(down);
+    }
+
+    /// True while the server says the player is using an item. Eat, draw a
+    /// bow or hold a shield by keeping [`TickContext::hold_use`] down until
+    /// this turns false (finished) or for as long as wanted.
+    pub fn using_item(&self) -> bool {
+        self.player.using_item
     }
 
     /// A point to aim at for the crosshair to land on an entity, `height`

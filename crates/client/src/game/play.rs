@@ -203,22 +203,50 @@ impl PlayState {
     /// block prediction. The server answers with block updates, which the
     /// world applies when they arrive.
     pub fn use_block(&self, net: &PacketSender, hit: &rapidbot_world::raycast::BlockHit) {
-        if hit.miss || self.game_type == GameType::Spectator {
+        if self.game_type == GameType::Spectator {
             return;
         }
-        let (x, y, z) = hit.pos;
-        net.send(&sb::UseItemOn {
-            // InteractionHand.MAIN_HAND
-            hand: 0,
-            pos: rapidbot_world::pack_block_pos(x, y, z),
-            direction: hit.direction as i32,
-            cursor_x: (hit.location[0] - x as f64) as f32,
-            cursor_y: (hit.location[1] - y as f64) as f32,
-            cursor_z: (hit.location[2] - z as f64) as f32,
-            inside: hit.inside,
-            world_border: false,
-            sequence: 0,
-        });
+        crate::interact::send_use_item_on(net, hit);
+    }
+
+    /// The use button: `Minecraft.startUseItem` plus `handleKeybinds`.
+    /// `down` is the button, `clicked` a fresh press this tick.
+    pub fn use_button(
+        &mut self,
+        net: &PacketSender,
+        hit: &crate::interact::Pick,
+        down: bool,
+        clicked: bool,
+    ) {
+        let selected = self.inventory.selected;
+        if selected != self.carried_index {
+            // ensureHasSentCarriedItem()
+            self.carried_index = selected;
+            net.send(&sb::SetCarriedItem {
+                slot: selected as i16,
+            });
+        }
+        let Self {
+            player,
+            world,
+            inventory,
+            entities,
+            tags,
+            game_mode,
+            game_type,
+            ..
+        } = self;
+        let mut hands = crate::interact::Hands {
+            player: &mut player.physics,
+            world,
+            inventory,
+            entities,
+            tags,
+            net,
+            restricted: matches!(game_type, GameType::Spectator | GameType::Adventure),
+            survival: *game_type != GameType::Creative,
+        };
+        game_mode.use_button(&mut hands, hit, down, clicked);
     }
 
     pub fn listener_tick(&mut self, net: &PacketSender) -> bool {
@@ -804,8 +832,9 @@ impl Game {
 }
 
 /// `SynchedEntityData.assignValues` for the parts of our own player that
-/// movement depends on: the shared flags (ID 0) and the pose (ID 6). Values
-/// come in ascending ID order; everything before the pose is a simple type.
+/// movement depends on: the shared flags (ID 0), the pose (ID 6) and the
+/// living flags (ID 8, after `DATA_TICKS_FROZEN`). Values come in ascending
+/// ID order; everything before the living flags is a simple type.
 fn apply_own_entity_data(
     player: &mut rapidbot_physics::Player,
     body: &[u8],
@@ -833,6 +862,7 @@ fn apply_own_entity_data(
                     player.apply_synced_pose(pose);
                 }
             }
+            (8, DataValue::Byte(flags)) => player.apply_living_flags(flags),
             _ => {}
         }
     }
@@ -902,4 +932,23 @@ fn dimension_height(session: &SessionData, id: i32) -> DimensionHeight {
         warn!(dimension = %entry.id, "unknown dimension type, assuming overworld height");
         DimensionHeight::OVERWORLD
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_living_flags_are_metadata_index_eight() {
+        let mut player = rapidbot_physics::Player::default();
+        // Ticks frozen (ID 7, int) comes before the living flags (ID 8,
+        // byte); the use bit is 1.
+        let start = [7, 1, 0, 0, 0, 0, 8, 0, 1, 0xff];
+        apply_own_entity_data(&mut player, &start).unwrap();
+        assert!(player.using_item);
+
+        let stop = [8, 0, 0, 0xff];
+        apply_own_entity_data(&mut player, &stop).unwrap();
+        assert!(!player.using_item);
+    }
 }

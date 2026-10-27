@@ -484,6 +484,40 @@ impl EquipmentSlot {
     }
 }
 
+/// `UseEffects`: how using the item in hand changes movement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UseEffects {
+    pub can_sprint: bool,
+    pub interact_vibrations: bool,
+    pub speed_multiplier: f32,
+}
+
+impl UseEffects {
+    /// `UseEffects.DEFAULT`, also used when the component is absent.
+    pub const DEFAULT: Self = Self {
+        can_sprint: false,
+        interact_vibrations: true,
+        speed_multiplier: 0.2,
+    };
+}
+
+impl Default for UseEffects {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+fn decode_use_effects(bytes: &[u8]) -> UseEffects {
+    if bytes.len() < 6 {
+        return UseEffects::DEFAULT;
+    }
+    UseEffects {
+        can_sprint: bytes[0] != 0,
+        interact_vibrations: bytes[1] != 0,
+        speed_multiplier: f32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+    }
+}
+
 /// A non-empty `ItemStack`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemStack {
@@ -542,6 +576,13 @@ impl ItemStack {
 
     pub fn has(&self, name: &str) -> bool {
         self.component(name).is_some()
+    }
+
+    /// `getOrDefault(DataComponents.USE_EFFECTS, UseEffects.DEFAULT)`.
+    pub fn use_effects(&self) -> UseEffects {
+        self.component("minecraft:use_effects")
+            .map(decode_use_effects)
+            .unwrap_or_default()
     }
 
     fn var_int(&self, name: &str) -> Option<i32> {
@@ -850,6 +891,43 @@ impl ItemData {
 mod tests {
     use super::*;
     use rapidbot_buf::Encode;
+
+    #[test]
+    fn use_effects_come_from_item_defaults() {
+        let spear = ItemData::get().item_id("minecraft:wooden_spear").unwrap();
+        assert_eq!(
+            ItemStack::new(spear, 1).use_effects(),
+            UseEffects {
+                can_sprint: true,
+                interact_vibrations: false,
+                speed_multiplier: 1.0,
+            }
+        );
+        let apple = ItemData::get().item_id("minecraft:apple").unwrap();
+        assert_eq!(ItemStack::new(apple, 1).use_effects(), UseEffects::DEFAULT);
+    }
+
+    #[test]
+    fn use_effects_are_bool_bool_float() {
+        assert_eq!(decode_use_effects(&[]), UseEffects::DEFAULT);
+        assert_eq!(
+            decode_use_effects(&[1, 0, 0x3f, 0x00, 0x00, 0x00]),
+            UseEffects {
+                can_sprint: true,
+                interact_vibrations: false,
+                speed_multiplier: 0.5,
+            }
+        );
+        // The component's default: no sprinting, 20% speed.
+        assert_eq!(
+            decode_use_effects(&[0, 1, 0x3e, 0x4c, 0xcc, 0xcd]),
+            UseEffects {
+                can_sprint: false,
+                interact_vibrations: true,
+                speed_multiplier: 0.2,
+            }
+        );
+    }
 
     #[test]
     fn holder_set_counts_reject_negative_and_oversized_values() {

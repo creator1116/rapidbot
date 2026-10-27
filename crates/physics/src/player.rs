@@ -193,6 +193,14 @@ pub struct Player {
     /// Set on the tick gliding starts; the client sends
     /// `player_command(START_FALL_FLYING)` and clears it.
     pub started_fall_flying: bool,
+    /// `LocalPlayer.startedUsingItem`.
+    pub using_item: bool,
+    /// `LocalPlayer.usingItemHand`: true for the off hand.
+    pub using_item_offhand: bool,
+    /// `UseEffects.canSprint` of the item being used.
+    pub use_item_can_sprint: bool,
+    /// `UseEffects.speedMultiplier` of the item being used.
+    pub use_item_speed: f32,
     /// `jumpTriggerTime`: ticks left in the window where a second jump
     /// press toggles creative flight.
     jump_trigger_time: i32,
@@ -258,6 +266,10 @@ impl Player {
             fall_flying: false,
             has_elytra: false,
             started_fall_flying: false,
+            using_item: false,
+            using_item_offhand: false,
+            use_item_can_sprint: false,
+            use_item_speed: 0.2,
             jump_trigger_time: 0,
             abilities_changed: false,
             first_tick: true,
@@ -356,6 +368,45 @@ impl Player {
     pub fn apply_synced_pose(&mut self, pose: Pose) {
         self.pose = pose;
         self.bb = make_bounding_box(pose, self.pos);
+    }
+
+    /// Our own `DATA_LIVING_ENTITY_FLAGS` arriving from the server
+    /// (`LocalPlayer.onSyncedDataUpdated`): start or stop using an item.
+    pub fn apply_living_flags(&mut self, flags: u8) {
+        let using = flags & 1 != 0;
+        if using {
+            if !self.using_item {
+                self.start_using_item(flags & 2 != 0);
+            }
+        } else if self.using_item {
+            self.stop_using_item();
+        }
+    }
+
+    /// `LivingEntity.startUsingItem`, before its use effects are known.
+    pub fn start_using_item(&mut self, offhand: bool) {
+        self.using_item = true;
+        self.using_item_offhand = offhand;
+        self.use_item_can_sprint = false;
+        self.use_item_speed = 0.2;
+    }
+
+    /// The `UseEffects` of the stack in the hand that started the use.
+    pub fn set_use_effects(&mut self, can_sprint: bool, speed_multiplier: f32) {
+        self.use_item_can_sprint = can_sprint;
+        self.use_item_speed = speed_multiplier;
+    }
+
+    /// `LivingEntity.stopUsingItem` (`releaseUsingItem` included).
+    pub fn stop_using_item(&mut self) {
+        self.using_item = false;
+        self.using_item_offhand = false;
+        self.use_item_can_sprint = false;
+        self.use_item_speed = 0.2;
+    }
+
+    fn is_slow_due_to_using_item(&self) -> bool {
+        self.using_item && !self.use_item_can_sprint
     }
 
     /// `isInLava()`.
@@ -602,7 +653,7 @@ impl Player {
         let left = impulse(self.key_presses.left, self.key_presses.right);
         self.move_vector = vec2_normalized(left, forward);
 
-        if was_shift_key_down || self.key_presses.backward {
+        if was_shift_key_down || self.is_slow_due_to_using_item() || self.key_presses.backward {
             self.sprint_trigger_time = 0;
         }
 
@@ -711,6 +762,7 @@ impl Player {
         !self.sprinting
             && self.has_forward_impulse()
             && self.is_sprinting_possible(self.abilities.flying)
+            && !self.is_slow_due_to_using_item()
             && (!self.fall_flying || self.under_water())
             && (!self.is_moving_slowly() || self.under_water())
     }
@@ -1027,6 +1079,10 @@ impl Player {
         if x * x + y * y != 0.0 {
             x *= 0.98;
             y *= 0.98;
+            if self.using_item {
+                x *= self.use_item_speed;
+                y *= self.use_item_speed;
+            }
             if self.is_moving_slowly() {
                 let factor = self.attributes.value(attributes::SNEAKING_SPEED) as f32;
                 x *= factor;
@@ -1956,4 +2012,35 @@ fn collect_candidate_step_up_heights(
     }
     candidates.sort_by(|a, b| a.total_cmp(b));
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_use_scales_input_and_blocks_sprint() {
+        let mut player = Player::new();
+        player.move_vector = (0.0, 1.0);
+        player.key_presses.forward = true;
+
+        player.apply_living_flags(0b11);
+        assert!(player.using_item);
+        assert!(player.using_item_offhand);
+
+        player.set_use_effects(false, 0.2);
+        player.apply_input();
+        assert!((player.zza - 0.196).abs() < 1e-6);
+        assert!(!player.can_start_sprinting());
+
+        player.set_use_effects(true, 0.5);
+        player.apply_input();
+        assert!((player.zza - 0.49).abs() < 1e-6);
+        assert!(player.can_start_sprinting());
+
+        player.apply_living_flags(0);
+        assert!(!player.using_item);
+        assert!(!player.using_item_offhand);
+        assert!(!player.is_slow_due_to_using_item());
+    }
 }

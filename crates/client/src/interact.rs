@@ -10,7 +10,7 @@ use rapidbot_physics::attributes;
 use rapidbot_physics::math::Vec3;
 use rapidbot_physics::player::Player;
 use rapidbot_protocol::packets::play::serverbound::{
-    Attack, PlayerAction, PlayerActionKind, Punch,
+    Attack, PlayerAction, PlayerActionKind, Punch, UseItem, UseItemOn,
 };
 use rapidbot_world::item::ItemStack;
 use rapidbot_world::raycast::{self, BlockHit, Direction};
@@ -299,6 +299,25 @@ pub(crate) struct Hands<'a> {
     pub survival: bool,
 }
 
+/// `MultiPlayerGameMode.useItemOn` for the main hand, without prediction.
+pub(crate) fn send_use_item_on(net: &PacketSender, hit: &BlockHit) {
+    if hit.miss {
+        return;
+    }
+    let (x, y, z) = hit.pos;
+    net.send(&UseItemOn {
+        hand: 0,
+        pos: pack_block_pos(x, y, z),
+        direction: hit.direction as i32,
+        cursor_x: (hit.location[0] - x as f64) as f32,
+        cursor_y: (hit.location[1] - y as f64) as f32,
+        cursor_z: (hit.location[2] - z as f64) as f32,
+        inside: hit.inside,
+        world_border: false,
+        sequence: 0,
+    });
+}
+
 struct ServerVerified {
     sequence: i32,
     state: StateId,
@@ -315,6 +334,9 @@ pub(crate) struct GameMode {
     destroy_progress: f32,
     destroy_delay: i32,
     miss_time: i32,
+    /// `Minecraft.rightClickDelay`: ticks before holding the button uses
+    /// the item again.
+    right_click_delay: i32,
     /// `Player.attackStrengthTicker`: ticks since the last swing at an
     /// entity or at nothing.
     attack_strength_ticker: i32,
@@ -332,6 +354,93 @@ impl GameMode {
             last_teleport_sequence: -1,
             ..Default::default()
         }
+    }
+
+    /// The right-click delay half of `Minecraft.tick`.
+    pub fn tick(&mut self) {
+        if self.right_click_delay > 0 {
+            self.right_click_delay -= 1;
+        }
+    }
+
+    /// `Minecraft.startUseItem` and the use half of `handleKeybinds`.
+    ///
+    /// `down` is the use button; `clicked` is a fresh press this tick.
+    /// With nothing under the crosshair this sends `UseItem` for the main
+    /// hand, then the off hand. On a block it sends `UseItemOn` instead.
+    pub fn use_button(&mut self, h: &mut Hands<'_>, pick: &Pick, down: bool, clicked: bool) {
+        if h.player.spectator {
+            return;
+        }
+        // handleKeybinds: letting go while using releases the item.
+        if h.player.using_item && !down {
+            Self::send_action(
+                h,
+                PlayerActionKind::ReleaseUseItem,
+                (0, 0, 0),
+                Direction::Down,
+                0,
+            );
+            h.player.stop_using_item();
+        }
+        // startUseItem does nothing while a block is being destroyed.
+        if self.destroying || h.player.using_item {
+            return;
+        }
+        // A click starts at once; holding waits for the delay.
+        if !down || (!clicked && self.right_click_delay > 0) {
+            return;
+        }
+        self.right_click_delay = 4;
+        if pick.entity.is_some() {
+            // Entity interaction is not modeled yet. Do not turn it into
+            // an item use aimed at the entity.
+            return;
+        }
+        if !pick.block.miss {
+            send_use_item_on(h.net, &pick.block);
+            return;
+        }
+        let y_rot = h.player.y_rot;
+        let x_rot = h.player.x_rot;
+        for hand in 0..2 {
+            let stack = if hand == 0 {
+                h.inventory.held()
+            } else {
+                h.inventory.offhand()
+            };
+            let Some(stack) = stack else { continue };
+            // Vanilla stops at the first hand whose use succeeds. We do
+            // not know the result locally, so send the off hand too when
+            // the main hand does not look usable (a sword in front of a
+            // shield, for example).
+            h.net.send(&UseItem {
+                hand,
+                sequence: self.next_sequence(),
+                y_rot,
+                x_rot,
+            });
+            if Self::likely_uses_item(stack) {
+                break;
+            }
+        }
+    }
+
+    /// Whether an item looks like it starts a use in progress. The server
+    /// is authoritative: it sends `DATA_LIVING_ENTITY_FLAGS` either way.
+    fn likely_uses_item(stack: &ItemStack) -> bool {
+        stack.has("minecraft:consumable")
+            || stack.has("minecraft:blocks_attacks")
+            || matches!(
+                stack.name(),
+                "minecraft:bow"
+                    | "minecraft:crossbow"
+                    | "minecraft:trident"
+                    | "minecraft:goat_horn"
+                    | "minecraft:spyglass"
+                    | "minecraft:brush"
+                    | "minecraft:fishing_rod"
+            )
     }
 
     /// The block being broken and how far along it is, 0 to 1.
@@ -881,6 +990,40 @@ mod tests {
             self.mode
                 .attack_button(&mut hands, clicks, down, &hit, |_| {});
             self.mode.player_tick(self.inventory.held());
+            self.take_packets()
+        }
+
+        /// One tick of the use button.
+        fn tick_use(&mut self, down: bool, clicked: bool) -> Vec<(i32, Vec<u8>)> {
+            let hit = pick(&self.player, &self.world, &self.entities, 1, &self.tags);
+            let mut hands = Hands {
+                player: &mut self.player,
+                world: &mut self.world,
+                inventory: &self.inventory,
+                entities: &self.entities,
+                tags: &self.tags,
+                net: &self.net,
+                restricted: false,
+                survival: true,
+            };
+            self.mode.use_button(&mut hands, &hit, down, clicked);
+            self.take_packets()
+        }
+
+        /// Puts a stack in an inventory-menu slot (36 is hotbar 0).
+        fn set_item(&mut self, index: usize, name: &str) {
+            let id = ItemData::get().item_id(name).unwrap();
+            let mut body = Vec::new();
+            body.extend(rapidbot_buf::to_bytes(&VarInt(0)));
+            body.extend(rapidbot_buf::to_bytes(&VarInt(0)));
+            body.extend((index as i16).to_be_bytes());
+            body.extend(rapidbot_buf::to_bytes(&VarInt(1)));
+            body.extend(rapidbot_buf::to_bytes(&VarInt(id as i32)));
+            body.extend([0, 0]);
+            self.inventory.set_slot(&body).unwrap();
+        }
+
+        fn take_packets(&mut self) -> Vec<(i32, Vec<u8>)> {
             let mut packets = Vec::new();
             while let Ok(frame) = self.sent.try_recv() {
                 let mut buf = frame.as_slice();
@@ -1235,6 +1378,89 @@ mod tests {
         scene.inventory.set_player_inventory(&body).unwrap();
         scene.tick(0, false);
         assert_eq!(scene.mode.attack_strength(&scene.player, 0.0), 0.0);
+    }
+
+    /// A held use button repeats only after the four-tick right-click
+    /// delay, as `Minecraft.startUseItem` sets it.
+    #[test]
+    fn use_button_waits_between_held_clicks() {
+        let mut scene = Scene::new();
+        let first = scene.tick_use(true, true);
+        assert_eq!(
+            first.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+        assert!(scene.tick_use(true, false).is_empty());
+        for _ in 0..4 {
+            scene.mode.tick();
+        }
+        let repeat = scene.tick_use(true, false);
+        assert_eq!(
+            repeat.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+    }
+
+    /// With a block item in the main hand, the off hand still gets its
+    /// `UseItem`; with a bow in the main hand it does not.
+    #[test]
+    fn use_button_tries_both_hands() {
+        let mut scene = Scene::new();
+        scene.player.x_rot = -90.0;
+        scene.player.y_rot = 30.0;
+        scene.set_item(36, "minecraft:stone");
+        scene.set_item(45, "minecraft:shield");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItem::ID, UseItem::ID]
+        );
+        let main = UseItem::decode(&mut &packets[0].1[..]).unwrap();
+        let off = UseItem::decode(&mut &packets[1].1[..]).unwrap();
+        assert_eq!(
+            (main.hand, main.sequence, main.y_rot, main.x_rot),
+            (0, 1, 30.0, -90.0)
+        );
+        assert_eq!((off.hand, off.sequence), (1, 2));
+
+        let mut scene = Scene::new();
+        scene.player.x_rot = -90.0;
+        scene.set_item(36, "minecraft:bow");
+        scene.set_item(45, "minecraft:shield");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItem::ID]
+        );
+        assert_eq!(UseItem::decode(&mut &packets[0].1[..]).unwrap().hand, 0);
+    }
+
+    /// Letting go while using sends the release action, then stops locally.
+    #[test]
+    fn releasing_use_item_sends_player_action() {
+        let mut scene = Scene::new();
+        scene.player.start_using_item(false);
+        let packets = scene.tick_use(false, false);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [PlayerAction::ID]
+        );
+        let release = action(&packets[0].1);
+        assert_eq!(
+            (
+                release.action,
+                release.pos,
+                release.direction,
+                release.sequence
+            ),
+            (
+                PlayerActionKind::ReleaseUseItem,
+                0,
+                Direction::Down as u8,
+                0
+            )
+        );
+        assert!(!scene.player.using_item);
     }
 
     #[test]

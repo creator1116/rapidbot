@@ -887,6 +887,22 @@ pub mod serverbound {
     }
     packet!(UseItemOn, play, serverbound, USE_ITEM_ON);
 
+    /// `ServerboundUseItemPacket`: a right click that is not on a block.
+    ///
+    /// `hand` is an `InteractionHand`: 0 main hand, 1 off hand. `sequence`
+    /// acknowledges predicted block changes, and the rotation is the
+    /// player's view when the button was clicked.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct UseItem {
+        #[var]
+        pub hand: i32,
+        #[var]
+        pub sequence: i32,
+        pub y_rot: f32,
+        pub x_rot: f32,
+    }
+    packet!(UseItem, play, serverbound, USE_ITEM);
+
     /// `ServerboundSetCarriedItemPacket`: the selected hotbar slot, 0 to 8.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
     pub struct SetCarriedItem {
@@ -993,6 +1009,22 @@ mod tests {
         assert_eq!(&bytes[22..24], &[0, 0]);
         assert_eq!(bytes[24], 7);
         assert_eq!(bytes.len(), 25);
+    }
+
+    #[test]
+    fn use_item_uses_vanilla_field_order() {
+        let packet = serverbound::UseItem {
+            hand: 1,
+            sequence: 7,
+            y_rot: 90.0,
+            x_rot: -30.0,
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        // Hand, then sequence, then yaw and pitch.
+        assert_eq!(&bytes[..2], &[1, 7]);
+        assert_eq!(&bytes[2..6], &packet.y_rot.to_be_bytes());
+        assert_eq!(&bytes[6..10], &packet.x_rot.to_be_bytes());
+        assert_eq!(bytes.len(), 10);
     }
 
     #[test]

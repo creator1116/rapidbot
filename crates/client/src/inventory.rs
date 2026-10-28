@@ -2,6 +2,9 @@
 //! `InventoryMenu` and whichever container menu is open.
 
 use rapidbot_buf::{Decode, DecodeError, VarInt};
+use rapidbot_protocol::packets::play::serverbound::{
+    ClickContainer, ClickContainerButton, ContainerInput, HashedStack,
+};
 use rapidbot_world::item::{EquipmentSlot, ItemStack};
 
 /// `InventoryMenu` slot numbers (container 0).
@@ -246,6 +249,363 @@ impl Inventory {
         self.container = None;
         self.cursor = None;
     }
+
+    /// The slot `-999` a click can name: the carried stack outside the menu.
+    pub const CLICK_OUTSIDE: i16 = -999;
+
+    /// Number of slots in the menu the player currently has open.
+    pub fn menu_len(&self) -> usize {
+        self.container
+            .as_ref()
+            .map_or(slot::COUNT, |c| c.slots.len() + 36)
+    }
+
+    /// A menu slot as the server numbers it. With a container open its own
+    /// slots come first, then the player's 27 main slots and 9 hotbar slots.
+    pub fn menu_item(&self, index: usize) -> Option<&ItemStack> {
+        if let Some(container) = &self.container {
+            if index < container.slots.len() {
+                return container.slots.get(index)?.as_ref();
+            }
+            return self
+                .slots
+                .get(slot::MAIN + index - container.slots.len())?
+                .as_ref();
+        }
+        self.slots.get(index)?.as_ref()
+    }
+
+    fn set_menu_item(&mut self, index: usize, item: Option<ItemStack>) -> bool {
+        if let Some(container) = &mut self.container {
+            if index < container.slots.len() {
+                container.slots[index] = item;
+                return true;
+            }
+            let Some(slot) = self
+                .slots
+                .get_mut(slot::MAIN + index - container.slots.len())
+            else {
+                return false;
+            };
+            *slot = item;
+            return true;
+        }
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        *slot = item;
+        true
+    }
+
+    /// The inventory menu's slot filters (`InventoryMenu` / `Slot.mayPlace`).
+    /// Container slots are unconstrained here; a server still rejects what
+    /// its menu does not allow.
+    fn slot_accepts(&self, index: usize, stack: &ItemStack) -> bool {
+        if self.container.is_some() {
+            return true;
+        }
+        match index {
+            slot::CRAFT_RESULT => false,
+            1..=4 => true,
+            slot::HEAD..=slot::FEET => {
+                let expected = match index {
+                    slot::HEAD => EquipmentSlot::Head,
+                    slot::CHEST => EquipmentSlot::Chest,
+                    slot::LEGS => EquipmentSlot::Legs,
+                    _ => EquipmentSlot::Feet,
+                };
+                stack.equip_slot() == Some(expected)
+            }
+            _ => true,
+        }
+    }
+
+    fn slot_max_stack(&self, index: usize, stack: &ItemStack) -> i32 {
+        if self.container.is_none() && (slot::HEAD..=slot::FEET).contains(&index) {
+            return 1;
+        }
+        stack.max_stack_size().max(1)
+    }
+
+    fn insert_at(&mut self, index: usize, incoming: &mut ItemStack, amount: i32) -> bool {
+        if amount <= 0 || !self.slot_accepts(index, incoming) {
+            return false;
+        }
+        let existing = self.menu_item(index).cloned();
+        let max = self.slot_max_stack(index, incoming);
+        match existing {
+            None => {
+                let n = amount.min(max);
+                let mut moved = incoming.clone();
+                moved.count = n;
+                self.set_menu_item(index, Some(moved));
+                incoming.count -= n;
+                n > 0
+            }
+            Some(mut existing)
+                if ItemStack::same_item_same_components(Some(&existing), Some(incoming)) =>
+            {
+                let n = amount.min((max - existing.count).max(0));
+                if n == 0 {
+                    return false;
+                }
+                existing.count += n;
+                self.set_menu_item(index, Some(existing));
+                incoming.count -= n;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    fn take_at(&mut self, index: usize, amount: i32) -> Option<ItemStack> {
+        let mut stack = self.menu_item(index)?.clone();
+        let n = amount.clamp(1, stack.count);
+        let mut taken = stack.clone();
+        taken.count = n;
+        stack.count -= n;
+        self.set_menu_item(index, (stack.count > 0).then_some(stack));
+        Some(taken)
+    }
+
+    fn pickup(&mut self, slot: i16, secondary: bool) {
+        if slot == Self::CLICK_OUTSIDE {
+            if let Some(mut carried) = self.cursor.take()
+                && secondary
+            {
+                carried.count -= 1;
+                if carried.count > 0 {
+                    self.cursor = Some(carried);
+                }
+            }
+            return;
+        }
+        let Ok(index) = usize::try_from(slot) else {
+            return;
+        };
+        if index >= self.menu_len() {
+            return;
+        }
+        match (self.menu_item(index).cloned(), self.cursor.take()) {
+            (None, Some(mut carried)) => {
+                let amount = if secondary { 1 } else { carried.count };
+                if self.insert_at(index, &mut carried, amount) {
+                    self.cursor = (carried.count > 0).then_some(carried);
+                } else {
+                    self.cursor = Some(carried);
+                }
+            }
+            (Some(clicked), None) => {
+                let amount = if secondary {
+                    (clicked.count + 1) / 2
+                } else {
+                    clicked.count
+                };
+                self.cursor = self.take_at(index, amount);
+            }
+            (Some(clicked), Some(mut carried)) => {
+                if ItemStack::same_item_same_components(Some(&clicked), Some(&carried)) {
+                    let amount = if secondary { 1 } else { carried.count };
+                    if self.insert_at(index, &mut carried, amount) {
+                        self.cursor = (carried.count > 0).then_some(carried);
+                    } else {
+                        self.cursor = Some(carried);
+                    }
+                } else if self.slot_accepts(index, &carried)
+                    && carried.count <= self.slot_max_stack(index, &carried)
+                {
+                    self.set_menu_item(index, Some(carried));
+                    self.cursor = Some(clicked);
+                } else {
+                    self.cursor = Some(carried);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// `quickMoveStack` for the menus this client opens: a container's own
+    /// slots and the player's 27 + 9 storage slots. Stack merging and the
+    /// first empty slot are enough for normal chest/furnace work; specialised
+    /// menus still settle on the server's slot updates.
+    fn quick_move(&mut self, slot: i16) {
+        let Ok(index) = usize::try_from(slot) else {
+            return;
+        };
+        if index >= self.menu_len() {
+            return;
+        }
+        let Some(mut stack) = self.menu_item(index).cloned() else {
+            return;
+        };
+        let targets = if let Some(container) = &self.container {
+            let own = container.slots.len();
+            if index < own {
+                (own..own + 36).collect::<Vec<_>>()
+            } else {
+                (0..own).collect()
+            }
+        } else if (slot::HOTBAR..slot::HOTBAR + 9).contains(&index) {
+            (slot::MAIN..slot::HOTBAR).collect()
+        } else if (slot::MAIN..slot::HOTBAR).contains(&index) {
+            (slot::HOTBAR..slot::HOTBAR + 9).collect()
+        } else {
+            (slot::MAIN..slot::HOTBAR + 9).collect()
+        };
+        for target in targets {
+            if stack.count == 0 {
+                break;
+            }
+            let amount = stack.count;
+            self.insert_at(target, &mut stack, amount);
+        }
+        self.set_menu_item(index, (stack.count > 0).then_some(stack));
+    }
+
+    fn swap(&mut self, slot: i16, button: i8) {
+        if !(0..=8).contains(&button) && button != 40 {
+            return;
+        }
+        let Ok(target) = usize::try_from(slot) else {
+            return;
+        };
+        if target >= self.menu_len() {
+            return;
+        }
+        let Some(source) = menu_slot(button as i32) else {
+            return;
+        };
+        let source_stack = self.slots[source].clone();
+        let target_stack = self.menu_item(target).cloned();
+        match (source_stack, target_stack) {
+            (None, None) => {}
+            (None, Some(target_stack)) => {
+                self.slots[source] = Some(target_stack);
+                self.set_menu_item(target, None);
+            }
+            (Some(mut source_stack), None) => {
+                if !self.slot_accepts(target, &source_stack) {
+                    return;
+                }
+                let max = self.slot_max_stack(target, &source_stack);
+                if source_stack.count > max {
+                    let mut moved = source_stack.clone();
+                    moved.count = max;
+                    source_stack.count -= max;
+                    self.set_menu_item(target, Some(moved));
+                    self.slots[source] = Some(source_stack);
+                } else {
+                    self.set_menu_item(target, Some(source_stack));
+                    self.slots[source] = None;
+                }
+            }
+            (Some(source_stack), Some(target_stack)) => {
+                let max = self.slot_max_stack(target, &source_stack);
+                if self.slot_accepts(target, &source_stack)
+                    && source_stack.count <= max
+                    && target_stack.count <= 64
+                {
+                    self.set_menu_item(target, Some(source_stack));
+                    self.slots[source] = Some(target_stack);
+                }
+            }
+        }
+    }
+
+    fn throw(&mut self, slot: i16, all: bool) {
+        if self.cursor.is_some() {
+            return;
+        }
+        let Ok(index) = usize::try_from(slot) else {
+            return;
+        };
+        if index >= self.menu_len() {
+            return;
+        }
+        let count = if all {
+            self.menu_item(index).map_or(0, |s| s.count)
+        } else {
+            1
+        };
+        let _ = self.take_at(index, count);
+    }
+
+    fn hashed(stack: Option<&ItemStack>) -> HashedStack {
+        match stack {
+            Some(stack) if stack.patch_is_empty() => HashedStack::Actual {
+                item: stack.item,
+                count: stack.count,
+                added_components: Vec::new(),
+                removed_components: Vec::new(),
+            },
+            _ => HashedStack::Empty,
+        }
+    }
+
+    /// `MultiPlayerGameMode.handleContainerInput`: apply a menu click locally
+    /// and return the packet that describes the prediction. `None` for input
+    /// this client does not implement (creative clone, drag, pickup-all).
+    pub fn click(
+        &mut self,
+        slot: i16,
+        button: i8,
+        input: ContainerInput,
+    ) -> Option<ClickContainer> {
+        let before: Vec<Option<ItemStack>> = (0..self.menu_len())
+            .map(|i| self.menu_item(i).cloned())
+            .collect();
+        let handled = match input {
+            ContainerInput::Pickup if button == 0 || button == 1 => {
+                self.pickup(slot, button == 1);
+                true
+            }
+            ContainerInput::QuickMove if button == 0 || button == 1 => {
+                self.quick_move(slot);
+                true
+            }
+            ContainerInput::Swap => {
+                self.swap(slot, button);
+                true
+            }
+            ContainerInput::Throw if button == 0 || button == 1 => {
+                self.throw(slot, button == 1);
+                true
+            }
+            _ => false,
+        };
+        if !handled {
+            return None;
+        }
+        let changed_slots = (0..self.menu_len())
+            .filter_map(|i| {
+                let after = self.menu_item(i);
+                (before.get(i).and_then(Option::as_ref) != after)
+                    .then(|| (i as i16, Self::hashed(after)))
+            })
+            .collect();
+        let (container_id, state_id) = self
+            .container
+            .as_ref()
+            .map_or((0, self.state_id), |c| (c.id, c.state_id));
+        Some(ClickContainer {
+            container_id,
+            state_id,
+            slot,
+            button,
+            input,
+            changed_slots,
+            carried_item: Self::hashed(self.cursor.as_ref()),
+        })
+    }
+
+    /// `MultiPlayerGameMode.handleInventoryButtonClick`.
+    pub fn click_button(&self, button_id: i32) -> Option<ClickContainerButton> {
+        let container = self.container.as_ref()?;
+        Some(ClickContainerButton {
+            container_id: container.id,
+            button_id,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +717,113 @@ mod tests {
         assert_eq!(inv.held().unwrap().name(), "minecraft:stone");
         inv.set_held_slot(&[9]).unwrap();
         assert_eq!(inv.selected, 2);
+    }
+
+    fn item(name: &str, count: i32) -> ItemStack {
+        ItemStack::new(ItemData::get().item_id(name).unwrap(), count)
+    }
+
+    fn chest() -> Inventory {
+        let mut inv = Inventory::default();
+        inv.open_screen(&[3, 2, 0]).unwrap();
+        let container = inv.container.as_mut().unwrap();
+        container.slots = vec![None; 27];
+        container.state_id = 4;
+        inv
+    }
+
+    #[test]
+    fn container_pickup_moves_the_cursor_both_ways() {
+        let mut inv = chest();
+        inv.cursor = Some(item("minecraft:stone", 5));
+        let packet = inv.click(0, 0, ContainerInput::Pickup).unwrap();
+        assert_eq!(packet.container_id, 3);
+        assert_eq!(packet.state_id, 4);
+        assert_eq!(packet.changed_slots.len(), 1);
+        assert_eq!(packet.changed_slots[0].0, 0);
+        assert_eq!(packet.carried_item, HashedStack::Empty);
+        assert_eq!(
+            inv.container.as_ref().unwrap().slots[0]
+                .as_ref()
+                .unwrap()
+                .count,
+            5
+        );
+        assert!(inv.cursor.is_none());
+
+        let packet = inv.click(0, 1, ContainerInput::Pickup).unwrap();
+        assert_eq!(packet.changed_slots[0].0, 0);
+        assert_eq!(inv.cursor.as_ref().unwrap().count, 3);
+        assert_eq!(
+            inv.container.as_ref().unwrap().slots[0]
+                .as_ref()
+                .unwrap()
+                .count,
+            2
+        );
+        assert!(matches!(packet.carried_item, HashedStack::Actual { .. }));
+    }
+
+    #[test]
+    fn container_quick_move_and_throw() {
+        let mut inv = chest();
+        inv.container.as_mut().unwrap().slots[0] = Some(item("minecraft:diamond", 5));
+        inv.click(0, 0, ContainerInput::QuickMove).unwrap();
+        assert!(inv.container.as_ref().unwrap().slots[0].is_none());
+        assert_eq!(inv.get(slot::MAIN).unwrap().count, 5);
+
+        inv.container.as_mut().unwrap().slots[1] = Some(item("minecraft:apple", 4));
+        inv.click(1, 1, ContainerInput::Throw).unwrap();
+        assert!(inv.container.as_ref().unwrap().slots[1].is_none());
+    }
+
+    #[test]
+    fn container_swap_and_button_click() {
+        let mut inv = chest();
+        inv.slots[slot::HOTBAR] = Some(item("minecraft:stone", 3));
+        inv.container.as_mut().unwrap().slots[2] = Some(item("minecraft:diamond", 2));
+        inv.click(2, 0, ContainerInput::Swap).unwrap();
+        assert_eq!(inv.hotbar(0).unwrap().name(), "minecraft:diamond");
+        assert_eq!(
+            inv.container.as_ref().unwrap().slots[2]
+                .as_ref()
+                .unwrap()
+                .name(),
+            "minecraft:stone"
+        );
+        let packet = inv.click_button(7).unwrap();
+        assert_eq!(packet.container_id, 3);
+        assert_eq!(packet.button_id, 7);
+    }
+
+    #[test]
+    fn quick_move_from_player_storage_goes_to_the_container() {
+        let mut inv = chest();
+        inv.slots[slot::MAIN] = Some(item("minecraft:coal", 8));
+        // Container menu slot 27 is the first player main-inventory slot.
+        inv.click(27, 0, ContainerInput::QuickMove).unwrap();
+        assert!(inv.get(slot::MAIN).is_none());
+        assert_eq!(
+            inv.container.as_ref().unwrap().slots[0]
+                .as_ref()
+                .unwrap()
+                .count,
+            8
+        );
+    }
+
+    #[test]
+    fn clicking_outside_drops_the_cursor() {
+        let mut inv = Inventory {
+            cursor: Some(item("minecraft:stone", 2)),
+            ..Default::default()
+        };
+        let packet = inv
+            .click(Inventory::CLICK_OUTSIDE, 0, ContainerInput::Pickup)
+            .unwrap();
+        assert!(inv.cursor.is_none());
+        assert!(packet.changed_slots.is_empty());
+        assert_eq!(packet.carried_item, HashedStack::Empty);
     }
 
     /// A chest's menu: 27 chest slots, then the player's 27 + 9.

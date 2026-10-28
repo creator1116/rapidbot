@@ -54,9 +54,9 @@ pub enum Inbound {
     Disconnected(String),
 }
 
-pub fn spawn_writer(mut writer: Writer) -> PacketSender {
+pub fn spawn_writer(mut writer: Writer) -> (PacketSender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
             // Every vanilla send is writeAndFlush: one write per packet.
             if writer.queue_raw(&packet).is_err() || writer.flush().await.is_err() {
@@ -65,7 +65,7 @@ pub fn spawn_writer(mut writer: Writer) -> PacketSender {
         }
         let _ = writer.shutdown().await;
     });
-    PacketSender { tx }
+    (PacketSender { tx }, task)
 }
 
 /// `ChunkBatchSizeCalculator`: an estimate of how fast this client takes in
@@ -110,11 +110,15 @@ impl ChunkBatchSizeCalculator {
     }
 }
 
-pub fn spawn_reader(mut reader: Reader, sender: PacketSender, inbound: std_mpsc::Sender<Inbound>) {
+pub fn spawn_reader(
+    mut reader: Reader,
+    sender: PacketSender,
+    inbound: std_mpsc::Sender<Inbound>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let reason = read_loop(&mut reader, &sender, &inbound).await;
         let _ = inbound.send(Inbound::Disconnected(reason));
-    });
+    })
 }
 
 async fn read_loop(

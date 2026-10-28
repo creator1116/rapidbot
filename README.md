@@ -117,8 +117,8 @@ cargo run --release -p rapidbot-client --example chat -- localhost:25565 Walker 
 cargo run --release -p rapidbot-client --example course -- localhost:25565 Walker 130  # walks +x through water, ladders; glides when wearing an elytra
 cargo run --release -p rapidbot-client --example dig -- localhost:25565 Walker 62 150 60  # digs the listed blocks
 cargo run --release -p rapidbot-client --example fight -- localhost:25565 Walker minecraft:husk  # fights the nearest husk
-cargo run -p rapidbot-auth --example login -- accounts/main.json            # Microsoft sign-in, cached (accounts/ is gitignored)
-cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft accounts/main.json
+cargo run -p rapidbot-auth -- login main                        # Microsoft sign-in, encrypted cache (accounts/ is gitignored)
+cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 ```
 
 Run bots with `--release`: tick timing is part of what servers see, and

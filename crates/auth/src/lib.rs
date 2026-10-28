@@ -2,25 +2,33 @@
 //!
 //! Chain: Microsoft OAuth (device code) → Xbox Live user token → XSTS token
 //! for `rp://api.minecraftservices.com/` → Minecraft access token → profile.
-//! Tokens are cached in a JSON file and refreshed as they expire, so the
-//! device-code prompt only appears on first use.
+//! Tokens are refreshed as they expire, so the device-code prompt only
+//! appears on first use. [`AccountStore`] keeps one encrypted cache per
+//! alias and puts its random key in the OS keyring; [`Authenticator::new`]
+//! still accepts a plain-JSON path for tools and scripts.
 //!
 //! None of this reaches the game server directly: it only learns whether
 //! [`join_server`] succeeded before it sent the encryption request.
 
+mod accounts;
 mod cache;
 mod microsoft;
 mod minecraft;
+mod store;
 mod xbox;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing::{debug, info};
 use uuid::Uuid;
 
+pub use accounts::{AccountStatus, AccountStore, StoredAccount};
 pub use cache::{CachedMinecraft, CachedMsa, TokenCache};
 pub use microsoft::DeviceCode;
 pub use minecraft::{ChatKeys, JoinError, join_server};
+pub use store::{
+    EncryptedFileTokenStore, FileTokenStore, KeyProvider, KeyringKeyProvider, TokenStore,
+};
 
 /// Public Xbox title client IDs usable with the live.com device-code flow.
 pub mod titles {
@@ -36,6 +44,8 @@ pub enum AuthError {
     Io(#[from] std::io::Error),
     #[error("cache file: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("token store: {0}")]
+    Store(String),
     #[error("Microsoft login: {0}")]
     Microsoft(String),
     #[error("device code expired before it was used")]
@@ -61,11 +71,11 @@ pub struct MinecraftAccount {
 pub struct Authenticator {
     http: reqwest::Client,
     client_id: String,
-    cache_path: PathBuf,
+    store: Box<dyn TokenStore>,
     cache: TokenCache,
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -73,21 +83,37 @@ fn now_secs() -> i64 {
 }
 
 impl Authenticator {
-    /// Loads (or starts) the token cache at `cache_path`.
+    /// Loads (or starts) a plain-JSON token cache at `cache_path`.
     pub fn new(cache_path: impl AsRef<Path>) -> Result<Self, AuthError> {
-        let cache_path = cache_path.as_ref().to_path_buf();
-        let cache = TokenCache::load(&cache_path)?;
+        Self::with_store(Box::new(FileTokenStore::new(cache_path)))
+    }
+
+    /// Loads (or starts) a cache from any [`TokenStore`].
+    pub fn with_store(store: Box<dyn TokenStore>) -> Result<Self, AuthError> {
+        let cache = store.load()?;
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             client_id: titles::MINECRAFT_NINTENDO_SWITCH.into(),
-            cache_path,
+            store,
             cache,
         })
+    }
+
+    /// The cached account, if the store has signed in at least once.
+    pub fn cached(&self) -> Option<&CachedMinecraft> {
+        self.cache.minecraft.as_ref()
     }
 
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = client_id.into();
         self
+    }
+
+    /// Forgets the cached tokens (the OS-keyring key too, if the store keeps
+    /// one there).
+    pub fn clear(&mut self) -> Result<(), AuthError> {
+        self.cache = TokenCache::default();
+        self.store.clear()
     }
 
     /// Returns a valid account, refreshing or re-authenticating as needed.
@@ -117,7 +143,7 @@ impl Authenticator {
                     id: profile.id,
                 };
                 self.cache.minecraft = Some(mc.clone());
-                self.cache.save(&self.cache_path)?;
+                self.store.save(&self.cache)?;
                 mc
             }
         };
@@ -143,7 +169,7 @@ impl Authenticator {
             match microsoft::refresh(&self.http, &self.client_id, &msa.refresh_token).await {
                 Ok(fresh) => {
                     self.cache.msa = Some(fresh.clone());
-                    self.cache.save(&self.cache_path)?;
+                    self.store.save(&self.cache)?;
                     return Ok(fresh.access_token);
                 }
                 Err(e) => debug!("refresh failed, falling back to device code: {e}"),
@@ -152,7 +178,7 @@ impl Authenticator {
         let fresh =
             microsoft::device_code_login(&self.http, &self.client_id, on_device_code).await?;
         self.cache.msa = Some(fresh.clone());
-        self.cache.save(&self.cache_path)?;
+        self.store.save(&self.cache)?;
         Ok(fresh.access_token)
     }
 
@@ -169,7 +195,7 @@ impl Authenticator {
         match minecraft::certificates(&self.http, access_token).await {
             Ok(keys) => {
                 self.cache.chat_keys = Some(keys.clone());
-                self.cache.save(&self.cache_path)?;
+                self.store.save(&self.cache)?;
                 Ok(Some(keys))
             }
             Err(e) => {

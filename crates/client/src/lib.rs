@@ -22,6 +22,7 @@ pub mod nav;
 mod net;
 mod packs;
 pub mod path;
+pub mod status;
 pub mod text;
 
 use std::collections::HashMap;
@@ -155,7 +156,7 @@ pub enum ClientError {
     Encryption(String),
     #[error("server requires a resource pack and the policy declines it")]
     ResourcePackRequired,
-    #[error("server asked to transfer to {host}:{port} (not supported yet)")]
+    #[error("server transferred the client to {host}:{port}")]
     Transfer { host: String, port: i32 },
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -199,9 +200,9 @@ pub async fn run_with(config: ClientConfig, controller: impl Controller) -> Clie
 /// Login runs here; configuration and play run on a dedicated main thread,
 /// like the vanilla client's, with the network side on tokio.
 async fn run_inner(
-    config: ClientConfig,
-    controller: Box<dyn Controller>,
-    link: bot::BotLink,
+    mut config: ClientConfig,
+    mut controller: Box<dyn Controller>,
+    mut link: bot::BotLink,
 ) -> Result<ClientError, ClientError> {
     // Unpack the embedded block and item data while logging in, so the
     // main thread does not stall on first use in the middle of play.
@@ -209,38 +210,117 @@ async fn run_inner(
         rapidbot_world::Registry::get();
         rapidbot_world::item::ItemData::get();
     });
-    let resolved = address::resolve(&config.address).await?;
-    info!(address = %resolved.socket, host = %resolved.handshake_host, "connecting");
-    let mut connection = Connection::connect(resolved.socket).await?;
-
-    // Vanilla sends the intention and then Hello, each flushed.
-    connection
-        .send(&Intention {
-            protocol_version: PROTOCOL_VERSION,
-            host: resolved.handshake_host.as_str().into(),
-            port: resolved.handshake_port,
-            intent: Intent::Login,
-        })
-        .await?;
 
     let mut session = SessionData::default();
-    let (profile, session_id) = login::login(&mut connection, &config, &mut session).await?;
-    info!(name = %profile.name.0, uuid = %profile.id, "logged in");
-    link.emit(BotEvent::LoggedIn {
-        name: profile.name.0.clone(),
-        uuid: profile.id,
-    });
-    session.profile = Some(profile);
-    session.session_id = Some(session_id);
+    loop {
+        if link.stopped() {
+            return Ok(ClientError::Stopped);
+        }
+        let resolved = address::resolve(&config.address).await?;
+        info!(address = %resolved.socket, host = %resolved.handshake_host, "connecting");
+        let mut connection = Connection::connect(resolved.socket).await?;
 
-    let (reader, writer) = connection.into_split();
-    let sender = net::spawn_writer(writer);
-    let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
-    net::spawn_reader(reader, sender.clone(), inbound_tx);
+        // Vanilla sends the intention and then Hello, each flushed.
+        connection
+            .send(&Intention {
+                protocol_version: PROTOCOL_VERSION,
+                host: resolved.handshake_host.as_str().into(),
+                port: resolved.handshake_port,
+                intent: Intent::Login,
+            })
+            .await?;
 
-    let game = game::Game::new(config, sender, inbound_rx, session, controller, link);
-    let reason = tokio::task::spawn_blocking(move || game.run())
-        .await
-        .map_err(|e| ClientError::Protocol(format!("main thread panicked: {e}")))?;
-    Ok(reason)
+        let (profile, session_id) = login::login(&mut connection, &config, &mut session).await?;
+        info!(name = %profile.name.0, uuid = %profile.id, "logged in");
+        link.emit(BotEvent::LoggedIn {
+            name: profile.name.0.clone(),
+            uuid: profile.id,
+        });
+        session.profile = Some(profile);
+        session.session_id = Some(session_id);
+
+        let (reader, writer) = connection.into_split();
+        let (sender, writer_task) = net::spawn_writer(writer);
+        let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        let reader_task = net::spawn_reader(reader, sender.clone(), inbound_tx);
+
+        let game = game::Game::new(config, sender, inbound_rx, session, controller, link);
+        let outcome = match tokio::task::spawn_blocking(move || game.run()).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                reader_task.abort();
+                writer_task.abort();
+                return Err(ClientError::Protocol(format!("main thread panicked: {e}")));
+            }
+        };
+        // The bot is done with this connection: close both halves now rather
+        // than waiting for the 30-second read timeout. A transfer opens a
+        // fresh connection on the next loop iteration.
+        reader_task.abort();
+        writer_task.abort();
+
+        let game::GameOutcome {
+            reason,
+            config: mut next_config,
+            session: next_session,
+            controller: next_controller,
+            link: next_link,
+        } = outcome;
+        match reason {
+            // handleTransfer: disconnect, keep the cookie jar (the only
+            // per-server state the server can see) and start a fresh login at
+            // the new address. Vanilla's TransferState also carries the
+            // UI-only seenPlayers and seenInsecureChatWarning; those are not
+            // modelled here.
+            ClientError::Transfer { host, port } => {
+                next_config.address = transfer_address(&host, port)?;
+                info!(address = %next_config.address, "transferring");
+                config = next_config;
+                session = SessionData {
+                    cookies: next_session.cookies,
+                    ..SessionData::default()
+                };
+                controller = next_controller;
+                link = next_link;
+            }
+            reason => return Ok(reason),
+        }
+    }
+}
+
+/// `new ServerAddress(packet.host(), packet.port())` rendered in the form
+/// [`address::parse_address`] accepts. The server can send an IPv6 literal
+/// without brackets.
+fn transfer_address(host: &str, port: i32) -> Result<String, ClientError> {
+    let port = u16::try_from(port)
+        .map_err(|_| ClientError::Protocol(format!("transfer to invalid port {port}")))?;
+    if host.is_empty() {
+        return Err(ClientError::Protocol(
+            "transfer to an empty host".to_string(),
+        ));
+    }
+    let host = if host.starts_with('[') || !host.contains(':') {
+        host.to_owned()
+    } else {
+        format!("[{host}]")
+    };
+    Ok(format!("{host}:{port}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transfer_address;
+
+    #[test]
+    fn transfer_addresses() {
+        assert_eq!(
+            transfer_address("play.example.net", 25565).unwrap(),
+            "play.example.net:25565"
+        );
+        assert_eq!(transfer_address("::1", 25565).unwrap(), "[::1]:25565");
+        assert_eq!(transfer_address("[::1]", 25565).unwrap(), "[::1]:25565");
+        assert!(transfer_address("", 25565).is_err());
+        assert!(transfer_address("host", -1).is_err());
+        assert!(transfer_address("host", 65536).is_err());
+    }
 }

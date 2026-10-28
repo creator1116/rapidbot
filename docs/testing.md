@@ -66,7 +66,7 @@ cargo run --release -p rapidbot-client --example fly -- localhost:25565 Walker  
 | Example | What it does |
 |---|---|
 | `ping` | Server list ping |
-| `join` | Joins and idles (offline name, or `--microsoft accounts/main.json`) |
+| `join` | Joins and idles (offline name, or `--microsoft <alias>` from `rapidbot-auth`) |
 | `walk` | Demonstrates route finding and timed input |
 | `chat` | Types the given lines into chat |
 | `course` | Walks along +x through water and ladders; glides when wearing an elytra |

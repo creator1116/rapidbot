@@ -1,7 +1,7 @@
 //! Joins a server and idles like a player who walked away from the keyboard.
 //!
 //!     cargo run --release -p rapidbot-client --example join -- localhost:25565 Steve
-//!     cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft accounts/main.json
+//!     cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 
 use rapidbot_client::{Account, ClientConfig};
 
@@ -17,11 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = args.first().cloned().unwrap_or_else(|| "localhost".into());
     let account = match args.get(1).map(String::as_str) {
         Some("--microsoft") => {
-            let cache = args
-                .get(2)
-                .cloned()
-                .unwrap_or_else(|| "accounts/main.json".into());
-            let mut auth = rapidbot_auth::Authenticator::new(&cache)?;
+            let alias = args.get(2).cloned().unwrap_or_else(|| "main".into());
+            let dir = std::env::var_os("RAPIDBOT_ACCOUNTS")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "accounts".into());
+            let store = rapidbot_auth::AccountStore::open(dir)?;
+            let mut auth = store.authenticator(&alias)?;
+            if let Ok(client_id) = std::env::var("RAPIDBOT_CLIENT_ID") {
+                auth = auth.with_client_id(client_id);
+            }
             let account = auth
                 .login(|code| {
                     println!(
@@ -30,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 })
                 .await?;
+            store.remember(&alias, &account)?;
             Account::Microsoft(account)
         }
         Some(name) => Account::Offline { name: name.into() },

@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rapidbot: always on tick</title>
+<meta name="description" content="A headless Minecraft Java Edition client framework in Rust: vanilla-exact protocol and physics with a human input layer.">
+<meta property="og:title" content="rapidbot: always on tick">
+<meta property="og:description" content="Vanilla-exact protocol, tick-exact physics, a human input layer. Written in Rust.">
+<meta name="theme-color" content="#06281a">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@800;900&family=Archivo:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--lime:#d4ff00;--green:#06281a;--deep:#03170f;--off:#f1f5e2;--ink:#06281a;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--off:#e3e8cf}}
+:root[data-theme="dark"]{--off:#e3e8cf}
+*,*::before,*::after{box-sizing:inherit}
+html{background:var(--green);scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;color:var(--off);font:400 1.05rem/1.5 "Archivo",system-ui,sans-serif;overflow-x:hidden}
+h1,h2,h3,.disp{font-family:"Big Shoulders Display",Impact,"Arial Narrow",sans-serif;font-weight:900;text-transform:uppercase;margin:0;line-height:.82;letter-spacing:-.01em}
+a{color:inherit}
+:focus-visible{outline:3px solid var(--lime);outline-offset:3px}
+code{font-family:ui-monospace,Menlo,monospace}
+#gl{position:fixed;inset:0;width:100%;height:100%;z-index:1;pointer-events:none}
+.up{position:relative;z-index:2}
+
+/* loader */
+.load{position:fixed;inset:0;z-index:50;background:var(--lime);color:var(--green);display:flex;flex-direction:column;justify-content:space-between;padding:24px;transition:transform .9s cubic-bezier(.8,0,.1,1)}
+.load.gone{transform:translateY(-101%)}
+.load .disp{font-size:clamp(5rem,26vw,22rem)}
+.load p{margin:0;font-weight:600}
+
+/* hero */
+.hero{min-height:100svh;position:relative;display:flex;flex-direction:column;justify-content:space-between;padding:22px 24px 26px;touch-action:pan-y}
+.locked .hero{touch-action:none;cursor:grab}
+.nav{display:flex;justify-content:space-between;gap:16px;align-items:center;font-weight:600;font-size:.95rem}
+.nav .logo{font:900 1.7rem "Big Shoulders Display",Impact,sans-serif;color:var(--lime);text-transform:uppercase;text-decoration:none}
+.nav nav{display:flex;gap:22px}
+.nav a{text-decoration:none}.nav nav a:hover{color:var(--lime)}
+.word{position:absolute;left:0;right:0;top:50%;transform:translateY(-52%);text-align:center;font-size:clamp(5rem,27vw,40rem);color:var(--lime);z-index:0;pointer-events:none;white-space:nowrap}
+.sub{position:relative;z-index:2;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
+.sub h1{font-size:clamp(1.6rem,3.4vw,2.8rem);max-width:12ch;line-height:.95}
+.lockbtn,.pill{position:relative;z-index:3;background:var(--lime);color:var(--green);border:0;font:800 1rem "Archivo",sans-serif;padding:14px 28px;border-radius:99px;cursor:pointer;text-decoration:none;display:inline-block;transition:transform .15s}
+.lockbtn:hover,.pill:hover{transform:scale(1.06)}
+.meta{text-align:right;font-weight:600;font-size:.95rem}
+.meta b{display:block;font:900 2.4rem "Big Shoulders Display",Impact,sans-serif;color:var(--lime);line-height:1}
+
+/* message */
+.msg{background:var(--off);color:var(--ink);padding:110px 24px 0;overflow:hidden}
+.msg h2{font-size:clamp(2.6rem,8.5vw,8rem);max-width:15ch;line-height:.88}
+.msg h2 b{background:var(--lime);padding:0 .1em}
+.strip{display:flex;gap:18px;width:max-content;margin:70px 0 0;padding-bottom:80px;animation:slide 34s linear infinite}
+.tile{width:min(70vw,340px);aspect-ratio:3/4;border-radius:22px;padding:22px;display:flex;flex-direction:column;justify-content:space-between;background:var(--green);color:var(--lime)}
+.tile:nth-child(3n+2){background:var(--lime);color:var(--green)}.tile:nth-child(3n){background:#fff;color:var(--green)}
+.tile .disp{font-size:clamp(4.5rem,13vw,8rem)}.tile p{margin:0;font-weight:600}
+@keyframes slide{to{transform:translateX(calc(-50% - 9px))}}
+
+/* on/off */
+.duo{display:grid;grid-template-columns:1fr 1fr;background:var(--green)}
+.half{padding:90px 24px 100px;border-right:1px solid #ffffff22;text-decoration:none;transition:background .25s,color .25s}
+.half:last-child{border:0}
+.half:hover{background:var(--lime);color:var(--green)}
+.half h2{font-size:clamp(5rem,17vw,16rem);color:var(--lime);transition:color .25s}.half:hover h2{color:var(--green)}
+.half p{max-width:28ch;margin:26px 0 0;font-size:1.15rem}
+
+
+/* crates band */
+.band{background:var(--lime);color:var(--green);overflow:hidden;white-space:nowrap;padding:18px 0}
+.band div{display:inline-block;font:900 clamp(2rem,5vw,3.8rem) "Big Shoulders Display",Impact,sans-serif;text-transform:uppercase;animation:run 40s linear infinite}
+@keyframes run{to{transform:translateX(-50%)}}
+
+/* footer */
+.foot{background:var(--deep);padding:100px 24px 40px}
+.foot h2{font-size:clamp(4.2rem,17vw,17rem);color:var(--lime)}
+.foot pre{margin:44px 0 0;padding:18px 20px;background:#ffffff10;border-radius:14px;overflow-x:auto;color:var(--off);font-size:.88rem}
+.links{display:flex;gap:14px;flex-wrap:wrap;margin-top:30px}
+.pill.o{background:none;color:var(--off);box-shadow:inset 0 0 0 2px var(--off)}
+.foot small{display:block;margin-top:50px;opacity:.7;max-width:60ch}
+
+html{scroll-behavior:smooth;scrollbar-color:var(--lime) var(--deep)}
+::selection{background:var(--lime);color:var(--green)}
+h1,h2,h3{text-wrap:balance}
+body::after{content:"";position:fixed;inset:0;z-index:40;pointer-events:none;opacity:.07;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+.skip{position:fixed;left:-999px;top:10px;z-index:60;background:var(--lime);color:var(--green);padding:10px 18px;border-radius:99px;font-weight:600}.skip:focus{left:14px}
+.load .bar{height:6px;margin-top:18px;background:#06281a26;border-radius:9px;overflow:hidden}.load .bar i{display:block;height:100%;width:0;background:var(--green)}
+.nav,.sub{transition:opacity .9s ease,transform .9s cubic-bezier(.2,.8,.2,1)}
+body:not(.ready) .nav,body:not(.ready) .sub{opacity:0;transform:translateY(18px)}
+.nav nav a{position:relative;padding:4px 0}
+.nav nav a::after{content:"";position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--lime);transform:scaleX(0);transform-origin:left;transition:transform .25s}
+.nav nav a:hover::after,.nav nav a:focus-visible::after{transform:scaleX(1)}
+.meta b{font-variant-numeric:tabular-nums;min-width:6ch}
+.strip:hover{animation-play-state:paused}
+.half::after{content:"Read the docs";display:inline-block;margin-top:30px;font-weight:600;border-bottom:2px solid currentColor}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:32px;margin-top:70px;padding-top:36px;border-top:1px solid #ffffff26}
+.cols h3{font-size:1.5rem;color:var(--lime);margin-bottom:16px}
+.cols a,.cols p{display:block;margin:0 0 9px;opacity:.85;text-decoration:none;font-size:.95rem}.cols a:hover{opacity:1;color:var(--lime)}
+.top{display:inline-block;margin-top:26px;font-weight:600}
+/* informational sections */
+.info{padding:100px 0;border-top:6px solid var(--ink)}
+.info.D{background:var(--green);--fg:#eef3e0;--mu:#b9ccb9;--hd:var(--lime);--ac:var(--lime);--sf:#0b3524;--ln:#ffffff33;--cd:#ffffff17;color:var(--fg)}
+.info.L{background:var(--off);--fg:#06281a;--mu:#3b5846;--hd:#06281a;--ac:#0b6b34;--sf:#fff;--ln:#06281a;--cd:#06281a12;color:var(--fg)}
+.info .wrap{max-width:1160px;margin:0 auto;padding:0 24px}
+.info h2{font-size:clamp(3.2rem,9vw,7.5rem);color:var(--hd);line-height:.86}
+.info h3{font-size:1.7rem;color:var(--hd);margin-bottom:10px}
+.info .lead{max-width:60ch;color:var(--mu);font-size:1.15rem;margin:22px 0 44px}
+.info code{font-size:.88em;background:var(--cd);padding:1px 6px;border-radius:4px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.card{background:var(--sf);border:3px solid var(--ln);border-radius:20px;padding:26px;transition:transform .15s,box-shadow .15s,border-color .15s}
+.info.L .card{box-shadow:6px 6px 0 var(--ink)}
+.card:hover{transform:translate(-3px,-3px)}
+.info.L .card:hover{box-shadow:10px 10px 0 var(--ink)}
+.info.D .card:hover{border-color:var(--lime)}
+.card p{color:var(--mu);font-size:.96rem}
+.card ul{margin:0;padding-left:18px;font-size:.94rem}.card li{margin:4px 0}
+.tw{overflow-x:auto;border:3px solid var(--ln);border-radius:20px;background:var(--sf)}
+table{width:100%;border-collapse:collapse;font-size:.94rem;min-width:620px}
+th,td{text-align:left;padding:14px 20px;border-bottom:1px solid var(--ln);vertical-align:top}
+th{font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;color:var(--mu);font-weight:700}
+tr:last-child td{border-bottom:0}
+td:first-child{white-space:nowrap;font-family:ui-monospace,Menlo,monospace;color:var(--ac);font-size:.88rem;font-weight:700}
+.grp td{background:var(--cd);font:700 .8rem ui-monospace,Menlo,monospace;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;white-space:normal}
+tbody tr:not(.grp):hover td{background:var(--cd)}
+.info pre{margin:0;background:#021109;color:#eef3e0;border:3px solid var(--ln);border-radius:20px;padding:22px 24px;overflow-x:auto;font:.86rem/1.65 ui-monospace,Menlo,monospace}
+.info.D pre{box-shadow:8px 8px 0 var(--lime)}
+.info.L pre{box-shadow:8px 8px 0 var(--ink)}
+.k{color:#ff7ac0}.s{color:#ffe566}.c{color:#7fa58f}.f{color:#7fe3ff}
+.two{display:grid;grid-template-columns:1fr 1.2fr;gap:40px;align-items:start}
+.steps{margin:0;padding-left:20px}.steps li{margin:0 0 12px;color:var(--mu)}.steps li b{color:var(--fg)}
+details{border-bottom:2px solid var(--ln);padding:18px 4px}
+summary{cursor:pointer;font-weight:700;font-size:1.12rem;list-style:none;display:flex;justify-content:space-between;gap:16px}
+summary::after{content:"+";color:var(--ac);font-size:1.5rem;line-height:1}details[open] summary::after{content:"\2212"}
+summary::-webkit-details-marker{display:none}
+details p{margin:12px 0 0;color:var(--mu);max-width:70ch}
+@media (max-width:820px){.grid,.two{grid-template-columns:1fr}}
+/* feature 1: hero reveal (letters rise out of a mask line) */
+.word{line-height:1}
+.lw{display:inline-block;overflow:hidden;vertical-align:top;padding:.03em 0}
+.lw .l{display:inline-block;transform:translateY(115%)}
+.ready .lw .l{transform:none;transition:transform 1.15s cubic-bezier(.16,1,.3,1) calc(var(--i)*65ms + 150ms)}
+/* feature 2: cursor blob reveal layer */
+@media (max-width:820px){.nav nav{display:none}.duo{grid-template-columns:1fr}.half{border-right:0;border-bottom:1px solid #ffffff22}.meta{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<a class="skip" href="#message">Skip to content</a>
+<canvas id="gl" aria-hidden="true"></canvas>
+
+<div class="load" id="load"><p>Loading client…</p><div><div class="disp" id="pct">0</div><div class="bar"><i id="bar"></i></div></div></div>
+
+<header class="hero" id="hero">
+  <div class="nav up">
+    <a class="logo" href="#">rapidbot</a>
+    <nav><a href="#features">Features</a><a href="#quickstart">Quick start</a><a href="#api">API</a><a href="#crates">Crates</a><a href="#faq">FAQ</a><a href="https://github.com/creator1116/rapidbot">GitHub</a></nav>
+    <a class="pill" href="https://github.com/creator1116/rapidbot">Get the code</a>
+  </div>
+  <div class="word disp" aria-hidden="true"><span class="lw"><span class="l" style="--i:0">R</span></span><span class="lw"><span class="l" style="--i:1">A</span></span><span class="lw"><span class="l" style="--i:2">P</span></span><span class="lw"><span class="l" style="--i:3">I</span></span><span class="lw"><span class="l" style="--i:4">D</span></span><span class="lw"><span class="l" style="--i:5">B</span></span><span class="lw"><span class="l" style="--i:6">O</span></span><span class="lw"><span class="l" style="--i:7">T</span></span></div>
+  <div class="sub">
+    <h1>Headless Minecraft client framework</h1>
+    <button class="lockbtn" id="lock" type="button">Tap to lock</button>
+    <div class="meta">Next tick<b id="tk">0</b>protocol 777 · mc 26.3</div>
+  </div>
+</header>
+
+<section class="msg up" id="message">
+  <h2>Vanilla-exact protocol. Tick-exact physics. A <b>human</b> input layer.</h2>
+  <div style="overflow:hidden">
+  <div class="strip" aria-hidden="true">
+    <div class="tile"><span class="disp">Byte exact</span><p>Same bytes on the wire as the vanilla client.</p></div>
+    <div class="tile"><span class="disp">50 ms</span><p>One client tick, twenty a second.</p></div>
+    <div class="tile"><span class="disp">11 crates</span><p>Depend on one: rapidbot.</p></div>
+    <div class="tile"><span class="disp">MIT</span><p>Open source and free to use.</p></div>
+    <div class="tile"><span class="disp">Byte exact</span><p>Same bytes on the wire as the vanilla client.</p></div>
+    <div class="tile"><span class="disp">50 ms</span><p>One client tick, twenty a second.</p></div>
+    <div class="tile"><span class="disp">11 crates</span><p>Depend on one: rapidbot.</p></div>
+    <div class="tile"><span class="disp">MIT</span><p>Open source and free to use.</p></div>
+  </div></div>
+</section>
+
+<section class="duo up">
+  <a class="half" href="https://github.com/creator1116/rapidbot/blob/main/docs/architecture.md"><h2>On<br>wire</h2><p>Framing, compression, encryption, packets and Microsoft login, written from scratch.</p></a>
+  <a class="half" href="https://github.com/creator1116/rapidbot/blob/main/docs/porting.md"><h2>On<br>tick</h2><p>Movement, collision and timing ported from vanilla, then verified against test vectors.</p></a>
+</section>
+
+<section class="info up L" id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="lead">rapidbot reimplements the Java client from the network up. Mojang’s code is used only as a reference, and everything here is written from scratch.</p>
+    <div class="grid">
+      <div class="card"><h3>Wire protocol</h3><p>A full connection stack, byte-exact with the vanilla client.</p><ul><li>VarInt, strings and UUID wire types</li><li>Framing, compression and encryption</li><li>Packet IDs and packets</li><li>Network NBT with Java’s modified UTF-8</li></ul></div>
+      <div class="card"><h3>Vanilla physics</h3><p>Player movement ported from the vanilla client, not approximated.</p><ul><li>Input, travel and ground state</li><li>Vanilla-exact block collision</li><li>Step-up handling</li><li>Block data extracted from the game jar</li></ul></div>
+      <div class="card"><h3>Human input layer</h3><p>Actions go through modeled input instead of teleporting state.</p><ul><li>Mouse strokes and response delays</li><li>Fatigue modeling</li><li>Keystroke timing for chat</li><li>A recorder that fits a mouse profile to your own play</li></ul></div>
+      <div class="card"><h3>Authentication</h3><p>Sign in with a real account or join offline-mode servers.</p><ul><li>Microsoft device-code login</li><li>Xbox and XSTS, Minecraft token and profile</li><li>Chat keys and session join</li><li>Offline accounts by name</li></ul></div>
+      <div class="card"><h3>Client runtime</h3><p>A vanilla-style main thread runs the connection.</p><ul><li>Address resolution and login</li><li>Frames, ticks and a packet queue</li><li>Configuration and play phases</li><li>Player and entity state</li></ul></div>
+      <div class="card"><h3>Gameplay helpers</h3><p>Higher-level tools on top of the same input model.</p><ul><li>Route finding around walls, steps, drops and lava</li><li>Digging at vanilla speed for the held tool</li><li>Entity targeting and a combat helper</li><li>Inventory, hotbar and container handling</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section class="info up L" id="quickstart">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p class="lead">Depend on the <code>rapidbot</code> crate by path or git, implement <code>Controller</code>, and spawn a bot.</p>
+    <div class="two">
+      <div>
+        <ol class="steps">
+          <li><b>Depend on rapidbot.</b> It re-exports the public API and a prelude.</li>
+          <li><b>Implement Controller.</b> <code>tick</code> runs once per client tick. Say where to look and what to hold.</li>
+          <li><b>Spawn the bot.</b> Give <code>Bot::spawn</code> a <code>ClientConfig</code> with a server address and an <code>Account</code>.</li>
+          <li><b>Handle events.</b> Await <code>bot.next_event()</code> for <code>Loaded</code>, <code>Chat</code> and others.</li>
+          <li><b>Run with <code>--release</code>.</b> Tick timing is part of what servers see, and debug builds are too slow to keep it regular.</li>
+        </ol>
+        <p>A complete example lives at <code>crates/rapidbot/examples/embed.rs</code>. Several bots can run in one process, and each has its own main thread.</p>
+      </div>
+<pre><span class="k">use</span> rapidbot::prelude::*;
+
+<span class="k">struct</span> MyLogic { walker: Walker }
+
+<span class="k">impl</span> Controller <span class="k">for</span> MyLogic {
+    <span class="k">fn</span> <span class="f">tick</span>(&amp;<span class="k">mut</span> self, ctx: &amp;<span class="k">mut</span> TickContext&lt;'_&gt;) {
+        <span class="c">// Called once per client tick.</span>
+        <span class="k">if</span> self.walker.<span class="f">arrived</span>() {
+            self.walker.<span class="f">go_to</span>(Vec3::new(<span class="s">100.0</span>, <span class="s">64.0</span>, <span class="s">-20.0</span>));
+        }
+        self.walker.<span class="f">tick</span>(ctx);
+    }
+}
+
+<span class="k">let</span> config = ClientConfig::new(
+    <span class="s">"play.example.net"</span>,
+    Account::Offline { name: <span class="s">"Steve"</span>.into() },
+);
+<span class="k">let mut</span> bot = Bot::<span class="f">spawn</span>(config, MyLogic { walker: Walker::new(<span class="s">1</span>) });
+<span class="k">while let</span> Some(event) = bot.<span class="f">next_event</span>().<span class="k">await</span> {
+    <span class="k">match</span> event {
+        BotEvent::Loaded =&gt; bot.<span class="f">chat</span>(<span class="s">"/home"</span>),
+        BotEvent::Chat { name, text, .. } =&gt; println!(<span class="s">"&lt;{name:?}&gt; {text}"</span>),
+        _ =&gt; {}
+    }
+}</pre>
+    </div>
+  </div>
+</section>
+
+<section class="info up D" id="api">
+  <div class="wrap">
+    <h2>Controller API</h2>
+    <p class="lead">What a controller can read and do from inside <code>tick</code>. Each action goes through the input models and vanilla physics.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Item</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr class="grp"><td colspan="2">Movement</td></tr>
+        <tr><td>Walker</td><td>Plans a route around walls, up steps, down drops and clear of lava, then follows it using modeled input. Use <code>go_to</code>, <code>arrived</code> and <code>tick</code>.</td></tr>
+        <tr class="grp"><td colspan="2">Chat and inventory</td></tr>
+        <tr><td>ctx.chat(..)</td><td>Types a line into chat from inside a controller.</td></tr>
+        <tr><td>ctx.inventory</td><td>What the player carries and wears. A jump in mid-air opens a worn elytra.</td></tr>
+        <tr><td>ctx.select_slot(n)</td><td>Presses a hotbar key.</td></tr>
+        <tr><td>ctx.close_container()</td><td>Closes a screen the server opened.</td></tr>
+        <tr class="grp"><td colspan="2">Interaction</td></tr>
+        <tr><td>ctx.crosshair</td><td>What the player is looking at.</td></tr>
+        <tr><td>ctx.hold_attack(true)</td><td>Holds the left mouse button. This digs the looked-at block at exactly the vanilla speed for the held tool.</td></tr>
+        <tr><td>interact::aim_point</td><td>Finds where to look to hit a given block.</td></tr>
+        <tr class="grp"><td colspan="2">Entities and combat</td></tr>
+        <tr><td>ctx.entities</td><td>Every entity, where the client shows it.</td></tr>
+        <tr><td>ctx.target</td><td>The entity under the crosshair.</td></tr>
+        <tr><td>ctx.click_attack()</td><td>Clicks on the targeted entity.</td></tr>
+        <tr><td>combat::Fighter</td><td>Aim, approach and attack-timing behaviour. See the <code>fight</code> example.</td></tr>
+        <tr class="grp"><td colspan="2">Connection</td></tr>
+        <tr><td>ResourcePackPolicy</td><td>Server resource packs are declined by default. Set <code>config.resource_packs = ResourcePackPolicy::Accept</code> to answer “Yes”. The pack is then downloaded with the same HTTP request the Java client sends, because servers can check their pack host’s log.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section class="info up L" id="crates">
+  <div class="wrap">
+    <h2>Crates</h2>
+    <p class="lead">The workspace has 11 crates. Most projects only depend on <code>rapidbot</code>, which re-exports the public API.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr class="grp"><td colspan="2">Entry point</td></tr>
+        <tr><td>rapidbot</td><td>The crate to depend on. Re-exports the public API and a prelude.</td></tr>
+        <tr class="grp"><td colspan="2">Wire and protocol</td></tr>
+        <tr><td>rapidbot-buf</td><td>Wire types (VarInt, strings, UUIDs) and the <code>Encode</code> / <code>Decode</code> traits.</td></tr>
+        <tr><td>rapidbot-buf-derive</td><td><code>#[derive(Encode, Decode)]</code>.</td></tr>
+        <tr><td>rapidbot-nbt</td><td>Network NBT with Java’s modified UTF-8.</td></tr>
+        <tr><td>rapidbot-protocol</td><td>Framing, compression, encryption, packet IDs, packets and the async connection.</td></tr>
+        <tr class="grp"><td colspan="2">World and physics</td></tr>
+        <tr><td>rapidbot-world</td><td>Block data extracted from the jar, chunk storage and vanilla-exact block collision.</td></tr>
+        <tr><td>rapidbot-physics</td><td>Player movement ported from vanilla: input, travel, collision, step-up and ground state.</td></tr>
+        <tr class="grp"><td colspan="2">Input and identity</td></tr>
+        <tr><td>rapidbot-human</td><td>Input models: mouse strokes, response delays and fatigue.</td></tr>
+        <tr><td>rapidbot-recorder</td><td>Records your own mouse and game-key input while you play, and fits a mouse profile to it.</td></tr>
+        <tr><td>rapidbot-auth</td><td>Microsoft login (device code), Xbox/XSTS, Minecraft token and profile, chat keys and session join.</td></tr>
+        <tr class="grp"><td colspan="2">Runtime</td></tr>
+        <tr><td>rapidbot-client</td><td>Address resolution and login, then a vanilla-style main thread (frames, ticks, packet queue) running configuration and play. Provides the <code>Controller</code> trait, route finding, modeled input and player and entity state.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section class="info up D" id="examples">
+  <div class="wrap">
+    <h2>Run the examples</h2>
+    <p class="lead">The repository ships runnable examples. Use <code>--release</code> for anything that joins a server.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Example</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td>ping</td><td>Pings a server with <code>rapidbot-protocol</code>.<br><code>cargo run -p rapidbot-protocol --example ping -- localhost 25565</code></td></tr>
+        <tr><td>join</td><td>Joins an offline-mode server and idles. Add <code>--microsoft accounts/main.json</code> to join with a Microsoft account.<br><code>cargo run --release -p rapidbot-client --example join -- localhost:25565 Steve</code></td></tr>
+        <tr><td>login</td><td>Microsoft sign-in with a cached result. The <code>accounts/</code> folder is gitignored.<br><code>cargo run -p rapidbot-auth --example login -- accounts/main.json</code></td></tr>
+        <tr><td>walk</td><td>Uses route finding to walk.<br><code>cargo run --release -p rapidbot-client --example walk -- localhost:25565 Walker</code></td></tr>
+        <tr><td>chat</td><td>Types the lines you give it into chat.<br><code>… --example chat -- localhost:25565 Walker "hello" "/msg Walker hi"</code></td></tr>
+        <tr><td>course</td><td>Walks +x through water and ladders, and glides when wearing an elytra.<br><code>… --example course -- localhost:25565 Walker 130</code></td></tr>
+        <tr><td>dig</td><td>Digs the listed blocks.<br><code>… --example dig -- localhost:25565 Walker 62 150 60</code></td></tr>
+        <tr><td>fight</td><td>Fights the nearest entity of a type.<br><code>… --example fight -- localhost:25565 Walker minecraft:husk</code></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section class="info up L" id="verification">
+  <div class="wrap">
+    <h2>How it stays exact</h2>
+    <p class="lead">Behaviour is ported from the vanilla client and checked against data generated from it.</p>
+    <div class="grid">
+      <div class="card"><h3>Ported, not guessed</h3><p>A tool fetches the vanilla jars, data reports and decompiled source into a gitignored <code>vanilla/</code> folder. That code is a reference only: rapidbot writes its own implementation and never commits anything from <code>vanilla/</code>.</p></div>
+      <div class="card"><h3>Generated data</h3><ul><li><code>gen_packet_ids.py</code> regenerates the packet ID table</li><li><code>extract_blocks.py</code> regenerates block data, attributes and Mth tables (needs <code>javac</code>)</li><li><code>extract_items.py</code> regenerates item components and decoder test vectors</li><li><code>gen_clip_vectors.py</code> regenerates ray cast test vectors</li></ul></div>
+      <div class="card"><h3>Tests</h3><p>Unit tests, generated vectors and live tests. Run the workspace suite with:</p><p><code>cargo test --workspace</code></p><p>The testing and porting docs explain how each kind works.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="band up" id="band" aria-label="Crates"><div id="mq"></div></div>
+
+<section class="info up D" id="faq">
+  <div class="wrap">
+    <h2>Questions</h2>
+    <div style="max-width:820px;margin-top:30px">
+      <details><summary>Which Minecraft version does it support?</summary><p>It targets Minecraft 26.3, protocol 777.</p></details>
+      <details><summary>Does it open a game window?</summary><p>No. It is a headless client. It runs a vanilla-style main thread with frames, ticks and a packet queue, but nothing is rendered.</p></details>
+      <details><summary>How do accounts work?</summary><p>Use <code>Account::Offline</code> with a name for offline-mode servers. For online servers, <code>rapidbot-auth</code> signs in with Microsoft using the device-code flow and handles the Xbox and Minecraft tokens, chat keys and session join. The login example caches the result in a file.</p></details>
+      <details><summary>Can I run more than one bot?</summary><p>Yes. Several bots can run in one process, and each has its own main thread.</p></details>
+      <details><summary>Why build with --release?</summary><p>Tick timing is part of what servers see. Debug builds are too slow to keep it regular.</p></details>
+      <details><summary>What happens with server resource packs?</summary><p>They are declined by default. If you set the policy to accept, the pack is really downloaded with the same HTTP request the Java client sends.</p></details>
+      <details><summary>Where can I run bots?</summary><p>Only on servers where you are allowed to. Read the Code of Conduct in the repository before you start.</p></details>
+    </div>
+  </div>
+</section>
+
+
+
+
+<footer class="foot up">
+  <h2>Always<br>on tick.</h2>
+  <pre><code>cargo run --release -p rapidbot-client --example join -- localhost:25565 Steve</code></pre>
+  <div class="links">
+    <a class="pill" href="https://github.com/creator1116/rapidbot">View on GitHub</a>
+    <a class="pill o" href="https://github.com/creator1116/rapidbot/blob/main/docs/guide.md">Developer guide</a>
+    <a class="pill o" href="https://github.com/creator1116/rapidbot/blob/main/CONTRIBUTING.md">Contribute</a>
+  </div>
+  <div class="cols">
+    <div><h3>Docs</h3><a href="https://github.com/creator1116/rapidbot/blob/main/docs/guide.md">Developer guide</a><a href="https://github.com/creator1116/rapidbot/blob/main/docs/architecture.md">Architecture</a><a href="https://github.com/creator1116/rapidbot/blob/main/docs/porting.md">Porting from vanilla</a><a href="https://github.com/creator1116/rapidbot/blob/main/docs/testing.md">Testing</a></div>
+    <div><h3>Project</h3><a href="https://github.com/creator1116/rapidbot">GitHub</a><a href="https://github.com/creator1116/rapidbot/issues">Issues</a><a href="https://github.com/creator1116/rapidbot/blob/main/CONTRIBUTING.md">Contributing</a><a href="https://github.com/creator1116/rapidbot/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></div>
+    <div><h3>Licence</h3><a href="https://github.com/creator1116/rapidbot/blob/main/LICENSE">MIT</a><p>Run bots only on servers where you’re allowed to. Use <code>--release</code>: tick timing is part of what servers see.</p></div>
+  </div>
+  <a class="top" href="#">Back to top</a>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+var RM=matchMedia('(prefers-reduced-motion:reduce)').matches;
+// loader
+var pct=document.getElementById('pct'),ld=document.getElementById('load'),n=0;
+function ready(){document.body.classList.add('ready')}
+var li=setInterval(function(){n+=3+Math.random()*7;if(n>=100){n=100;clearInterval(li);setTimeout(function(){ld.classList.add('gone');setTimeout(ready,350)},250)}pct.textContent=Math.floor(n);document.getElementById('bar').style.width=n+'%'},60);
+setTimeout(ready,4000);
+// ticks
+var tk=document.getElementById('tk'),c=0;setInterval(function(){tk.textContent=++c},50);
+// band
+var cr=['rapidbot-buf','rapidbot-nbt','rapidbot-protocol','rapidbot-world','rapidbot-physics','rapidbot-human','rapidbot-auth','rapidbot-recorder','rapidbot-client'],b='';
+cr.forEach(function(x){b+=x+' &nbsp;/&nbsp; '});document.getElementById('mq').innerHTML=b+b;
+
+var T=THREE,cv=document.getElementById('gl');
+if(!T){return}
+var R=new T.WebGLRenderer({canvas:cv,alpha:true});
+R.setPixelRatio(Math.min(devicePixelRatio||1,2));R.outputEncoding=T.sRGBEncoding;
+var sc=new T.Scene(),cam=new T.PerspectiveCamera(30,1,.1,60);cam.position.set(0,.2,11);
+sc.add(new T.AmbientLight(0xffffff,.8));
+var dl=new T.DirectionalLight(0xffffff,.8);dl.position.set(3,5,6);sc.add(dl);
+var rim=new T.PointLight(0xd4ff00,2,25);rim.position.set(-4,2,-3);sc.add(rim);
+
+// skin atlas: standard 64x64 Minecraft skin layout
+var atlas=document.createElement('canvas');atlas.width=atlas.height=64;
+var X=atlas.getContext('2d');
+var skinTex=new T.CanvasTexture(atlas);skinTex.magFilter=skinTex.minFilter=T.NearestFilter;skinTex.generateMipmaps=false;skinTex.encoding=T.sRGBEncoding;
+var baseMat=new T.MeshLambertMaterial({map:skinTex}),overMat=new T.MeshLambertMaterial({map:skinTex,alphaTest:.5});
+
+// write one box's UVs from its skin origin (ox,oy) and size (w,h,d)
+// three.js face order: +x (player's left), -x (right), top, bottom, front, back
+function uvBox(mesh,ox,oy,w,h,d){
+ var Q=[[ox+d+w,oy+d,d,h],[ox,oy+d,d,h],[ox+d,oy,w,d],[ox+d+w,oy,w,d],[ox+d,oy+d,w,h],[ox+2*d+w,oy+d,w,h]],uv=mesh.geometry.attributes.uv;
+ Q.forEach(function(r,f){var u0=r[0]/64,u1=(r[0]+r[2])/64,v0=1-r[1]/64,v1=1-(r[1]+r[3])/64,i=f*4;
+  uv.setXY(i,u0,v0);uv.setXY(i+1,u1,v0);uv.setXY(i+2,u0,v1);uv.setXY(i+3,u1,v1)});
+ uv.needsUpdate=true}
+function mk(w,h,d,ox,oy,inf,over,hang){
+ var m=new T.Mesh(new T.BoxGeometry(w+inf*2,h+inf*2,d+inf*2),over?overMat:baseMat);uvBox(m,ox,oy,w,h,d);if(hang)m.position.y=-h/2;return m}
+// base layer + second (hat, jacket, sleeves, pants) layer, as in the real format
+function part(w,h,d,ox,oy,ox2,oy2,inf,x,y,hang){
+ var g=new T.Group();g.position.set(x,y,0);g.add(mk(w,h,d,ox,oy,0,0,hang),mk(w,h,d,ox2,oy2,inf,1,hang));return g}
+
+var pivot=new T.Group(),rig=new T.Group();pivot.add(rig);sc.add(pivot);
+var head=part(8,8,8,0,0,32,0,.5,0,28,0),body=part(8,12,4,16,16,16,32,.25,0,18,0);
+var aL=part(4,12,4,40,16,40,32,.25,-6,24,1),aR=part(4,12,4,32,48,48,48,.25,6,24,1);
+var lL=part(4,12,4,0,16,0,32,.25,-2,12,1),lR=part(4,12,4,16,48,0,48,.25,2,12,1);
+[head,body,aL,aR,lL,lR].forEach(function(p){rig.add(p)});
+rig.scale.setScalar(.1);rig.position.y=-1.6;
+
+// skins drawn onto the atlas
+function fill(c,a,b,w,h){X.fillStyle=c;X.fillRect(a,b,w,h)}
+function blk(ox,oy,w,h,d,t,s,b){fill(s,ox,oy+d,2*d+2*w,h);fill(t,ox+d,oy,w,d);fill(b,ox+d+w,oy,w,d)}
+function grain(){var d=X.getImageData(0,0,64,64),p=d.data,s=7;for(var i=0;i<p.length;i+=4){if(p[i+3]){s=(s*16807)%2147483647;var v=(s%15)-7;p[i]+=v;p[i+1]+=v;p[i+2]+=v}}X.putImageData(d,0,0)}
+var P={
+ steve:{s:'#c28b66',h:'#3b2716',t:'#17a6b4',p:'#3a3da4',o:'#6b6b6b',f:'s'},
+ creeper:{s:'#4cb43a',h:'#4cb43a',t:'#3f9f31',p:'#4cb43a',o:'#2f7a26',f:'c'},
+ gold:{s:'#ffe066',h:'#d9a400',t:'#ffcf24',p:'#e0a800',o:'#a67c00',f:'s'}
+};
+function drawSkin(k){
+ X.clearRect(0,0,64,64);
+ blk(0,0,8,8,8,k.h,k.s,k.s);                                   // head
+ fill(k.h,0,8,8,2);fill(k.h,0,10,3,4);fill(k.h,16,8,8,2);fill(k.h,21,10,3,4);fill(k.h,24,8,8,8);fill(k.h,8,8,8,2);fill(k.h,8,10,1,1);fill(k.h,15,10,1,1);
+ if(k.f=='c'){var d='#0d3b0a';fill(d,9,10,2,2);fill(d,13,10,2,2);fill(d,11,12,2,2);fill(d,10,13,1,3);fill(d,13,13,1,3)}
+ else{fill('#fff',9,12,1,1);fill('#4a3d8f',10,12,1,1);fill('#4a3d8f',13,12,1,1);fill('#fff',14,12,1,1);fill('#a8704c',11,13,2,1);fill('#7d4e35',10,14,4,1);fill('#5e3523',11,15,2,1)}
+ blk(16,16,8,12,4,k.t,k.t,k.p);fill(k.s,23,20,2,1);             // body
+ blk(40,16,4,12,4,k.t,k.s,k.s);fill(k.t,40,20,16,4);            // right arm + sleeve
+ blk(32,48,4,12,4,k.t,k.s,k.s);fill(k.t,32,52,16,4);            // left arm + sleeve
+ blk(0,16,4,12,4,k.p,k.p,k.o);fill(k.o,0,28,16,4);              // right leg + shoe
+ blk(16,48,4,12,4,k.p,k.p,k.o);fill(k.o,16,60,16,4)}            // left leg + shoe
+function paint(name){
+ if(name=='missing'){X.clearRect(0,0,64,64);for(var y=0;y<16;y++)for(var x=0;x<16;x++)fill((x+y)%2?'#000':'#f800f8',x*4,y*4,4,4)}
+ else{drawSkin(P[name]);grain()}
+ skinTex.needsUpdate=true}
+
+// Skin file (64x64 PNG, embedded). Base layer + hat, jacket, sleeve and pants layers are all mapped.
+var SKIN_SRC='data:image/png;base64,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';
+function mir(sx,sy,w,h,dx,dy){X.save();X.translate(dx+w,dy);X.scale(-1,1);X.drawImage(atlas,sx,sy,w,h,0,0,w,h);X.restore()}
+function useSkin(im){
+ var h=im.height;if(im.width!=64||(h!=64&&h!=32))return;
+ X.clearRect(0,0,64,64);X.drawImage(im,0,0);
+ if(h==32){ // legacy format: mirror the right arm and leg onto the left
+  mir(4,16,4,4,20,48);mir(8,16,4,4,24,48);mir(8,20,4,12,16,52);mir(4,20,4,12,20,52);mir(0,20,4,12,24,52);mir(12,20,4,12,28,52);
+  mir(44,16,4,4,36,48);mir(48,16,4,4,40,48);mir(48,20,4,12,32,52);mir(44,20,4,12,36,52);mir(40,20,4,12,40,52);mir(52,20,4,12,44,52)}
+ // the base layer is solid in-game: fill any transparent base pixels (e.g. arm tops) so no part is see-through
+ [[0,0,8,8,8],[16,16,8,12,4],[40,16,4,12,4],[32,48,4,12,4],[0,16,4,12,4],[16,48,4,12,4]].forEach(function(b){
+  var ox=b[0],oy=b[1],w=b[2],hh=b[3],d=b[4],sd=X.getImageData(ox,oy+d,2*d+2*w,hh).data,r=0,g=0,bl=0,n=0;
+  for(var q=0;q<sd.length;q+=4)if(sd[q+3]>127){r+=sd[q];g+=sd[q+1];bl+=sd[q+2];n++}
+  if(!n)return;var W=2*d+2*w;
+  function avg(row){var a=0,b2=0,c2=0,m=0;for(var u=0;u<W;u++){var o=(row*W+u)*4;if(sd[o+3]>127){a+=sd[o];b2+=sd[o+1];c2+=sd[o+2];m++}}return m?'rgb('+Math.round(a/m)+','+Math.round(b2/m)+','+Math.round(c2/m)+')':'rgb('+Math.round(r/n)+','+Math.round(g/n)+','+Math.round(bl/n)+')'}
+  // top and bottom faces continue the colour of the row next to them; side holes use the overall average
+  [[ox+d,oy,w,d,avg(0)],[ox+d+w,oy,w,d,avg(hh-1)],[ox,oy+d,2*d+2*w,hh,'rgb('+Math.round(r/n)+','+Math.round(g/n)+','+Math.round(bl/n)+')']].forEach(function(q){
+   var im2=X.getImageData(q[0],q[1],q[2],q[3]),px=im2.data,hole=false;
+   for(var k=3;k<px.length;k+=4)if(px[k]<128)hole=true;
+   if(!hole)return;
+   var cv2=document.createElement('canvas');cv2.width=q[2];cv2.height=q[3];var x2=cv2.getContext('2d');x2.fillStyle=q[4];x2.fillRect(0,0,q[2],q[3]);x2.drawImage(atlas,q[0],q[1],q[2],q[3],0,0,q[2],q[3]);
+   var o=x2.getImageData(0,0,q[2],q[3]);
+   for(var k2=3;k2<px.length;k2+=4)if(px[k2]>=128){o.data[k2-3]=px[k2-3];o.data[k2-2]=px[k2-2];o.data[k2-1]=px[k2-1]}
+   for(var k3=3;k3<o.data.length;k3+=4)o.data[k3]=255;
+   X.putImageData(o,q[0],q[1])})})
+ skinTex.needsUpdate=true}
+var pop=0;
+if(SKIN_SRC){var sim=new Image();sim.onload=function(){useSkin(sim)};sim.src=SKIN_SRC}
+function rad(c0,c1){var cn=document.createElement('canvas');cn.width=cn.height=128;var x=cn.getContext('2d'),g=x.createRadialGradient(64,64,0,64,64,64);g.addColorStop(0,c0);g.addColorStop(1,c1);x.fillStyle=g;x.fillRect(0,0,128,128);var t=new T.CanvasTexture(cn);t.encoding=T.sRGBEncoding;return t}
+var sh=new T.Mesh(new T.PlaneGeometry(3.2,3.2),new T.MeshBasicMaterial({map:rad('rgba(0,0,0,.6)','rgba(0,0,0,0)'),transparent:true,depthWrite:false}));sh.rotation.x=-Math.PI/2;sh.position.y=-1.58;pivot.add(sh);
+var glow=new T.Sprite(new T.SpriteMaterial({map:rad('rgba(212,255,0,.38)','rgba(212,255,0,0)'),transparent:true,depthWrite:false,blending:T.AdditiveBlending}));glow.scale.set(11,11,1);glow.position.z=-3;pivot.add(glow);
+
+// lock
+var hero=document.getElementById('hero'),lock=document.getElementById('lock'),locked=false,drag=0;
+lock.addEventListener('click',function(){locked=!locked;document.body.classList.toggle('locked',locked);document.body.style.overflow=locked?'hidden':'';lock.textContent=locked?'Back to scroll':'Tap to lock';lock.setAttribute('aria-pressed',locked)});
+hero.addEventListener('pointermove',function(e){if(locked&&e.buttons)drag+=e.movementX*.013});
+var my=0;addEventListener('pointermove',function(e){my=e.clientY/innerHeight-.5});
+
+// ===== feature 2: cursor blob reveal (wireframe layer under the hero) =====
+var W=1,H=1,DPR=Math.min(devicePixelRatio||1,2),introT0=null;
+var U={uB1:{value:new T.Vector4()},uB2:{value:new T.Vector4()},uT:{value:0}};
+// the reveal is a 3D blob in world space: the model surface inside it becomes a blueprint
+function xrayShader(mat,over){
+ mat.onBeforeCompile=function(sh2){
+  sh2.uniforms.uB1=U.uB1;sh2.uniforms.uB2=U.uB2;sh2.uniforms.uT=U.uT;
+  var vars='varying vec3 vP;varying vec3 vNo;varying vec3 vVw;varying vec3 vNv;varying vec3 vW;';
+  sh2.vertexShader=sh2.vertexShader
+   .replace('#include <common>','#include <common>\n'+vars)
+   .replace('#include <begin_vertex>','#include <begin_vertex>\nvP=position;vNo=normal;vW=(modelMatrix*vec4(position,1.)).xyz;')
+   .replace('#include <project_vertex>','#include <project_vertex>\nvVw=-mvPosition.xyz;vNv=normalize(normalMatrix*normal);');
+  sh2.fragmentShader=sh2.fragmentShader
+   .replace('#include <common>','#include <common>\n'+vars+`uniform vec4 uB1;uniform vec4 uB2;uniform float uT;
+float hsh(vec3 p){p=fract(p*.3183099+.1);p*=17.;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float vnz(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+ return mix(mix(mix(hsh(i),hsh(i+vec3(1,0,0)),f.x),mix(hsh(i+vec3(0,1,0)),hsh(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(hsh(i+vec3(0,0,1)),hsh(i+vec3(1,0,1)),f.x),mix(hsh(i+vec3(0,1,1)),hsh(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float blobM(vec4 b,float seed){
+ if(b.w<.001)return 0.;
+ // organic edge: the blob boundary is pushed in and out by slowly drifting 3D noise
+ float f=length(vW-b.xyz)/b.w
+  +(vnz(vW*1.8+vec3(uT*.12,-uT*.09,uT*.1)+seed*7.)-.5)*1.1
+  +(vnz(vW*3.4+vec3(-uT*.15,uT*.12,uT*.08)+seed*3.)-.5)*.18;
+ return 1.-smoothstep(.95,1.05,f);}`)
+   .replace('#include <map_fragment>','#include <map_fragment>\nfloat xm=max(blobM(uB1,0.),blobM(uB2,2.1));\n'+(over?'if(xm>.5)discard;\n':''))
+   .replace('#include <dithering_fragment>',`#include <dithering_fragment>
+if(xm>0.){
+ vec3 n=abs(vNo);vec3 g=abs(fract(vP+.5)-.5);
+ float ln=max(max((1.-smoothstep(0.,.07,g.x))*(1.-n.x),(1.-smoothstep(0.,.07,g.y))*(1.-n.y)),(1.-smoothstep(0.,.07,g.z))*(1.-n.z));
+ float rim=pow(1.-abs(dot(normalize(vNv),normalize(vVw))),2.);
+ vec3 xr=vec3(.008,.067,.035)+gl_FragColor.rgb*.12+vec3(.83,1.,0.)*(ln*.9+rim*.55);
+ gl_FragColor.rgb=mix(gl_FragColor.rgb,xr,xm);
+}`)}}
+xrayShader(baseMat,false);xrayShader(overMat,true);
+var mouse={x:0,y:0,ok:false},ray=new T.Raycaster(),ndc=new T.Vector2(),hitMeshes=[],c1=new T.Vector3(),c2=new T.Vector3(),r1=0,r2=0,seen=false;
+rig.traverse(function(o){if(o.isMesh)hitMeshes.push(o)});
+addEventListener('pointermove',function(e){mouse.ok=e.pointerType=='mouse';mouse.x=e.clientX;mouse.y=e.clientY});
+function xray(t){
+ var hr=hero.getBoundingClientRect(),on=!locked&&pivot.visible&&mouse.ok&&mouse.y>=hr.top&&mouse.y<=hr.bottom&&hr.bottom>60,hit=null;
+ if(on){ndc.set(mouse.x/W*2-1,-(mouse.y/H)*2+1);ray.setFromCamera(ndc,cam);var hs=ray.intersectObjects(hitMeshes,false);if(hs.length)hit=hs[0].point}
+ if(hit){if(!seen){c1.copy(hit);c2.copy(hit);seen=true}c1.lerp(hit,.3);c2.lerp(hit,.1)}
+ var tr=hit?.9:0;r1+=(tr-r1)*.16;r2+=(tr*.7-r2)*.1;if(!hit&&r1<.01)seen=false;
+ U.uB1.value.set(c1.x,c1.y,c1.z,r1<.02?0:r1);U.uB2.value.set(c2.x,c2.y,c2.z,r1<.02?0:r2);U.uT.value=RM?0:t}
+
+var asp=1;
+function size(){var w=innerWidth,h=innerHeight;W=w;H=h;R.setSize(w,h,false);asp=w/h;cam.aspect=asp;cam.updateProjectionMatrix();}
+size();addEventListener('resize',size);
+var scale=1;
+function frame(ms){
+ var t=ms/1000;
+ var rdy=document.body.classList.contains('ready');if(rdy&&introT0===null)introT0=t;
+ var e=RM?1:(introT0===null?0:Math.min(1,(t-introT0)/1.8));e=1-Math.pow(1-e,3);pivot.visible=rdy;pivot.position.y=-(1-e)*3.4; // hero reveal: model rises and spins in
+ var base=(locked?drag:(RM?0:t*.45)+scrollY*.0035)+(1-e)*5;
+ rig.rotation.y+=(base-rig.rotation.y)*.12;
+ var sw=RM?0:Math.sin(t*4)*.5;aL.rotation.x=sw;aR.rotation.x=-sw;lL.rotation.x=-sw;lR.rotation.x=sw;
+ pop*=.9;rig.rotation.x+=((RM||locked?0:my*.16)-rig.rotation.x)*.06;var k=(asp<.8?.62:1)*(1+pop*.18)*(.65+.35*e);pivot.scale.setScalar(k);
+ rig.position.y=-1.6+(RM?0:Math.abs(Math.sin(t*4))*.05);
+ R.render(sc,cam);xray(t);requestAnimationFrame(frame)}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 //! Signs in with a Microsoft account and caches the tokens.
 //!
-//!     cargo run -p rapidbot-auth --example login -- accounts/main.json
+//!     cargo run -p rapidbot-auth --example login -- main
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,11 +9,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let cache = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "accounts/main.json".into());
+    let alias = std::env::args().nth(1).unwrap_or_else(|| "main".into());
+    let dir = std::env::var_os("RAPIDBOT_ACCOUNTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "accounts".into());
 
-    let mut auth = rapidbot_auth::Authenticator::new(&cache)?;
+    let store = rapidbot_auth::AccountStore::open(&dir)?;
+    let mut auth = store.authenticator(&alias)?;
+    if let Ok(client_id) = std::env::var("RAPIDBOT_CLIENT_ID") {
+        auth = auth.with_client_id(client_id);
+    }
     let account = auth
         .login(|code| {
             println!(
@@ -22,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         })
         .await?;
+    store.remember(&alias, &account)?;
     println!("Logged in as {} ({})", account.name, account.id);
     println!(
         "Chat signing keys: {}",
@@ -31,6 +37,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "no"
         }
     );
-    println!("Tokens cached in {cache}");
+    println!("Account {alias} saved in {}", store.root().display());
     Ok(())
 }

@@ -76,6 +76,16 @@ pub(crate) struct Game {
     pack_required: bool,
 }
 
+/// Everything `run_inner` needs to start the next connection after a
+/// `transfer`, or to report the final reason.
+pub(crate) struct GameOutcome {
+    pub reason: ClientError,
+    pub config: ClientConfig,
+    pub session: SessionData,
+    pub controller: Box<dyn Controller>,
+    pub link: BotLink,
+}
+
 /// A chat line on its way out.
 struct Typing {
     line: String,
@@ -144,17 +154,18 @@ impl Game {
         }
     }
 
-    /// Runs until the connection ends. Returns the disconnect reason.
-    pub fn run(mut self) -> ClientError {
-        loop {
+    /// Runs until the connection ends. Returns the reason and the state needed
+    /// to reconnect after a transfer.
+    pub fn run(mut self) -> GameOutcome {
+        let reason = loop {
             if self.link.stopped() {
-                return ClientError::Stopped;
+                break ClientError::Stopped;
             }
             let frame_start = std::time::Instant::now();
             let ticks = self.timer.advance_game_time(clock::millis());
 
             if let Err(e) = self.process_queued_packets() {
-                return e;
+                break e;
             }
             if self
                 .conduct_click
@@ -168,7 +179,7 @@ impl Game {
             if let Some(packs) = &mut self.packs {
                 let turn = packs.poll(self.pack_required);
                 if let Err(e) = self.send_pack_turn(turn) {
-                    return e;
+                    break e;
                 }
             }
             let handled_in = frame_start.elapsed();
@@ -202,6 +213,13 @@ impl Game {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 self.last_stall = Instant::now();
             }
+        };
+        GameOutcome {
+            reason,
+            config: self.config,
+            session: self.session,
+            controller: self.controller,
+            link: self.link,
         }
     }
 

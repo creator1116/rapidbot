@@ -9,6 +9,7 @@
 //! the JVM). The TLS handshake of an `https`
 //! download is rustls', not Java's.
 
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -22,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
+use zip::ZipArchive;
 
 use crate::ResourcePackPolicy;
 
@@ -70,8 +72,10 @@ type DownloadResult = (Uuid, Result<Downloaded, String>);
 struct Downloaded {
     sha1: String,
     size: u64,
-    /// Starts like a zip file. Anything else fails to load.
-    is_zip: bool,
+    /// Passes our best-effort `Pack.readPackMetadata`: a zip with a root
+    /// `pack.mcmeta`, a `pack` object and a component-shaped description.
+    /// Format errors use vanilla's fallback rather than failing the pack.
+    valid: bool,
     from_cache: bool,
 }
 
@@ -260,7 +264,7 @@ impl PackManager {
                 Ok(done) => {
                     info!(%id, size = done.size, sha1 = %done.sha1, cached = done.from_cache, "resource pack downloaded");
                     self.downloaded_bytes += done.size;
-                    pack.download = Download::Done { valid: done.is_zip };
+                    pack.download = Download::Done { valid: done.valid };
                 }
                 Err(error) => {
                     warn!(%id, "resource pack download failed: {error}");
@@ -307,12 +311,23 @@ impl PackManager {
         }
         if let Some((_, ready)) = self.reload.take_if(|(at, _)| now >= *at) {
             self.downloaded_bytes = 0;
+            // `DownloadedPackSource.loadRequestedPacks` returns null when any
+            // pack in the batch has bad metadata; the recovery reload then
+            // starts without the new packs. So every pack in this reload
+            // reports the failure, not just the bad one.
+            // A pack popped while the reload was pending is no longer in
+            // `self.packs`; don't let its absence fail the others.
+            let batch_loads = ready.iter().all(|id| {
+                self.packs
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .is_none_or(|p| matches!(p.download, Download::Done { valid: true }))
+            });
             for pack in self.packs.iter_mut().filter(|p| ready.contains(&p.id)) {
                 pack.settled = true;
-                let valid = matches!(pack.download, Download::Done { valid: true });
                 turn.responses.push((
                     pack.id,
-                    if valid {
+                    if batch_loads {
                         Action::SuccessfullyLoaded
                     } else {
                         Action::FailedReload
@@ -334,10 +349,11 @@ struct Request {
 }
 
 /// `HttpUtil.downloadFile`: the cached copy if its hash is the one asked
-/// for, else an HTTP GET, hashed as it arrives.
+/// for, else an HTTP GET, hashed as it arrives. A cached copy is also checked
+/// the way a resource reload would check it; an old empty marker from earlier
+/// versions is simply downloaded again.
 async fn download(request: Request) -> Result<Downloaded, String> {
-    // Vanilla keeps each pack as `downloads/<pack id>/<sha1>`. Only the
-    // fact that it is there matters here, so the cache holds empty files.
+    // Vanilla keeps each pack as `downloads/<pack id>/<sha1>`.
     let marker = match (&request.cache, &request.hash) {
         (Some(dir), Some(hash)) => Some(dir.join(request.id.to_string()).join(hash)),
         _ => None,
@@ -345,19 +361,29 @@ async fn download(request: Request) -> Result<Downloaded, String> {
     if let (Some(marker), Some(hash)) = (&marker, &request.hash)
         && marker.exists()
     {
-        return Ok(Downloaded {
-            sha1: hash.clone(),
-            size: 0,
-            is_zip: true,
-            from_cache: true,
-        });
+        match std::fs::read(marker) {
+            Ok(body) if sha1_hex(&body) == *hash => {
+                let valid = validate_pack(&body);
+                if let Err(error) = &valid {
+                    warn!(%error, "cached resource pack would fail vanilla's reload");
+                }
+                return Ok(Downloaded {
+                    sha1: hash.clone(),
+                    size: body.len() as u64,
+                    valid: valid.is_ok(),
+                    from_cache: true,
+                });
+            }
+            Ok(_) => warn!("cached resource pack hash does not match; downloading it again"),
+            Err(error) => {
+                warn!(%error, "could not read cached resource pack; downloading it again")
+            }
+        }
+        let _ = std::fs::remove_file(marker);
     }
 
     let body = fetch(&request).await?;
-    let sha1 = Sha1::digest(&body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let sha1 = sha1_hex(&body);
     if let Some(hash) = &request.hash
         && *hash != sha1
     {
@@ -365,20 +391,256 @@ async fn download(request: Request) -> Result<Downloaded, String> {
             "hash of downloaded file ({sha1}) did not match requested ({hash})"
         ));
     }
-    let is_zip = body.starts_with(b"PK");
+    let valid = match validate_pack(&body) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "downloaded resource pack would fail vanilla's reload");
+            false
+        }
+    };
     if let Some(dir) = &request.cache {
         let marker = dir.join(request.id.to_string()).join(&sha1);
         if let Some(parent) = marker.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&marker, b"");
+        let _ = std::fs::write(&marker, &body);
     }
     Ok(Downloaded {
         sha1,
         size: body.len() as u64,
-        is_zip,
+        valid,
         from_cache: false,
     })
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    Sha1::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `Pack.readPackMetadata` for a downloaded zip: `FilePackResources` opens
+/// the archive and reads the root `pack.mcmeta`; a missing pack section or
+/// description makes `loadRequestedPacks` fail the reload. The pack's
+/// declared version does not have to match the game: vanilla only labels it
+/// incompatible, it still loads.
+///
+/// This is a best-effort version of that reader. In particular it does not
+/// decode the full component codec behind `description`, and it does not
+/// read `features` or `overlays`; see `docs/architecture.md`.
+fn validate_pack(body: &[u8]) -> Result<(), String> {
+    let mut archive =
+        ZipArchive::new(Cursor::new(body)).map_err(|e| format!("not a valid zip: {e}"))?;
+    let mut meta = archive
+        .by_name("pack.mcmeta")
+        .map_err(|e| format!("no pack.mcmeta at the zip root: {e}"))?;
+    let mut text = String::new();
+    meta.read_to_string(&mut text)
+        .map_err(|e| format!("could not read pack.mcmeta: {e}"))?;
+    drop(meta);
+
+    let root: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("pack.mcmeta is not JSON: {e}"))?;
+    let pack = root
+        .get("pack")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("pack.mcmeta has no pack object")?;
+    let description = pack
+        .get("description")
+        .ok_or("pack.mcmeta has no pack description")?;
+    validate_description(description)?;
+    // `readPackMetadata` retries with a description-only codec when the full
+    // format codec fails, so bad or missing format fields still load as
+    // UNKNOWN. Keep the parse for a useful log, but do not reject the pack.
+    if let Err(error) = validate_pack_formats(pack) {
+        debug!(%error, "pack.mcmeta format declaration failed; vanilla uses its fallback codec");
+    }
+    Ok(())
+}
+
+/// The shape `ComponentSerialization.CODEC` accepts without descending into
+/// every content codec: a string, a non-empty list of components, or an
+/// object. An empty list is rejected as vanilla does; object contents are not
+/// decoded any further.
+fn validate_description(value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(_) | serde_json::Value::Object(_) => Ok(()),
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            for item in items {
+                validate_description(item)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(_) => {
+            Err("pack.mcmeta pack description is an empty component list".into())
+        }
+        _ => Err("pack.mcmeta pack description is not a JSON text component".into()),
+    }
+}
+
+/// The part of `PackFormat.packCodec` that `Pack.readPackMetadata` tries
+/// first. Errors here are not fatal: the fallback codec above only reads
+/// `description`. `lastPreMinorVersion` for client resources is 64.
+fn validate_pack_formats(pack: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    const LAST_PRE_MINOR: i64 = 64;
+
+    let pack_format = pack
+        .get("pack_format")
+        .map(non_negative_int)
+        .transpose()
+        .map_err(|e| format!("pack.mcmeta pack_format: {e}"))?;
+    let min = pack
+        .get("min_format")
+        .map(|value| pack_version(value, 0))
+        .transpose()
+        .map_err(|e| format!("pack.mcmeta min_format: {e}"))?;
+    let max = pack
+        .get("max_format")
+        .map(|value| pack_version(value, i64::from(i32::MAX)))
+        .transpose()
+        .map_err(|e| format!("pack.mcmeta max_format: {e}"))?;
+    let supported = pack
+        .get("supported_formats")
+        .map(int_range)
+        .transpose()
+        .map_err(|e| format!("pack.mcmeta supported_formats: {e}"))?;
+
+    if min.is_some() != max.is_some() {
+        return Err("pack.mcmeta must declare both min_format and max_format".into());
+    }
+    if let (Some(min), Some(max)) = (min, max) {
+        if min > max {
+            return Err("pack.mcmeta min_format is greater than max_format".into());
+        }
+        if min.0 > LAST_PRE_MINOR {
+            // New-style range: the old supported_formats field is forbidden.
+            if supported.is_some() {
+                return Err(
+                    "pack.mcmeta has supported_formats alongside the newer min/max format".into(),
+                );
+            }
+            if let Some(format) = pack_format {
+                check_main_format(format, min.0, max.0)?;
+            }
+        } else {
+            // Old-style range: supported_formats and pack_format are required.
+            let Some((lo, hi)) = supported else {
+                return Err("pack.mcmeta has min/max format but no supported_formats".into());
+            };
+            if lo != min.0 {
+                return Err("pack.mcmeta supported_formats and min_format disagree".into());
+            }
+            if hi != max.0 && hi != LAST_PRE_MINOR {
+                return Err("pack.mcmeta supported_formats and max_format disagree".into());
+            }
+            let Some(format) = pack_format else {
+                return Err("pack.mcmeta has min/max format but no pack_format".into());
+            };
+            check_main_format(format, min.0, max.0)?;
+        }
+    } else if let Some((lo, hi)) = supported {
+        if hi > LAST_PRE_MINOR {
+            return Err(
+                "pack.mcmeta supports a newer format without min_format and max_format".into(),
+            );
+        }
+        let Some(format) = pack_format else {
+            return Err("pack.mcmeta has supported_formats but no pack_format".into());
+        };
+        check_main_format(format, lo, hi)?;
+    } else if let Some(format) = pack_format {
+        if format > LAST_PRE_MINOR {
+            return Err(
+                "pack.mcmeta declares a newer pack_format without min_format and max_format".into(),
+            );
+        }
+    } else {
+        return Err("pack.mcmeta has no pack format information".into());
+    }
+    Ok(())
+}
+
+fn check_main_format(format: i64, min: i64, max: i64) -> Result<(), String> {
+    if !(min..=max).contains(&format) {
+        return Err(format!(
+            "pack.mcmeta pack_format {format} is outside the declared range {min}..={max}"
+        ));
+    }
+    if format < 15 {
+        return Err("pack.mcmeta pack_format is below 15".into());
+    }
+    Ok(())
+}
+
+fn non_negative_int(value: &serde_json::Value) -> Result<i64, String> {
+    value
+        .as_i64()
+        .filter(|n| (0..=i64::from(i32::MAX)).contains(n))
+        .ok_or_else(|| "expected a non-negative 32-bit integer".into())
+}
+
+/// `PackFormat` JSON: an integer, or `[major, minor]`. An integer leaves the
+/// minor at the codec's default (0 for `min_format`, `Integer.MAX_VALUE` for
+/// `max_format`).
+fn pack_version(value: &serde_json::Value, default_minor: i64) -> Result<(i64, i64), String> {
+    if let Some(major) = value.as_i64() {
+        return if (0..=i64::from(i32::MAX)).contains(&major) {
+            Ok((major, default_minor))
+        } else {
+            Err("expected a non-negative 32-bit integer".into())
+        };
+    }
+    let array = value
+        .as_array()
+        .filter(|a| (1..=256).contains(&a.len()))
+        .ok_or_else(|| "expected an integer or a list of up to 256 integers".to_string())?;
+    let major = non_negative_int(&array[0])?;
+    let minor = match array.get(1) {
+        Some(minor) => non_negative_int(minor)?,
+        None => default_minor,
+    };
+    Ok((major, minor))
+}
+
+/// `InclusiveRange<Integer>` JSON: an integer, `[min, max]`, or the object
+/// form `{ "min_inclusive": .., "max_inclusive": .. }`.
+fn int_range(value: &serde_json::Value) -> Result<(i64, i64), String> {
+    if let Some(both) = value.as_i64() {
+        return if (0..=i64::from(i32::MAX)).contains(&both) {
+            Ok((both, both))
+        } else {
+            Err("expected a non-negative 32-bit integer".into())
+        };
+    }
+    if let Some(array) = value.as_array() {
+        if array.len() != 2 {
+            return Err("expected [min, max]".into());
+        }
+        let min = non_negative_int(&array[0])?;
+        let max = non_negative_int(&array[1])?;
+        return if min <= max {
+            Ok((min, max))
+        } else {
+            Err("minimum is greater than maximum".into())
+        };
+    }
+    if let Some(object) = value.as_object() {
+        let min = object
+            .get("min_inclusive")
+            .ok_or_else(|| "missing min_inclusive".to_string())
+            .and_then(non_negative_int)?;
+        let max = object
+            .get("max_inclusive")
+            .ok_or_else(|| "missing max_inclusive".to_string())
+            .and_then(non_negative_int)?;
+        return if min <= max {
+            Ok((min, max))
+        } else {
+            Err("minimum is greater than maximum".into())
+        };
+    }
+    Err("expected an integer, [min, max] or an object".into())
 }
 
 /// The request line and headers `HttpURLConnection` writes. `Map.of`
@@ -617,9 +879,27 @@ fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use tokio::net::TcpListener;
 
     use super::*;
+
+    const VALID_META: &str =
+        r#"{"pack":{"description":"test","min_format":[97,0],"max_format":[97,1]}}"#;
+
+    fn pack_zip(meta: &str) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut out);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("pack.mcmeta", options).unwrap();
+            zip.write_all(meta.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        out.into_inner()
+    }
 
     fn profile() -> Uuid {
         Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()
@@ -739,11 +1019,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn accepts_downloads_and_loads() {
-        let pack = b"PK\x03\x04 pretend zip".to_vec();
-        let sha1 = Sha1::digest(&pack)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let pack = pack_zip(VALID_META);
+        let sha1 = sha1_hex(&pack);
         let (port, seen) = serve(pack).await;
         let id = Uuid::from_u128(1);
 
@@ -861,5 +1138,140 @@ mod tests {
                 .responses,
             [(b, Action::Declined)]
         );
+    }
+
+    #[test]
+    fn pack_metadata_validation() {
+        assert!(validate_pack(&pack_zip(VALID_META)).is_ok());
+        assert!(
+            validate_pack(&pack_zip(
+                r#"{"pack":{"description":"old","pack_format":64,"supported_formats":[64,64]}}"#
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_pack(&pack_zip(
+                r#"{"pack":{"description":"new","pack_format":97,"min_format":[97,0],"max_format":[97,1]}}"#
+            ))
+            .is_ok()
+        );
+        // An integer max_format leaves the minor at Integer.MAX_VALUE.
+        assert!(
+            validate_pack(&pack_zip(
+                r#"{"pack":{"description":"new","min_format":[97,2],"max_format":97}}"#
+            ))
+            .is_ok()
+        );
+        // PackFormat's compact list ignores entries after the minor.
+        assert!(
+            validate_pack(&pack_zip(
+                r#"{"pack":{"description":"new","min_format":[97,0,1],"max_format":[97,1,2]}}"#
+            ))
+            .is_ok()
+        );
+        assert!(validate_pack(&pack_zip(r#"{"pack":{"description":5}}"#)).is_err());
+        assert!(validate_pack(&pack_zip(r#"{"pack":{"description":[]}}"#)).is_err());
+        assert!(validate_pack(&pack_zip(r#"{"pack":{"description":["x",5]}}"#)).is_err());
+        // Vanilla's metadata reader needs a description, but it retries with
+        // a description-only codec when the format codec fails. A missing or
+        // malformed format declaration therefore still loads (as UNKNOWN).
+        assert!(validate_pack(&pack_zip(r#"{"pack":{"description":"x"}}"#)).is_ok());
+        assert!(
+            validate_pack(&pack_zip(
+                r#"{"pack":{"description":"x","pack_format":97}}"#
+            ))
+            .is_ok()
+        );
+        assert!(validate_pack(&pack_zip(r#"{"pack":{"pack_format":97}}"#)).is_err());
+        assert!(validate_pack(b"not a zip").is_err());
+        // The strict parser is still useful for logging why vanilla fell back.
+        let pack = serde_json::from_str::<serde_json::Value>(
+            r#"{"pack":{"description":"x","pack_format":97}}"#,
+        )
+        .unwrap();
+        assert!(validate_pack_formats(pack["pack"].as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_bad_pack_fails_the_whole_metadata_batch() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut manager = PackManager::new(
+            ResourcePackPolicy::Enabled,
+            "Steve".into(),
+            profile(),
+            None,
+            1,
+        );
+        for (id, valid) in [(a, true), (b, false)] {
+            manager.packs.push(Pack {
+                id,
+                url: Url::parse("http://127.0.0.1:1/pack.zip").unwrap(),
+                hash: None,
+                download: Download::Done { valid },
+                reported: true,
+                settled: false,
+            });
+        }
+        assert!(manager.poll(false).responses.is_empty());
+        // Skip the varying reload delay.
+        manager.reload = manager.reload.take().map(|(_, ids)| (Instant::now(), ids));
+        assert_eq!(
+            manager.poll(false).responses,
+            [(a, Action::FailedReload), (b, Action::FailedReload)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_pack_is_reused_and_validated() {
+        let pack = pack_zip(VALID_META);
+        let sha1 = sha1_hex(&pack);
+        let (port, _) = serve(pack.clone()).await;
+        let dir = std::env::temp_dir().join(format!("rapidbot-pack-cache-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = Uuid::from_u128(7);
+        let request = || Request {
+            id,
+            url: Url::parse(&format!("http://127.0.0.1:{port}/pack.zip")).unwrap(),
+            hash: Some(sha1.clone()),
+            username: "Steve".into(),
+            profile: profile(),
+            cache: Some(dir.clone()),
+        };
+
+        let first = download(request()).await.unwrap();
+        assert!(!first.from_cache && first.valid);
+        let cached = dir.join(id.to_string()).join(&sha1);
+        assert_eq!(std::fs::read(&cached).unwrap(), pack);
+
+        let second = download(request()).await.unwrap();
+        assert!(second.from_cache && second.valid);
+
+        // A corrupt cached file is not trusted; it is downloaded again.
+        std::fs::write(&cached, b"broken").unwrap();
+        let third = download(request()).await.unwrap();
+        assert!(!third.from_cache && third.valid);
+
+        // A cache entry that matches the requested hash is authoritative even
+        // when the pack is invalid: vanilla reuses it and reports FailedReload
+        // instead of downloading it every time.
+        let invalid = b"not a zip".to_vec();
+        let invalid_id = Uuid::from_u128(8);
+        let invalid_sha = sha1_hex(&invalid);
+        let invalid_path = dir.join(invalid_id.to_string()).join(&invalid_sha);
+        std::fs::create_dir_all(invalid_path.parent().unwrap()).unwrap();
+        std::fs::write(&invalid_path, &invalid).unwrap();
+        let invalid = download(Request {
+            id: invalid_id,
+            url: Url::parse("http://127.0.0.1:9/pack.zip").unwrap(),
+            hash: Some(invalid_sha),
+            username: "Steve".into(),
+            profile: profile(),
+            cache: Some(dir.clone()),
+        })
+        .await
+        .unwrap();
+        assert!(invalid.from_cache);
+        assert!(!invalid.valid);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

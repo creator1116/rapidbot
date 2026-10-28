@@ -159,14 +159,17 @@ land.
 ## Accounts
 
 `Account::Offline { name }` works on offline-mode servers. For online-mode
-servers sign in with Microsoft once; the tokens are cached in a file:
+servers sign in with Microsoft once; tokens are kept per alias in an
+encrypted file, with its random key in the OS keyring:
 
 ```sh
-cargo run -p rapidbot-auth --example login -- accounts/main.json
-cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft accounts/main.json
+cargo run -p rapidbot-auth -- login main
+cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 ```
 
-Keep that file private (`accounts/` is gitignored).
+`rapidbot-auth status` shows the aliases and cached token state, and
+`rapidbot-auth logout main` forgets one. `RAPIDBOT_ACCOUNTS` chooses the
+directory (default `accounts`, which is gitignored).
 
 ## Configuration
 

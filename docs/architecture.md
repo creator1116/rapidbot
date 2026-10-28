@@ -16,7 +16,7 @@ everything else is an implementation layer.
 | `rapidbot-world` | Block and item data extracted from the game, chunks, tags, collision shapes, item stacks and components, block ray cast |
 | `rapidbot-physics` | Player movement ported from vanilla, attributes, `Mth`/`Vec3` |
 | `rapidbot-human` | Input models: mouse strokes, response delays, key timing, typing, fatigue; seeded per account |
-| `rapidbot-auth` | Microsoft device code → Xbox → XSTS → Minecraft token, chat keys, session join |
+| `rapidbot-auth` | Microsoft device code → Xbox → XSTS → Minecraft token, encrypted per-alias token cache, chat keys, session join |
 | `rapidbot-recorder` | Windows raw-input recorder (game keys only, only while Minecraft is focused) and an analyser that fits a mouse profile |
 
 ## Two layers
@@ -62,10 +62,19 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `inventory.rs` | Inventory and server-opened containers |
 | `interact.rs` | Crosshair pick, digging, block-change predictions, attacking |
 | `chat.rs`, `commands.rs` | Chat sending and signing, last-seen tracking, the server's command tree |
-| `packs.rs` | Resource pack prompt, download and status packets |
+| `packs.rs` | Resource pack prompt, download and status packets; best-effort `pack.mcmeta` validation |
+| `status.rs` | Server list ping: raw handshake address, SRV-resolved socket |
 | `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
 | `combat.rs` | Target approach, aiming, and attack timing |
 | `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
+
+`packs.rs` reports `SUCCESSFULLY_LOADED` after a best-effort check of the
+downloaded zip, its root `pack.mcmeta`, the `pack` object and the shape of
+`description`. It does not decode the full text-component codec, does not
+read the `features` or `overlays` sections, and does not load the pack's
+resource files, so a pack that only fails vanilla's real resource reload can
+still be reported as loaded. Download batches are per-pack here; vanilla
+discards the rest of a download batch when one request fails.
 
 ## Generated data
 

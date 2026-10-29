@@ -123,6 +123,7 @@ impl PlayState {
             carried_index: 0,
             game_mode: crate::interact::GameMode::new(),
         };
+        state.inventory.creative = state.game_type == GameType::Creative;
         state.start_waiting_for_new_level();
         state
     }
@@ -451,6 +452,7 @@ impl Game {
                         let mut id: &[u8] = &[event.param as u8];
                         play.game_type = GameType::decode(&mut id)?;
                         play.player.physics.spectator = play.game_type == GameType::Spectator;
+                        play.inventory.creative = play.game_type == GameType::Creative;
                     }
                     _ => {}
                 }
@@ -655,6 +657,37 @@ impl Game {
                     play.player.physics.delta_movement = v;
                 }
             }
+            cb::SetPassengers::ID => {
+                let passengers = packet.decode::<cb::SetPassengers>()?;
+                let ids: Vec<i32> = passengers.passengers.iter().map(|id| id.0).collect();
+                let play = play_mut(&mut self.play)?;
+                if let Some(vehicle) = play.entities.get(passengers.vehicle) {
+                    if ids.contains(&play.player.id) {
+                        let authoritative = vehicle.is_local_authoritative_vehicle()
+                            && ids.first() == Some(&play.player.id);
+                        play.player.set_passengers(vehicle, &ids, authoritative);
+                    } else if play.player.riding_vehicle() == Some(passengers.vehicle) {
+                        play.player.dismount();
+                    }
+                } else {
+                    warn!(
+                        vehicle = passengers.vehicle,
+                        "passengers for unknown entity"
+                    );
+                }
+            }
+            cb::MoveVehicle::ID => {
+                let motion = packet.decode::<cb::MoveVehicle>()?;
+                let play = play_mut(&mut self.play)?;
+                if play.player.riding_vehicle().is_some()
+                    && play
+                        .player
+                        .snap_vehicle(&mut play.entities, motion.moving_to)
+                    && let Some(echo) = play.player.serverbound_vehicle()
+                {
+                    self.net.send(&echo);
+                }
+            }
             cb::Explode::ID => {
                 let explode = packet.decode::<cb::Explode>()?;
                 let play = play_mut(&mut self.play)?;
@@ -708,7 +741,12 @@ impl Game {
             }
             cb::SystemChat::ID => {
                 let chat = packet.decode::<cb::SystemChat>()?;
-                let text = crate::text::nbt_to_plain(&chat.content);
+                let text = match &self.packs {
+                    Some(packs) => {
+                        crate::text::nbt_to_plain_translated(&chat.content, packs.translations())
+                    }
+                    None => crate::text::nbt_to_plain(&chat.content),
+                };
                 debug!(overlay = chat.overlay, "system chat: {text}");
                 self.link.emit(crate::BotEvent::SystemMessage {
                     text,
@@ -816,7 +854,13 @@ impl Game {
             },
             ids::DISGUISED_CHAT | ids::SET_TITLE_TEXT => {
                 let mut body = packet.body.as_slice();
-                let text = crate::text::nbt_to_plain(&rapidbot_nbt::Tag::decode(&mut body)?);
+                let content = rapidbot_nbt::Tag::decode(&mut body)?;
+                let text = match &self.packs {
+                    Some(packs) => {
+                        crate::text::nbt_to_plain_translated(&content, packs.translations())
+                    }
+                    None => crate::text::nbt_to_plain(&content),
+                };
                 debug!("message: {text}");
             }
             cb::UpdateTags::ID => {
@@ -843,6 +887,7 @@ impl Game {
                 self.slot_press = None;
                 self.close_press = None;
                 play.game_type = respawn.spawn.game_type;
+                play.inventory.creative = play.game_type == GameType::Creative;
                 play.player.physics.spectator = play.game_type == GameType::Spectator;
                 play.player.physics.fast_lava =
                     fast_lava(&self.session, respawn.spawn.dimension_type);

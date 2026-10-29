@@ -190,11 +190,17 @@ impl Authenticator {
         })
     }
 
-    /// The cached account, without any network access. Expired chat keys are
-    /// omitted so the result is always safe to send.
+    /// The cached account, without any network access. Returns `None` when the
+    /// Minecraft token has expired; expired chat keys are omitted so the
+    /// result is always safe to send.
     pub fn cached_account(&self) -> Option<MinecraftAccount> {
-        let minecraft = self.cache.minecraft.as_ref()?;
-        let now_ms = now_secs() * 1000;
+        let now_secs = now_secs();
+        let minecraft = self
+            .cache
+            .minecraft
+            .as_ref()
+            .filter(|minecraft| minecraft.expires_at > now_secs)?;
+        let now_ms = now_secs * 1000;
         Some(MinecraftAccount {
             name: minecraft.name.clone(),
             id: minecraft.id,
@@ -254,7 +260,10 @@ impl Authenticator {
                 chat_keys,
             });
         }
-        self.cached_account().ok_or(AuthError::NoRefreshToken)
+        match self.cached_account() {
+            Some(account) => Ok(account),
+            None => self.refresh().await,
+        }
     }
 
     /// Renews the Microsoft, Xbox, Minecraft and chat-key tokens from the
@@ -745,6 +754,27 @@ mod tests {
         let account = auth.cached_account().unwrap();
         assert_eq!(account.access_token, "cached");
         assert!(account.chat_keys.is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cached_account_requires_a_live_minecraft_token() {
+        let (dir, path) = temp_cache_path();
+        TokenCache {
+            minecraft: Some(CachedMinecraft {
+                access_token: "expired".into(),
+                expires_at: now_secs() - 1,
+                name: "Steve".into(),
+                id: Uuid::from_u128(1),
+            }),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        let auth = Authenticator::new(&path).unwrap();
+        assert!(auth.cached_account().is_none());
 
         std::fs::remove_dir_all(dir).unwrap();
     }

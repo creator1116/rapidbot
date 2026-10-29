@@ -34,9 +34,9 @@
 
 pub use rapidbot_auth as auth;
 pub use rapidbot_client::{
-    Account, Bot, BotEvent, ClientConfig, ClientError, Controller, DisplaySettings, Idle, Keys,
-    MouseSettings, ResourcePackPolicy, TickContext, chat, combat, commands, controller, entities,
-    interact, inventory, math, nav, path, run, run_with,
+    Account, Bot, BotEvent, ClientConfig, ClientError, Controller, DisplaySettings, Idle,
+    InputMode, Keys, MouseSettings, ResourcePackPolicy, TickContext, chat, combat, commands,
+    controller, entities, interact, inventory, math, nav, path, run, run_with,
 };
 pub use rapidbot_human as human;
 pub use rapidbot_physics as physics;
@@ -48,6 +48,6 @@ pub mod prelude {
     pub use crate::math::Vec3;
     pub use crate::nav::Walker;
     pub use crate::{
-        Account, Bot, BotEvent, ClientConfig, ClientError, Controller, Keys, TickContext,
+        Account, Bot, BotEvent, ClientConfig, ClientError, Controller, InputMode, Keys, TickContext,
     };
 }

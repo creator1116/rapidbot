@@ -23,7 +23,7 @@ use rapidbot_protocol::State;
 use crate::bot::{BotEvent, BotLink};
 use crate::controller::{Controller, TickContext};
 use crate::net::{Inbound, PacketSender};
-use crate::{ClientConfig, ClientError, SessionData, clock};
+use crate::{ClientConfig, ClientError, InputMode, SessionData, clock};
 
 pub use frame::DisplaySettings;
 pub use player::LocalPlayer;
@@ -258,6 +258,10 @@ impl Game {
             self.attack_down = false;
             return;
         }
+        if self.config.input_mode == InputMode::Direct {
+            self.direct_input_frame();
+            return;
+        }
         if self.chat_frame(dt) {
             // KeyMapping.releaseAll() when the screen opened.
             self.attack_down = false;
@@ -311,6 +315,30 @@ impl Game {
         if (dx, dy) != (0, 0) {
             self.frames.on_input_received(clock::millis());
             settings.turn_player(player, dx, dy);
+        }
+    }
+
+    /// Direct mode's input frame: no mouse path, no key travel and no
+    /// typing. Chat is the only thing that still belongs between ticks, so
+    /// it keeps vanilla's packet order relative to movement.
+    fn direct_input_frame(&mut self) {
+        if let Some(play) = &mut self.play {
+            play.player.physics.held_keys = self.key_intent;
+        }
+        // A direct click is released before the next tick; a held button
+        // keeps its intent.
+        self.attack_down = self.attack_intent;
+        let lines: Vec<String> = self.chat_queue.drain(..).collect();
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(play) = &mut self.play {
+            for line in lines {
+                let line = crate::chat::normalize(&line);
+                if !line.is_empty() {
+                    play.send_chat_line(&line, &self.net);
+                }
+            }
         }
     }
 
@@ -496,7 +524,7 @@ impl Game {
             }
             let before = (play.player.physics.y_rot, play.player.physics.x_rot);
             // pick(1.0F): what the crosshair is on, before the keybinds.
-            let pick = crate::interact::pick(
+            let mut pick = crate::interact::pick(
                 &play.player.physics,
                 &play.world,
                 &play.entities,
@@ -561,6 +589,30 @@ impl Game {
             };
             self.controller.tick(&mut ctx);
             self.loaded_ticks += 1;
+            let direct = self.config.input_mode == InputMode::Direct;
+            let direct_locked = screen_open || self.packs.as_ref().is_some_and(|p| p.screen_open());
+            if direct {
+                if direct_locked {
+                    play.player.physics.held_keys = Keys::default();
+                } else {
+                    // Direct mode has no mouse path: the requested view is
+                    // the view this tick, and the crosshair is picked again
+                    // from it before any click is handled.
+                    if let Some(aim) = self.aim.take() {
+                        play.player.physics.y_rot = aim.yaw;
+                        play.player.physics.x_rot = aim.pitch.clamp(-90.0, 90.0);
+                        self.frames.on_input_received(clock::millis());
+                    }
+                    pick = crate::interact::pick(
+                        &play.player.physics,
+                        &play.world,
+                        &play.entities,
+                        play.player.id,
+                        &play.tags,
+                    );
+                    play.player.physics.held_keys = self.key_intent;
+                }
+            }
             if !chat_open {
                 if let Some((slot, button, input)) = actions.container_click
                     && let Some(packet) = play.inventory.click(slot, button, input)
@@ -574,14 +626,34 @@ impl Game {
                 }
             }
             if let Some(slot) = actions.select_slot {
-                let pending = self.slot_press.map(|(s, _)| s);
-                if pending != Some(slot) && (pending.is_some() || slot != play.inventory.selected) {
-                    // Finding the number key: quicker than a mouse movement.
-                    let seconds = self.noise.lognormal(0.22, 0.35).clamp(0.08, 1.2);
-                    self.slot_press = Some((slot, (seconds * 20.0).round() as u32));
+                if direct {
+                    if !direct_locked {
+                        self.slot_press = None;
+                        play.inventory.selected = slot;
+                    }
+                } else {
+                    let pending = self.slot_press.map(|(s, _)| s);
+                    if pending != Some(slot)
+                        && (pending.is_some() || slot != play.inventory.selected)
+                    {
+                        // Finding the number key: quicker than a mouse movement.
+                        let seconds = self.noise.lognormal(0.22, 0.35).clamp(0.08, 1.2);
+                        self.slot_press = Some((slot, (seconds * 20.0).round() as u32));
+                    }
                 }
             }
-            if let Some(down) = actions.attack {
+            if direct {
+                if let Some(down) = actions.attack {
+                    self.attack_intent = down;
+                    self.attack_down = down;
+                    self.click_release = None;
+                }
+                if actions.click && !direct_locked {
+                    // A click is a press and release in this tick.
+                    self.attack_clicks += 1;
+                    self.attack_down = true;
+                }
+            } else if let Some(down) = actions.attack {
                 self.attack_intent = down;
                 self.click_release = None;
             } else if let Some(ticks) = self.click_release {
@@ -605,7 +677,7 @@ impl Game {
                 self.use_intent = down;
             }
             // The attack button: startAttack per click, then continueAttack.
-            if screen_open {
+            if screen_open || (direct && direct_locked) {
                 // `missTime = 10000`; clicks go to the screen.
                 play.game_mode.screen_open();
                 self.attack_clicks = 0;
@@ -618,12 +690,20 @@ impl Game {
                 }
                 play.use_button(&self.net, &pick, self.use_intent, use_clicked);
             }
-            if actions.close_container
-                && self.close_press.is_none()
-                && play.inventory.container.is_some()
-            {
-                let seconds = self.noise.lognormal(0.7, 0.4).clamp(0.3, 4.0);
-                self.close_press = Some((seconds * 20.0).round() as u32);
+            if actions.close_container && play.inventory.container.is_some() {
+                if direct {
+                    if let Some(container) = &play.inventory.container {
+                        self.net.send(
+                            &rapidbot_protocol::packets::play::serverbound::ContainerClose {
+                                container_id: container.id,
+                            },
+                        );
+                        play.inventory.close_container();
+                    }
+                } else if self.close_press.is_none() {
+                    let seconds = self.noise.lognormal(0.7, 0.4).clamp(0.3, 4.0);
+                    self.close_press = Some((seconds * 20.0).round() as u32);
+                }
             }
             let after = (play.player.physics.y_rot, play.player.physics.x_rot);
             if before != after {

@@ -32,7 +32,9 @@ lives in `crates/human` and in `nav.rs` / `combat.rs` of the client.
 Bot logic never writes rotation or packets directly. It states intent ("look
 there", "hold forward", "click"), the input model turns that into events over
 the following frames, and the vanilla layer turns input into what the server
-sees.
+sees. `InputMode::Direct` is the explicit test/debug exception: it applies the
+same intent in the current tick without human timing while keeping vanilla
+packet order and gating.
 
 ## Threads and timing
 

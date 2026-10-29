@@ -112,6 +112,12 @@ impl Inventory {
             .any(|s| self.equipped(s).is_some_and(|i| i.can_glide_in(s)))
     }
 
+    /// Leather boots in the feet slot, which allow walking on powder snow.
+    pub fn has_leather_boots(&self) -> bool {
+        self.equipped(EquipmentSlot::Feet)
+            .is_some_and(|item| item.name() == "minecraft:leather_boots")
+    }
+
     /// The hotbar slot holding an item (`minecraft:diamond_pickaxe`).
     pub fn hotbar_slot_of(&self, name: &str) -> Option<u8> {
         (0..9).find(|i| self.hotbar(*i).is_some_and(|s| s.name() == name))
@@ -287,6 +293,31 @@ mod tests {
         inv.set_slot(&set_slot(0, 3, slot::CHEST as i16, &[0]))
             .unwrap();
         assert!(!inv.can_glide());
+    }
+
+    #[test]
+    fn leather_boots_in_the_feet_slot_allow_powder_snow() {
+        let mut inv = Inventory::default();
+        assert!(!inv.has_leather_boots());
+        inv.set_slot(&set_slot(
+            0,
+            1,
+            slot::FEET as i16,
+            &stack_bytes("minecraft:leather_boots", 1),
+        ))
+        .unwrap();
+        assert!(inv.has_leather_boots());
+        // Other armour slots do not count.
+        inv.set_slot(&set_slot(0, 2, slot::FEET as i16, &[0]))
+            .unwrap();
+        inv.set_slot(&set_slot(
+            0,
+            3,
+            slot::HEAD as i16,
+            &stack_bytes("minecraft:leather_boots", 1),
+        ))
+        .unwrap();
+        assert!(!inv.has_leather_boots());
     }
 
     #[test]

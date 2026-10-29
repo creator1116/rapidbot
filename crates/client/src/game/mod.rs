@@ -531,8 +531,10 @@ impl Game {
                     }
                 }
             }
-            // The glide check in aiStep reads the equipment slots.
+            // The glide and powder-snow checks in aiStep read the equipment
+            // slots.
             play.player.physics.has_elytra = play.inventory.can_glide();
+            play.player.physics.has_leather_boots = play.inventory.has_leather_boots();
             // Once the server says an item is in use, its UseEffects come
             // from the hand that started it.
             play.player.sync_use_effects(&play.inventory);

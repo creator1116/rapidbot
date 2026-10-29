@@ -22,7 +22,9 @@ pub struct DeviceCode {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    /// OAuth token responses may omit a rotated refresh token; callers must
+    /// keep the one they already have in that case.
+    refresh_token: Option<String>,
     expires_in: i64,
 }
 
@@ -68,18 +70,13 @@ pub(crate) async fn device_code_login(
             .send()
             .await?;
         if response.status().is_success() {
-            return Ok(to_cached(response.json().await?));
+            return to_cached(response.json().await?, None);
         }
-        let err: ErrorResponse = response.json().await?;
+        let err = error_response(response).await?;
         match err.error.as_str() {
             "authorization_pending" => {}
             "slow_down" => interval += 5,
-            _ => {
-                return Err(AuthError::Microsoft(format!(
-                    "{}: {}",
-                    err.error, err.error_description
-                )));
-            }
+            _ => return Err(error_to_auth(err)),
         }
         debug!("waiting for device code sign-in");
     }
@@ -103,19 +100,35 @@ pub(crate) async fn refresh(
         .send()
         .await?;
     if !response.status().is_success() {
-        let err: ErrorResponse = response.json().await?;
-        return Err(AuthError::Microsoft(format!(
-            "{}: {}",
-            err.error, err.error_description
-        )));
+        return Err(match error_response(response).await {
+            Ok(err) => error_to_auth(err),
+            Err(err) => err,
+        });
     }
-    Ok(to_cached(response.json().await?))
+    to_cached(response.json().await?, Some(refresh_token))
 }
 
-fn to_cached(t: TokenResponse) -> CachedMsa {
-    CachedMsa {
+async fn error_response(response: reqwest::Response) -> Result<ErrorResponse, AuthError> {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    serde_json::from_str(&body).map_err(|_| {
+        let body: String = body.chars().take(500).collect();
+        AuthError::Microsoft(format!("HTTP {status}: {body}"))
+    })
+}
+
+fn error_to_auth(err: ErrorResponse) -> AuthError {
+    AuthError::Microsoft(format!("{}: {}", err.error, err.error_description))
+}
+
+fn to_cached(t: TokenResponse, previous_refresh: Option<&str>) -> Result<CachedMsa, AuthError> {
+    let refresh_token = t
+        .refresh_token
+        .or_else(|| previous_refresh.map(str::to_owned))
+        .ok_or_else(|| AuthError::Microsoft("token response omitted refresh_token".into()))?;
+    Ok(CachedMsa {
         access_token: t.access_token,
-        refresh_token: t.refresh_token,
+        refresh_token,
         expires_at: now_secs() + t.expires_in,
-    }
+    })
 }

@@ -168,10 +168,15 @@ cargo run --release -p rapidbot-client --example join -- play.example.net --micr
 ```
 
 `rapidbot-auth refresh main` renews all cached tokens from the stored refresh
-token without a device-code prompt; it is safe to run from a timer or another
-background task. `rapidbot-auth status` shows the aliases and cached token
-state, and `rapidbot-auth logout main` forgets one. `RAPIDBOT_ACCOUNTS` chooses
-the directory (default `accounts`, which is gitignored).
+token without a device-code prompt; `refresh --all` does that for every alias.
+A background task can use `Authenticator::refresh_if_needed(skew)` instead:
+it returns the cached account when nothing is due, rotates chat keys with the
+current Minecraft token when only the keys are due, and renews the whole chain
+when the Minecraft token is near expiry. `rapidbot-auth list` shows the known
+aliases, `rapidbot-auth status` shows their cached token state, and
+`status --json` is the machine-readable form. `rapidbot-auth logout main`
+forgets one. `RAPIDBOT_ACCOUNTS` chooses the directory (default `accounts`,
+which is gitignored).
 
 ## Configuration
 

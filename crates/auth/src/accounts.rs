@@ -16,7 +16,7 @@ const KEYRING_SERVICE: &str = "rapidbot.minecraft";
 const INDEX: &str = "accounts.json";
 
 /// Cached token state for one account, without exposing the tokens.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountStatus {
     pub alias: String,
     /// Unix seconds; `None` when no Microsoft token is cached.
@@ -227,6 +227,21 @@ mod tests {
             second.keyring_account("main")
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn status_is_serializable() {
+        let status = AccountStatus {
+            alias: "main".into(),
+            msa_expires_at: Some(1),
+            minecraft_expires_at: Some(2),
+            has_refresh_token: true,
+            chat_keys_expire_at: Some(3),
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["alias"], "main");
+        assert_eq!(value["minecraft_expires_at"], 2);
+        assert_eq!(value["has_refresh_token"], true);
     }
 
     #[test]

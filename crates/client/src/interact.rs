@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use rapidbot_physics::attributes;
 use rapidbot_physics::math::Vec3;
 use rapidbot_physics::player::Player;
+use rapidbot_protocol::packets::play::LpVec3;
 use rapidbot_protocol::packets::play::serverbound::{
-    Attack, PlayerAction, PlayerActionKind, Punch, UseItem, UseItemOn,
+    Attack, Interact, PlayerAction, PlayerActionKind, Punch, UseItem, UseItemOn,
 };
 use rapidbot_world::item::ItemStack;
 use rapidbot_world::raycast::{self, BlockHit, Direction};
@@ -299,23 +300,46 @@ pub(crate) struct Hands<'a> {
     pub survival: bool,
 }
 
-/// `MultiPlayerGameMode.useItemOn` for the main hand, without prediction.
-pub(crate) fn send_use_item_on(net: &PacketSender, hit: &BlockHit) {
+/// The first block state of the block an item would place. Approximate:
+/// this uses the registry's first state, which is the default state for
+/// block items with no properties.
+fn placed_state(item: &ItemStack) -> Option<StateId> {
+    let registry = Registry::get();
+    let block = registry.block_by_name(item.name())?;
+    (0..registry.state_count() as StateId).find(|state| registry.state(*state).block == block.id)
+}
+
+/// Whether a block can be replaced by a placement (`BlockPlaceContext`).
+fn replaceable(state: StateId) -> bool {
+    let registry = Registry::get();
+    let info = registry.state(state);
+    info.is_air
+        || !info.fluid.is_empty()
+        || registry.collision_shape(state).is_none()
+        || matches!(
+            registry.block_of(state).name.as_str(),
+            "minecraft:snow"
+                | "minecraft:moss_carpet"
+                | "minecraft:short_grass"
+                | "minecraft:tall_grass"
+        )
+}
+
+/// Where `BlockItem.useOn` would put a block: the clicked block itself when
+/// it can be replaced, otherwise the adjacent block on the clicked face.
+fn placement_pos(h: &Hands<'_>, hit: &BlockHit) -> Option<BlockPos> {
     if hit.miss {
-        return;
+        return None;
     }
-    let (x, y, z) = hit.pos;
-    net.send(&UseItemOn {
-        hand: 0,
-        pos: pack_block_pos(x, y, z),
-        direction: hit.direction as i32,
-        cursor_x: (hit.location[0] - x as f64) as f32,
-        cursor_y: (hit.location[1] - y as f64) as f32,
-        cursor_z: (hit.location[2] - z as f64) as f32,
-        inside: hit.inside,
-        world_border: false,
-        sequence: 0,
-    });
+    let clicked = h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2);
+    let pos = if hit.inside || replaceable(clicked) {
+        hit.pos
+    } else {
+        let (dx, dy, dz) = hit.direction.normal();
+        (hit.pos.0 + dx, hit.pos.1 + dy, hit.pos.2 + dz)
+    };
+    let state = h.world.block_state_or_air(pos.0, pos.1, pos.2);
+    replaceable(state).then_some(pos)
 }
 
 struct ServerVerified {
@@ -363,11 +387,114 @@ impl GameMode {
         }
     }
 
+    /// `MultiPlayerGameMode.useItemOn` for the main hand. Every call takes
+    /// the next prediction sequence; a block item also predicts the block
+    /// it would place, so the server's update for that position is held
+    /// until the acknowledgement.
+    pub(crate) fn use_item_on(&mut self, h: &mut Hands<'_>, hit: &BlockHit) {
+        if hit.miss {
+            return;
+        }
+        let sequence = self.next_sequence();
+        if let Some(item) = h.inventory.held()
+            && let Some(state) = placed_state(item)
+            && let Some(pos) = placement_pos(h, hit)
+        {
+            let obstructed = Registry::get().collision_shape(state).is_some_and(|shape| {
+                shape
+                    .at(pos.0, pos.1, pos.2)
+                    .intersects_box(&h.player.bounding_box())
+            });
+            if !obstructed {
+                self.predict_block(h, pos, state);
+            }
+        }
+        let (x, y, z) = hit.pos;
+        h.net.send(&UseItemOn {
+            hand: 0,
+            pos: pack_block_pos(x, y, z),
+            direction: hit.direction as i32,
+            cursor_x: (hit.location[0] - x as f64) as f32,
+            cursor_y: (hit.location[1] - y as f64) as f32,
+            cursor_z: (hit.location[2] - z as f64) as f32,
+            inside: hit.inside,
+            world_border: false,
+            sequence,
+        });
+    }
+
+    /// `MultiPlayerGameMode.interact`: send `Interact` for the main hand,
+    /// then the off hand when the main hand looks like it would not consume
+    /// the click. The server is authoritative about success.
+    fn use_entity(&mut self, h: &mut Hands<'_>, hit: &EntityHit) {
+        let Some(target) = h.entities.get(hit.id) else {
+            return;
+        };
+        let location = LpVec3 {
+            x: hit.location[0] - target.pos.x,
+            y: hit.location[1] - target.pos.y,
+            z: hit.location[2] - target.pos.z,
+        };
+        let secondary = h.player.key_presses.shift;
+        for hand in 0..2 {
+            let stack = if hand == 0 {
+                h.inventory.held()
+            } else {
+                h.inventory.offhand()
+            };
+            // Vanilla sends the main hand even with an empty hand; the off
+            // hand follows only if the first interaction is not consumed.
+            h.net.send(&Interact {
+                entity_id: target.id,
+                hand,
+                location,
+                using_secondary_action: secondary,
+            });
+            if Self::likely_entity_interact(stack, target) {
+                // The local interaction is predicted to succeed and swing,
+                // except for `interaction` entities, which consume without
+                // an animation.
+                if !target.info().is("Interaction") {
+                    h.net.send(&Punch);
+                }
+                break;
+            }
+        }
+    }
+
+    /// Whether a held stack looks like it would consume an entity click.
+    /// This is a prediction only; the server decides and may resync.
+    fn likely_entity_interact(stack: Option<&ItemStack>, target: &Entity) -> bool {
+        let info = target.info();
+        if info.is("ItemFrame") {
+            return stack.is_some() || target.framed_item().is_some();
+        }
+        if info.is("Interaction") {
+            return true;
+        }
+        stack.is_some_and(|stack| {
+            stack.has("minecraft:food")
+                || stack.has("minecraft:equippable")
+                || stack.name().ends_with("_spawn_egg")
+                || matches!(
+                    stack.name(),
+                    "minecraft:lead"
+                        | "minecraft:name_tag"
+                        | "minecraft:shears"
+                        | "minecraft:bucket"
+                        | "minecraft:water_bucket"
+                        | "minecraft:lava_bucket"
+                        | "minecraft:milk_bucket"
+                )
+        })
+    }
+
     /// `Minecraft.startUseItem` and the use half of `handleKeybinds`.
     ///
     /// `down` is the use button; `clicked` is a fresh press this tick.
     /// With nothing under the crosshair this sends `UseItem` for the main
-    /// hand, then the off hand. On a block it sends `UseItemOn` instead.
+    /// hand, then the off hand. On a block it sends `UseItemOn` instead, and
+    /// on an entity it sends `Interact`.
     pub fn use_button(&mut self, h: &mut Hands<'_>, pick: &Pick, down: bool, clicked: bool) {
         if h.player.spectator {
             return;
@@ -392,13 +519,12 @@ impl GameMode {
             return;
         }
         self.right_click_delay = 4;
-        if pick.entity.is_some() {
-            // Entity interaction is not modeled yet. Do not turn it into
-            // an item use aimed at the entity.
+        if let Some(entity) = pick.entity {
+            self.use_entity(h, &entity);
             return;
         }
         if !pick.block.miss {
-            send_use_item_on(h.net, &pick.block);
+            self.use_item_on(h, &pick.block);
             return;
         }
         let y_rot = h.player.y_rot;
@@ -907,7 +1033,7 @@ impl GameMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rapidbot_buf::{Decode, VarInt};
+    use rapidbot_buf::{Decode, Encode, VarInt};
     use rapidbot_protocol::Packet;
     use rapidbot_world::DimensionHeight;
     use rapidbot_world::chunk::Chunk;
@@ -1378,6 +1504,75 @@ mod tests {
         scene.inventory.set_player_inventory(&body).unwrap();
         scene.tick(0, false);
         assert_eq!(scene.mode.attack_strength(&scene.player, 0.0), 0.0);
+    }
+
+    /// A right click on an entity sends `Interact` with the hit point
+    /// relative to the entity, and falls through to the off hand.
+    #[test]
+    fn right_clicks_entities() {
+        let mut scene = Scene::new();
+        scene.player.x_rot = 0.0;
+        spawn(&mut scene, "minecraft:zombie", [2.5, 64.0, 0.5]);
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [Interact::ID, Interact::ID]
+        );
+        let main = Interact::decode(&mut &packets[0].1[..]).unwrap();
+        assert_eq!((main.entity_id, main.hand), (7, 0));
+        assert!(!main.using_secondary_action);
+        assert!((main.location.x + 0.3).abs() < 0.01);
+        assert!((main.location.y - 1.62).abs() < 0.02);
+        assert!(main.location.z.abs() < 0.01);
+        assert_eq!(Interact::decode(&mut &packets[1].1[..]).unwrap().hand, 1);
+    }
+
+    /// Item frames and interaction entities are picked with their real
+    /// boxes, rather than being left out of entity picking.
+    #[test]
+    fn picks_item_frames_and_interactions() {
+        let mut scene = Scene::new();
+        scene.player.x_rot = 0.0;
+        spawn(&mut scene, "minecraft:item_frame", [2.0, 65.5, 0.5]);
+        let hit = pick(&scene.player, &scene.world, &scene.entities, 1, &scene.tags);
+        assert_eq!(hit.entity.map(|e| e.id), Some(7));
+
+        let mut scene = Scene::new();
+        scene.player.x_rot = 0.0;
+        spawn(&mut scene, "minecraft:interaction", [2.0, 64.0, 0.5]);
+        let mut data = vec![8u8, 3];
+        2.0f32.encode(&mut data);
+        data.extend_from_slice(&[9, 3]);
+        3.0f32.encode(&mut data);
+        data.push(0xff);
+        scene.entities.set_entity_data(7, &data).unwrap();
+        let hit = pick(&scene.player, &scene.world, &scene.entities, 1, &scene.tags);
+        assert_eq!(hit.entity.map(|e| e.id), Some(7));
+    }
+
+    /// A block item predicts the block it places and sends that prediction's
+    /// sequence; the server's answer is held until its acknowledgement.
+    #[test]
+    fn use_on_a_block_predicts_placement() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:stone");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+        let use_on = UseItemOn::decode(&mut &packets[0].1[..]).unwrap();
+        assert_eq!(use_on.sequence, 1);
+        let stone = state("minecraft:stone");
+        assert_eq!(scene.world.block_state(1, 65, 0), Some(stone));
+
+        // The server disagrees. Its update waits for the ack, then wins.
+        assert!(scene.mode.server_block((1, 65, 0), AIR));
+        assert_eq!(scene.world.block_state(1, 65, 0), Some(stone));
+        scene
+            .mode
+            .block_changed_ack(1, &mut scene.world, &mut scene.player);
+        assert_eq!(scene.world.block_state(1, 65, 0), Some(AIR));
     }
 
     /// A held use button repeats only after the four-tick right-click

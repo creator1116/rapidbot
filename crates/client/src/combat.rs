@@ -45,6 +45,13 @@ pub struct Fighter {
     pub approach: bool,
     /// Sprint while approaching.
     pub sprint: bool,
+    /// Circle the target while in reach, rather than standing still.
+    pub strafe: bool,
+    /// Back away when the target is closer than `keep_distance`.
+    pub retreat: bool,
+    /// Which way to circle: -1 left, 1 right.
+    strafe_direction: f32,
+    ticks_until_strafe_change: u32,
 }
 
 impl Fighter {
@@ -59,6 +66,10 @@ impl Fighter {
             keep_distance: 1.9,
             approach: true,
             sprint: true,
+            strafe: true,
+            retreat: true,
+            strafe_direction: 1.0,
+            ticks_until_strafe_change: 0,
         }
     }
 
@@ -67,6 +78,7 @@ impl Fighter {
         if self.target != id {
             self.target = id;
             self.swing_in = None;
+            self.ticks_until_strafe_change = 0;
         }
     }
 
@@ -81,6 +93,23 @@ impl Fighter {
         } else {
             self.noise.uniform(0.8, 1.0) as f32
         };
+    }
+
+    /// The movement keys for a target `horizontal` blocks away (eye to
+    /// body axis): approach when far, circle while in reach, and back off
+    /// when the target gets too close.
+    fn movement_keys(&self, horizontal: f64) -> Keys {
+        let forward = self.approach && horizontal > self.keep_distance;
+        let backward = self.retreat && horizontal < self.keep_distance * 0.65;
+        let circle = self.strafe && horizontal <= self.keep_distance && !backward;
+        Keys {
+            forward,
+            backward,
+            left: circle && self.strafe_direction < 0.0,
+            right: circle && self.strafe_direction > 0.0,
+            sprint: forward && self.sprint,
+            ..Keys::default()
+        }
     }
 
     /// One tick of fighting. Sets the aim and the movement keys, and asks
@@ -112,15 +141,17 @@ impl Fighter {
         let reachable = ctx.entity_aim_point(id, self.aim_height);
         ctx.aim_at(reachable.unwrap_or(body), 1.5);
 
-        if self.approach {
-            // Keep running at it until well inside reach, as people do:
-            // the first hit of an approach is usually a sprint hit.
-            let forward = horizontal > self.keep_distance;
-            ctx.set_keys(Keys {
-                forward,
-                sprint: forward && self.sprint,
-                ..Keys::default()
-            });
+        if self.strafe {
+            if self.ticks_until_strafe_change == 0 {
+                self.strafe_direction = if self.noise.chance(0.5) { -1.0 } else { 1.0 };
+                self.ticks_until_strafe_change = (self.noise.uniform(0.8, 2.2) * 20.0) as u32;
+            } else {
+                self.ticks_until_strafe_change -= 1;
+            }
+        }
+
+        if self.approach || self.strafe || self.retreat {
+            ctx.set_keys(self.movement_keys(horizontal));
         }
 
         let on_target = ctx.target.is_some_and(|hit| hit.id == id);
@@ -152,5 +183,35 @@ impl Fighter {
                 FightStatus::Engaged
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fights_at_a_distance_with_strafing_and_retreat() {
+        let mut fighter = Fighter::new(1);
+        fighter.strafe = true;
+        fighter.retreat = true;
+        fighter.strafe_direction = 1.0;
+        fighter.keep_distance = 2.0;
+
+        let far = fighter.movement_keys(4.0);
+        assert!(far.forward && far.sprint);
+        assert!(!far.left && !far.right && !far.backward);
+
+        let in_reach = fighter.movement_keys(2.0);
+        assert!(!in_reach.forward && !in_reach.backward);
+        assert!(in_reach.right && !in_reach.left);
+
+        fighter.strafe_direction = -1.0;
+        let other_way = fighter.movement_keys(2.0);
+        assert!(other_way.left && !other_way.right);
+
+        let close = fighter.movement_keys(1.0);
+        assert!(close.backward && !close.forward);
+        assert!(!close.left && !close.right);
     }
 }

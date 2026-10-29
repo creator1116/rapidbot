@@ -562,7 +562,7 @@ pub mod serverbound {
     pub use super::common_serverbound::*;
     use rapidbot_buf::{Decode, DecodeError, Encode, VarInt};
 
-    use super::{Input, Vec3};
+    use super::{Input, LpVec3, Vec3};
     use crate::packets::packet;
 
     /// `ServerboundAcceptTeleportationPacket`: the teleport ID plus where
@@ -858,6 +858,23 @@ pub mod serverbound {
     }
     packet!(Attack, play, serverbound, ATTACK);
 
+    /// `ServerboundInteractPacket`: a right click on an entity.
+    ///
+    /// `entity_id` is the target entity, `hand` an `InteractionHand`
+    /// (`0` main hand, `1` off hand), and `location` is the hit point
+    /// relative to the entity's position, packed as an `LpVec3`.
+    /// `using_secondary_action` is the sneak key.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct Interact {
+        #[var]
+        pub entity_id: i32,
+        #[var]
+        pub hand: i32,
+        pub location: LpVec3,
+        pub using_secondary_action: bool,
+    }
+    packet!(Interact, play, serverbound, INTERACT);
+
     /// `ServerboundPunchPacket`: the arm swung at something.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
     pub struct Punch;
@@ -982,6 +999,43 @@ mod tests {
                 Err(rapidbot_buf::DecodeError::InvalidDiscriminant { ty: "optional game type", value }) if value == wire
             ));
         }
+    }
+
+    #[test]
+    fn interact_uses_vanilla_field_order() {
+        let packet = serverbound::Interact {
+            entity_id: 300,
+            hand: 1,
+            location: LpVec3 {
+                x: 0.5,
+                y: 0.25,
+                z: -0.5,
+            },
+            using_secondary_action: true,
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        // Entity ID and hand are VarInts.
+        let mut body = bytes.as_slice();
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 300);
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 1);
+        // The relative hit point follows as an LpVec3, then the sneak flag.
+        let location = LpVec3::decode(&mut body).unwrap();
+        assert!((location.x - 0.5).abs() < 0.001);
+        assert!((location.y - 0.25).abs() < 0.001);
+        assert!((location.z + 0.5).abs() < 0.001);
+        assert_eq!(*body, [1]);
+        let decoded = serverbound::Interact::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            (
+                decoded.entity_id,
+                decoded.hand,
+                decoded.using_secondary_action
+            ),
+            (300, 1, true)
+        );
+        assert!((decoded.location.x - packet.location.x).abs() < 0.001);
+        assert!((decoded.location.y - packet.location.y).abs() < 0.001);
+        assert!((decoded.location.z - packet.location.z).abs() < 0.001);
     }
 
     #[test]

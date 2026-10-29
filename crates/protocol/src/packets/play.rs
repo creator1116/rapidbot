@@ -426,6 +426,73 @@ pub mod clientbound {
     }
     packet!(PlayerAbilities, play, clientbound, PLAYER_ABILITIES);
 
+    /// `ClientboundInitializeBorderPacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct InitializeBorder {
+        pub center_x: f64,
+        pub center_z: f64,
+        pub old_size: f64,
+        pub new_size: f64,
+        pub lerp_time: rapidbot_buf::VarLong,
+        #[var]
+        pub absolute_max_size: i32,
+        #[var]
+        pub warning_blocks: i32,
+        #[var]
+        pub warning_time: i32,
+    }
+    packet!(InitializeBorder, play, clientbound, INITIALIZE_BORDER);
+
+    /// `ClientboundSetBorderCenterPacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct SetBorderCenter {
+        pub center_x: f64,
+        pub center_z: f64,
+    }
+    packet!(SetBorderCenter, play, clientbound, SET_BORDER_CENTER);
+
+    /// `ClientboundSetBorderLerpSizePacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct SetBorderLerpSize {
+        pub old_size: f64,
+        pub new_size: f64,
+        pub lerp_time: rapidbot_buf::VarLong,
+    }
+    packet!(SetBorderLerpSize, play, clientbound, SET_BORDER_LERP_SIZE);
+
+    /// `ClientboundSetBorderSizePacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct SetBorderSize {
+        pub size: f64,
+    }
+    packet!(SetBorderSize, play, clientbound, SET_BORDER_SIZE);
+
+    /// `ClientboundSetBorderWarningDelayPacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct SetBorderWarningDelay {
+        #[var]
+        pub warning_delay: i32,
+    }
+    packet!(
+        SetBorderWarningDelay,
+        play,
+        clientbound,
+        SET_BORDER_WARNING_DELAY
+    );
+
+    /// `ClientboundSetBorderWarningDistancePacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct SetBorderWarningDistance {
+        #[var]
+        pub warning_blocks: i32,
+    }
+    packet!(
+        SetBorderWarningDistance,
+        play,
+        clientbound,
+        SET_BORDER_WARNING_DISTANCE
+    );
+
     /// `ClientboundSetHealthPacket`.
     #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
     pub struct SetHealth {

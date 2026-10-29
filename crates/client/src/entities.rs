@@ -11,10 +11,10 @@ use rapidbot_buf::{BoundedString, ByteArray, Decode, DecodeError, VarInt};
 use rapidbot_physics::math::{self, Vec3};
 use rapidbot_protocol::packets::login::ProfileProperty;
 use rapidbot_protocol::packets::play::{LpVec3, PositionMoveRotation};
-use rapidbot_world::Registry;
 use rapidbot_world::item::ItemStack;
 use rapidbot_world::registry::{EntityKind, Interpolation};
 use rapidbot_world::tags::Tags;
+use rapidbot_world::{Aabb, Registry};
 use uuid::Uuid;
 
 /// `Pose` IDs.
@@ -712,6 +712,29 @@ impl Entities {
 
     pub fn iter(&self) -> impl Iterator<Item = &Entity> {
         self.by_id.values()
+    }
+
+    /// `Level.getEntityCollisions` for the local player: entity boxes that
+    /// stop movement (`canBeCollidedWith`). `player_bottom` is used by the
+    /// happy ghast's client-side above-the-box rule.
+    pub fn collision_boxes(&self, player_bottom: f64) -> Vec<Aabb> {
+        self.by_id
+            .values()
+            .filter_map(|entity| {
+                let info = entity.info();
+                let alive = entity.health.is_none_or(|h| h > 0.0);
+                let collides = info.is("AbstractBoat")
+                    || (info.is("Shulker") && alive)
+                    || (info.is("HappyGhast")
+                        && alive
+                        && player_bottom >= entity.bounding_box().1[1]);
+                if !collides {
+                    return None;
+                }
+                let (min, max) = entity.bounding_box();
+                Some(Aabb::new(min[0], min[1], min[2], max[0], max[1], max[2]))
+            })
+            .collect()
     }
 
     /// All currently tracked player entities, independent of tab-list

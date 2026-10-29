@@ -598,6 +598,37 @@ impl Game {
                     play.player.physics.delta_movement = v;
                 }
             }
+            cb::SetPassengers::ID => {
+                let passengers = packet.decode::<cb::SetPassengers>()?;
+                let ids: Vec<i32> = passengers.passengers.iter().map(|id| id.0).collect();
+                let play = play_mut(&mut self.play)?;
+                if let Some(vehicle) = play.entities.get(passengers.vehicle) {
+                    if ids.contains(&play.player.id) {
+                        let authoritative = vehicle.is_local_authoritative_vehicle()
+                            && ids.first() == Some(&play.player.id);
+                        play.player.set_passengers(vehicle, &ids, authoritative);
+                    } else if play.player.riding_vehicle() == Some(passengers.vehicle) {
+                        play.player.dismount();
+                    }
+                } else {
+                    warn!(
+                        vehicle = passengers.vehicle,
+                        "passengers for unknown entity"
+                    );
+                }
+            }
+            cb::MoveVehicle::ID => {
+                let motion = packet.decode::<cb::MoveVehicle>()?;
+                let play = play_mut(&mut self.play)?;
+                if play.player.riding_vehicle().is_some()
+                    && play
+                        .player
+                        .snap_vehicle(&mut play.entities, motion.moving_to)
+                    && let Some(echo) = play.player.serverbound_vehicle()
+                {
+                    self.net.send(&echo);
+                }
+            }
             cb::Explode::ID => {
                 let explode = packet.decode::<cb::Explode>()?;
                 let play = play_mut(&mut self.play)?;

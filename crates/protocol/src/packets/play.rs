@@ -22,6 +22,15 @@ pub struct PositionMoveRotation {
     pub x_rot: f32,
 }
 
+/// `PositionAndRotation.STREAM_CODEC`: position, yaw and pitch, without the
+/// movement delta `PositionMoveRotation` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+pub struct PositionAndRotation {
+    pub position: Vec3,
+    pub y_rot: f32,
+    pub x_rot: f32,
+}
+
 /// `Relative` bit flags (`Relative.SET_STREAM_CODEC`, an int).
 pub mod relative {
     pub const X: i32 = 1 << 0;
@@ -452,6 +461,24 @@ pub mod clientbound {
     }
     packet!(SetEntityMotion, play, clientbound, SET_ENTITY_MOTION);
 
+    /// `ClientboundSetPassengersPacket`: which entities ride a vehicle, in
+    /// seat order.
+    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+    pub struct SetPassengers {
+        #[var]
+        pub vehicle: i32,
+        pub passengers: Vec<rapidbot_buf::VarInt>,
+    }
+    packet!(SetPassengers, play, clientbound, SET_PASSENGERS);
+
+    /// `ClientboundMoveVehiclePacket`: the authoritative position of the
+    /// vehicle the client controls.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct MoveVehicle {
+        pub moving_to: super::PositionAndRotation,
+    }
+    packet!(MoveVehicle, play, clientbound, MOVE_VEHICLE);
+
     /// `ClientboundPlayerLookAtPacket`: the server turns the player to face
     /// a point (or an entity, whose position the client looks up).
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -562,7 +589,7 @@ pub mod serverbound {
     pub use super::common_serverbound::*;
     use rapidbot_buf::{Decode, DecodeError, Encode, VarInt};
 
-    use super::{Input, LpVec3, Vec3};
+    use super::{Input, LpVec3, PositionAndRotation, Vec3};
     use crate::packets::packet;
 
     /// `ServerboundAcceptTeleportationPacket`: the teleport ID plus where
@@ -606,6 +633,14 @@ pub mod serverbound {
         pub flags: u8,
     }
     packet!(MovePlayerRot, play, serverbound, MOVE_PLAYER_ROT);
+
+    /// `ServerboundMoveVehiclePacket`: the position of a locally controlled
+    /// vehicle.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct MoveVehicle {
+        pub moving_to: PositionAndRotation,
+    }
+    packet!(MoveVehicle, play, serverbound, MOVE_VEHICLE);
 
     /// `ServerboundMovePlayerPacket.StatusOnly`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -1167,6 +1202,51 @@ mod tests {
                 Err(rapidbot_buf::DecodeError::InvalidDiscriminant { ty: "optional game type", value }) if value == wire
             ));
         }
+    }
+
+    #[test]
+    fn set_passengers_is_a_varint_list() {
+        let packet = clientbound::SetPassengers {
+            vehicle: 300,
+            passengers: vec![rapidbot_buf::VarInt(7), rapidbot_buf::VarInt(9)],
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        let mut body = bytes.as_slice();
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 300);
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 2);
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 7);
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 9);
+        assert!(body.is_empty());
+        assert_eq!(
+            clientbound::SetPassengers::decode(&mut bytes.as_slice()),
+            Ok(packet)
+        );
+    }
+
+    #[test]
+    fn move_vehicle_is_position_then_rotation() {
+        let packet = serverbound::MoveVehicle {
+            moving_to: PositionAndRotation {
+                position: Vec3 {
+                    x: 1.5,
+                    y: 64.0,
+                    z: -2.5,
+                },
+                y_rot: 90.0,
+                x_rot: -30.0,
+            },
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..8], &1.5f64.to_be_bytes());
+        assert_eq!(&bytes[8..16], &64.0f64.to_be_bytes());
+        assert_eq!(&bytes[16..24], &(-2.5f64).to_be_bytes());
+        assert_eq!(&bytes[24..28], &90.0f32.to_be_bytes());
+        assert_eq!(&bytes[28..32], &(-30.0f32).to_be_bytes());
+        assert_eq!(
+            serverbound::MoveVehicle::decode(&mut bytes.as_slice()),
+            Ok(packet)
+        );
     }
 
     #[test]

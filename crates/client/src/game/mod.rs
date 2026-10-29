@@ -715,6 +715,8 @@ impl Game {
 
             // level.tickEntities() → LocalPlayer.tick()
             if !play.player.is_riding() {
+                play.player.physics.entity_colliders =
+                    play.entities.collision_boxes(play.player.physics.pos.y);
                 play.player.physics.tick(&play.world, &play.tags);
             }
             // The end of Player.tick: the attack charge.

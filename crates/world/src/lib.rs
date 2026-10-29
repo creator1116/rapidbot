@@ -1,6 +1,7 @@
 //! Block data, chunk storage and vanilla-exact block collision.
 
 pub mod aabb;
+pub mod border;
 pub mod chunk;
 pub mod collision;
 pub mod fluid;
@@ -12,6 +13,7 @@ pub mod tags;
 pub mod world;
 
 pub use aabb::{Aabb, Axis};
+pub use border::WorldBorder;
 pub use registry::{AIR, Registry, StateId};
 pub use world::{DimensionHeight, World};
 

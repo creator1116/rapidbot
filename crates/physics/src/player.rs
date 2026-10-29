@@ -25,7 +25,7 @@ use rapidbot_world::collision::{
 use rapidbot_world::fluid::{self, FluidKind};
 use rapidbot_world::shape::PlacedShape;
 use rapidbot_world::tags::Tags;
-use rapidbot_world::{Aabb, Axis, Registry, World};
+use rapidbot_world::{Aabb, Axis, Registry, World, WorldBorder};
 
 use crate::attributes::{self, Attributes, Operation};
 use crate::math::{self, DEG_TO_RAD, Vec3};
@@ -225,6 +225,12 @@ pub struct Player {
     /// Lava currents are three times stronger in the Nether
     /// (`EnvironmentAttributes.FAST_LAVA`).
     pub fast_lava: bool,
+    /// The level's world border, updated by border packets and ticked with
+    /// the player.
+    pub world_border: WorldBorder,
+    /// Bounding boxes of entities that collide with the player (boats,
+    /// shulkers, happy ghasts), refreshed from the entity tracker.
+    pub entity_colliders: Vec<Aabb>,
 }
 
 impl Player {
@@ -285,6 +291,8 @@ impl Player {
             movements: Vec::new(),
             old_pos: Vec3::ZERO,
             fast_lava: false,
+            world_border: WorldBorder::default(),
+            entity_colliders: Vec::new(),
         }
     }
 
@@ -606,6 +614,7 @@ impl Player {
     /// `LocalPlayer.tick` → `Player.tick` → `LivingEntity.tick`, movement
     /// parts, for a player whose client has loaded.
     pub fn tick(&mut self, world: &World, tags: &Tags) {
+        self.world_border.tick();
         let ctx = Ctx {
             world,
             registry: Registry::get(),
@@ -614,6 +623,8 @@ impl Player {
             descending: self.held_keys.shift,
             fall_distance: self.fall_distance,
             can_walk_on_powder_snow: self.has_leather_boots,
+            world_border: self.world_border,
+            entity_colliders: self.entity_colliders.clone(),
         };
 
         // Player.tick
@@ -1761,17 +1772,24 @@ impl Player {
     /// `Entity.collide`, with step-up.
     fn collide(&self, ctx: &Ctx<'_>, movement: Vec3) -> Vec3 {
         let aabb = self.bb;
+        let max_up_step = self.max_up_step();
         let movement_step = if movement.length_sqr() == 0.0 {
             movement
         } else {
-            let colliders = ctx.colliders(&aabb.expand_towards(movement.x, movement.y, movement.z));
-            collide_with_shapes(movement, &aabb, &colliders)
+            let expanded = aabb.expand_towards(movement.x, movement.y, movement.z);
+            let search = expanded.expand_towards(0.0, max_up_step as f64, 0.0);
+            let boxes = ctx.entity_boxes(&search);
+            let colliders = ctx.colliders(&expanded);
+            let border = ctx
+                .world_border
+                .is_inside_close_to_border(self.pos.x, self.pos.z, &expanded)
+                .then_some(&ctx.world_border);
+            collide_with_shapes(movement, &aabb, &colliders, &boxes, border)
         };
         let x_collision = movement.x != movement_step.x;
         let y_collision = movement.y != movement_step.y;
         let z_collision = movement.z != movement_step.z;
         let on_ground_after_collision = y_collision && movement.y < 0.0;
-        let max_up_step = self.max_up_step();
 
         if max_up_step > 0.0
             && (on_ground_after_collision || self.on_ground)
@@ -1787,10 +1805,12 @@ impl Player {
                 step_up = step_up.expand_towards(0.0, -1.0e-5f32 as f64, 0.0);
             }
             let colliders = ctx.colliders(&step_up);
+            let boxes = ctx.entity_boxes(&step_up);
             let step_height_to_skip = movement_step.y as f32;
             for candidate in collect_candidate_step_up_heights(
                 &grounded,
                 &colliders,
+                &boxes,
                 max_up_step,
                 step_height_to_skip,
             ) {
@@ -1798,6 +1818,8 @@ impl Player {
                     Vec3::new(movement.x, candidate as f64, movement.z),
                     &grounded,
                     &colliders,
+                    &boxes,
+                    None,
                 );
                 if step.horizontal_distance_sqr() > movement_step.horizontal_distance_sqr() {
                     let distance_to_ground = aabb.min_y - grounded.min_y;
@@ -1978,6 +2000,8 @@ pub struct Ctx<'a> {
     descending: bool,
     fall_distance: f64,
     can_walk_on_powder_snow: bool,
+    world_border: WorldBorder,
+    entity_colliders: Vec<Aabb>,
 }
 
 impl Ctx<'_> {
@@ -1997,6 +2021,18 @@ impl Ctx<'_> {
 
     fn no_collision(&self, bbox: &Aabb) -> bool {
         self.colliders(bbox).is_empty()
+            && !self
+                .entity_colliders
+                .iter()
+                .any(|b| b.intersects_aabb(bbox))
+    }
+
+    fn entity_boxes(&self, bbox: &Aabb) -> Vec<Aabb> {
+        self.entity_colliders
+            .iter()
+            .copied()
+            .filter(|b| b.intersects_aabb(bbox))
+            .collect()
     }
 
     fn block_at(&self, pos: (i32, i32, i32)) -> &'static rapidbot_world::registry::BlockInfo {
@@ -2079,8 +2115,14 @@ fn java_min_f32(a: f32, b: f32) -> f32 {
 }
 
 /// `Entity.collideWithShapes`.
-fn collide_with_shapes(movement: Vec3, bbox: &Aabb, shapes: &[PlacedShape<'_>]) -> Vec3 {
-    if shapes.is_empty() {
+fn collide_with_shapes(
+    movement: Vec3,
+    bbox: &Aabb,
+    shapes: &[PlacedShape<'_>],
+    boxes: &[Aabb],
+    border: Option<&WorldBorder>,
+) -> Vec3 {
+    if shapes.is_empty() && boxes.is_empty() && border.is_none() {
         return movement;
     }
     let mut resolved = Vec3::ZERO;
@@ -2094,11 +2136,51 @@ fn collide_with_shapes(movement: Vec3, bbox: &Aabb, shapes: &[PlacedShape<'_>]) 
         let axis_movement = movement.get(axis);
         if axis_movement != 0.0 {
             let moved = bbox.move_by(resolved.x, resolved.y, resolved.z);
-            let collision = shapes_collide(axis, &moved, shapes, axis_movement);
+            let mut distance = if let Some(border) = border {
+                border.collide(axis, &moved, axis_movement)
+            } else {
+                axis_movement
+            };
+            distance = collide_boxes(axis, &moved, boxes, distance);
+            let collision = shapes_collide(axis, &moved, shapes, distance);
             resolved = resolved.with(axis, collision);
         }
     }
     resolved
+}
+
+/// The AABB part of `Shapes.collide`: an entity collider is the shape of its
+/// bounding box.
+fn collide_boxes(axis: Axis, moving: &Aabb, boxes: &[Aabb], mut distance: f64) -> f64 {
+    const EPSILON: f64 = 1.0e-7;
+    if distance.abs() < EPSILON {
+        return 0.0;
+    }
+    let (b_axis, c_axis) = axis.cycle();
+    for collider in boxes {
+        let overlaps = moving.max(b_axis) > collider.min(b_axis) + EPSILON
+            && moving.min(b_axis) < collider.max(b_axis) - EPSILON
+            && moving.max(c_axis) > collider.min(c_axis) + EPSILON
+            && moving.min(c_axis) < collider.max(c_axis) - EPSILON;
+        if !overlaps {
+            continue;
+        }
+        if distance > 0.0 {
+            let new_distance = collider.min(axis) - moving.max(axis);
+            if new_distance >= -EPSILON {
+                distance = distance.min(new_distance);
+            }
+        } else if distance < 0.0 {
+            let new_distance = collider.max(axis) - moving.min(axis);
+            if new_distance <= EPSILON {
+                distance = distance.max(new_distance);
+            }
+        }
+        if distance.abs() < EPSILON {
+            return 0.0;
+        }
+    }
+    distance
 }
 
 /// `Entity.collectCandidateStepUpHeights`: distinct Y coordinates of the
@@ -2107,6 +2189,7 @@ fn collide_with_shapes(movement: Vec3, bbox: &Aabb, shapes: &[PlacedShape<'_>]) 
 fn collect_candidate_step_up_heights(
     bbox: &Aabb,
     colliders: &[PlacedShape<'_>],
+    boxes: &[Aabb],
     max_step: f32,
     skip: f32,
 ) -> Vec<f32> {
@@ -2122,6 +2205,18 @@ fn collect_candidate_step_up_heights(
                 if !candidates.contains(&relative) {
                     candidates.push(relative);
                 }
+            }
+        }
+    }
+    for collider in boxes {
+        for coord in [collider.min_y, collider.max_y] {
+            let relative = (coord - bbox.min_y) as f32;
+            if !(relative < 0.0)
+                && relative != skip
+                && relative <= max_step
+                && !candidates.contains(&relative)
+            {
+                candidates.push(relative);
             }
         }
     }

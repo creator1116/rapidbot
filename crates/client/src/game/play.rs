@@ -682,7 +682,12 @@ impl Game {
             }
             cb::SystemChat::ID => {
                 let chat = packet.decode::<cb::SystemChat>()?;
-                let text = crate::text::nbt_to_plain(&chat.content);
+                let text = match &self.packs {
+                    Some(packs) => {
+                        crate::text::nbt_to_plain_translated(&chat.content, packs.translations())
+                    }
+                    None => crate::text::nbt_to_plain(&chat.content),
+                };
                 debug!(overlay = chat.overlay, "system chat: {text}");
                 self.link.emit(crate::BotEvent::SystemMessage {
                     text,
@@ -790,7 +795,13 @@ impl Game {
             },
             ids::DISGUISED_CHAT | ids::SET_TITLE_TEXT => {
                 let mut body = packet.body.as_slice();
-                let text = crate::text::nbt_to_plain(&rapidbot_nbt::Tag::decode(&mut body)?);
+                let content = rapidbot_nbt::Tag::decode(&mut body)?;
+                let text = match &self.packs {
+                    Some(packs) => {
+                        crate::text::nbt_to_plain_translated(&content, packs.translations())
+                    }
+                    None => crate::text::nbt_to_plain(&content),
+                };
                 debug!("message: {text}");
             }
             cb::UpdateTags::ID => {

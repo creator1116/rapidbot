@@ -36,6 +36,34 @@ pub mod titles {
     pub const MINECRAFT_JAVA: &str = "00000000402b5328";
 }
 
+/// Token endpoint URLs. Tests point these at a local server so the whole
+/// renewal chain can run without contacting Microsoft.
+#[derive(Debug, Clone)]
+pub(crate) struct Endpoints {
+    pub microsoft_device_code: String,
+    pub microsoft_token: String,
+    pub xbox_user_auth: String,
+    pub xbox_xsts: String,
+    pub minecraft_login: String,
+    pub minecraft_profile: String,
+    pub minecraft_certificates: String,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            microsoft_device_code: "https://login.live.com/oauth20_connect.srf".into(),
+            microsoft_token: "https://login.live.com/oauth20_token.srf".into(),
+            xbox_user_auth: "https://user.auth.xboxlive.com/user/authenticate".into(),
+            xbox_xsts: "https://xsts.auth.xboxlive.com/xsts/authorize".into(),
+            minecraft_login: "https://api.minecraftservices.com/authentication/login_with_xbox"
+                .into(),
+            minecraft_profile: "https://api.minecraftservices.com/minecraft/profile".into(),
+            minecraft_certificates: "https://api.minecraftservices.com/player/certificates".into(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("HTTP: {0}")]
@@ -48,6 +76,8 @@ pub enum AuthError {
     Store(String),
     #[error("Microsoft login: {0}")]
     Microsoft(String),
+    #[error("no cached Microsoft refresh token; sign in first")]
+    NoRefreshToken,
     #[error("device code expired before it was used")]
     DeviceCodeExpired,
     #[error("Xbox Live: {0}")]
@@ -64,16 +94,20 @@ pub struct MinecraftAccount {
     pub name: String,
     pub id: Uuid,
     pub access_token: String,
-    /// Chat signing keys, present when [`Authenticator::login`] fetched them.
+    /// Chat signing keys, when [`Authenticator::login`] or
+    /// [`Authenticator::refresh`] fetched them.
     pub chat_keys: Option<ChatKeys>,
 }
 
 pub struct Authenticator {
     http: reqwest::Client,
     client_id: String,
+    endpoints: Endpoints,
     store: Box<dyn TokenStore>,
     cache: TokenCache,
 }
+
+pub(crate) const REFRESH_SKEW_SECS: i64 = 300;
 
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -90,13 +124,26 @@ impl Authenticator {
 
     /// Loads (or starts) a cache from any [`TokenStore`].
     pub fn with_store(store: Box<dyn TokenStore>) -> Result<Self, AuthError> {
+        Self::with_store_and_endpoints(store, Endpoints::default())
+    }
+
+    fn with_store_and_endpoints(
+        store: Box<dyn TokenStore>,
+        endpoints: Endpoints,
+    ) -> Result<Self, AuthError> {
         let cache = store.load()?;
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             client_id: titles::MINECRAFT_NINTENDO_SWITCH.into(),
+            endpoints,
             store,
             cache,
         })
+    }
+
+    #[cfg(test)]
+    fn with_endpoints(store: Box<dyn TokenStore>, endpoints: Endpoints) -> Result<Self, AuthError> {
+        Self::with_store_and_endpoints(store, endpoints)
     }
 
     /// The cached account, if the store has signed in at least once.
@@ -122,29 +169,14 @@ impl Authenticator {
         &mut self,
         on_device_code: impl Fn(&DeviceCode),
     ) -> Result<MinecraftAccount, AuthError> {
-        let now = now_secs();
         let minecraft = match &self.cache.minecraft {
-            Some(mc) if mc.expires_at - 300 > now => {
+            Some(mc) if mc.expires_at - REFRESH_SKEW_SECS > now_secs() => {
                 debug!("using cached Minecraft token");
                 mc.clone()
             }
             _ => {
                 let msa = self.msa_token(&on_device_code).await?;
-                let user = xbox::user_token(&self.http, &msa).await?;
-                let xsts = xbox::xsts_token(&self.http, &user.token).await?;
-                let (access_token, expires_in) =
-                    minecraft::login_with_xbox(&self.http, &xsts.uhs, &xsts.token).await?;
-                let profile = minecraft::profile(&self.http, &access_token).await?;
-                info!(name = %profile.name, "Minecraft login complete");
-                let mc = CachedMinecraft {
-                    access_token,
-                    expires_at: now + expires_in,
-                    name: profile.name,
-                    id: profile.id,
-                };
-                self.cache.minecraft = Some(mc.clone());
-                self.store.save(&self.cache)?;
-                mc
+                self.minecraft_login(&msa).await?
             }
         };
 
@@ -157,16 +189,94 @@ impl Authenticator {
         })
     }
 
+    /// Whether the cached Minecraft token is missing or expires within
+    /// `skew_secs`. A background task can use this before calling
+    /// [`refresh`](Self::refresh).
+    pub fn is_expiring(&self, skew_secs: i64) -> bool {
+        self.cache
+            .minecraft
+            .as_ref()
+            .is_none_or(|mc| mc.expires_at - skew_secs <= now_secs())
+    }
+
+    /// Renews the Microsoft, Xbox, Minecraft and chat-key tokens from the
+    /// cached refresh token. Unlike [`login`](Self::login), this never falls
+    /// back to a device-code prompt, so it is safe for a background task. It
+    /// fails with [`AuthError::NoRefreshToken`] when the account has never
+    /// signed in.
+    pub async fn refresh(&mut self) -> Result<MinecraftAccount, AuthError> {
+        let refresh_token = self
+            .cache
+            .msa
+            .as_ref()
+            .map(|msa| msa.refresh_token.clone())
+            .ok_or(AuthError::NoRefreshToken)?;
+        let msa = microsoft::refresh(
+            &self.http,
+            &self.client_id,
+            &self.endpoints.microsoft_token,
+            &refresh_token,
+        )
+        .await?;
+        self.cache.msa = Some(msa.clone());
+        self.store.save(&self.cache)?;
+
+        let minecraft = self.minecraft_login(&msa.access_token).await?;
+        let chat_keys = self.chat_keys(&minecraft.access_token).await?;
+        Ok(MinecraftAccount {
+            name: minecraft.name,
+            id: minecraft.id,
+            access_token: minecraft.access_token,
+            chat_keys,
+        })
+    }
+
+    async fn minecraft_login(
+        &mut self,
+        msa_access_token: &str,
+    ) -> Result<CachedMinecraft, AuthError> {
+        let user =
+            xbox::user_token(&self.http, &self.endpoints.xbox_user_auth, msa_access_token).await?;
+        let xsts = xbox::xsts_token(&self.http, &self.endpoints.xbox_xsts, &user.token).await?;
+        let (access_token, expires_in) = minecraft::login_with_xbox(
+            &self.http,
+            &self.endpoints.minecraft_login,
+            &xsts.uhs,
+            &xsts.token,
+        )
+        .await?;
+        let profile =
+            minecraft::profile(&self.http, &self.endpoints.minecraft_profile, &access_token)
+                .await?;
+        info!(name = %profile.name, "Minecraft login complete");
+        let mc = CachedMinecraft {
+            access_token,
+            expires_at: now_secs() + expires_in,
+            name: profile.name,
+            id: profile.id,
+        };
+        self.cache.minecraft = Some(mc.clone());
+        self.store.save(&self.cache)?;
+        Ok(mc)
+    }
+
     async fn msa_token(
         &mut self,
         on_device_code: &impl Fn(&DeviceCode),
     ) -> Result<String, AuthError> {
         let now = now_secs();
         if let Some(msa) = &self.cache.msa {
-            if msa.expires_at - 300 > now {
+            if msa.expires_at - REFRESH_SKEW_SECS > now {
                 return Ok(msa.access_token.clone());
             }
-            match microsoft::refresh(&self.http, &self.client_id, &msa.refresh_token).await {
+            match microsoft::refresh(
+                &self.http,
+                &self.client_id,
+                &self.endpoints.microsoft_token,
+                &msa.refresh_token,
+            )
+            .await
+            {
                 Ok(fresh) => {
                     self.cache.msa = Some(fresh.clone());
                     self.store.save(&self.cache)?;
@@ -175,8 +285,14 @@ impl Authenticator {
                 Err(e) => debug!("refresh failed, falling back to device code: {e}"),
             }
         }
-        let fresh =
-            microsoft::device_code_login(&self.http, &self.client_id, on_device_code).await?;
+        let fresh = microsoft::device_code_login(
+            &self.http,
+            &self.client_id,
+            &self.endpoints.microsoft_device_code,
+            &self.endpoints.microsoft_token,
+            on_device_code,
+        )
+        .await?;
         self.cache.msa = Some(fresh.clone());
         self.store.save(&self.cache)?;
         Ok(fresh.access_token)
@@ -192,7 +308,13 @@ impl Authenticator {
         {
             return Ok(Some(keys.clone()));
         }
-        match minecraft::certificates(&self.http, access_token).await {
+        match minecraft::certificates(
+            &self.http,
+            &self.endpoints.minecraft_certificates,
+            access_token,
+        )
+        .await
+        {
             Ok(keys) => {
                 self.cache.chat_keys = Some(keys.clone());
                 self.store.save(&self.cache)?;
@@ -207,5 +329,213 @@ impl Authenticator {
                     .filter(|k| k.expires_at > now_ms))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use uuid::Uuid;
+
+    async fn mock_auth_server() -> (Endpoints, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let server_hits = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = server_hits.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let header_end = loop {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..n]);
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+
+                    let path = headers
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/")
+                        .to_owned();
+                    hits.lock().unwrap().push(path.clone());
+                    let (status, body) = match path.as_str() {
+                        "/microsoft/token" => (
+                            "200 OK",
+                            r#"{"access_token":"msa-access","refresh_token":"new-refresh","expires_in":3600}"#,
+                        ),
+                        "/xbox/user" => (
+                            "200 OK",
+                            r#"{"Token":"user-token","DisplayClaims":{"xui":[{"uhs":"uhs"}]}}"#,
+                        ),
+                        "/xbox/xsts" => (
+                            "200 OK",
+                            r#"{"Token":"xsts-token","DisplayClaims":{"xui":[{"uhs":"uhs"}]}}"#,
+                        ),
+                        "/minecraft/login" => (
+                            "200 OK",
+                            r#"{"access_token":"mc-access","expires_in":86400}"#,
+                        ),
+                        "/minecraft/profile" => (
+                            "200 OK",
+                            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"Steve"}"#,
+                        ),
+                        "/minecraft/certificates" => (
+                            "200 OK",
+                            r#"{"keyPair":{"privateKey":"private","publicKey":"AQID"},"publicKeySignatureV2":"BA==","expiresAt":"2099-01-01T00:00:00Z","refreshedAfter":"2099-01-01T00:00:00Z"}"#,
+                        ),
+                        _ => (
+                            "500 Internal Server Error",
+                            r#"{"error":"unexpected request"}"#,
+                        ),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let endpoints = Endpoints {
+            microsoft_device_code: format!("{base}/microsoft/device"),
+            microsoft_token: format!("{base}/microsoft/token"),
+            xbox_user_auth: format!("{base}/xbox/user"),
+            xbox_xsts: format!("{base}/xbox/xsts"),
+            minecraft_login: format!("{base}/minecraft/login"),
+            minecraft_profile: format!("{base}/minecraft/profile"),
+            minecraft_certificates: format!("{base}/minecraft/certificates"),
+        };
+        (endpoints, hits, server)
+    }
+
+    fn temp_cache_path() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rapidbot-auth-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("tokens.json");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn refresh_renews_the_whole_chain_without_a_device_code() {
+        let (endpoints, hits, server) = mock_auth_server().await;
+        let (dir, path) = temp_cache_path();
+        TokenCache {
+            msa: Some(CachedMsa {
+                access_token: "old-msa".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at: now_secs() - 10,
+            }),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        let mut auth =
+            Authenticator::with_endpoints(Box::new(FileTokenStore::new(&path)), endpoints).unwrap();
+        assert!(auth.is_expiring(REFRESH_SKEW_SECS));
+        let account = auth.refresh().await.unwrap();
+        assert_eq!(account.name, "Steve");
+        assert_eq!(account.access_token, "mc-access");
+        assert!(account.chat_keys.is_some());
+        assert!(!auth.is_expiring(REFRESH_SKEW_SECS));
+
+        let cache = TokenCache::load(&path).unwrap();
+        assert_eq!(cache.msa.unwrap().refresh_token, "new-refresh");
+        assert_eq!(cache.minecraft.unwrap().access_token, "mc-access");
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            [
+                "/microsoft/token",
+                "/xbox/user",
+                "/xbox/xsts",
+                "/minecraft/login",
+                "/minecraft/profile",
+                "/minecraft/certificates"
+            ]
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_cached_account_does_not_touch_the_network() {
+        let (dir, path) = temp_cache_path();
+        let mut auth = Authenticator::new(&path).unwrap();
+        assert!(matches!(
+            auth.refresh().await,
+            Err(AuthError::NoRefreshToken)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_reuses_a_valid_cached_minecraft_token() {
+        let (dir, path) = temp_cache_path();
+        TokenCache {
+            minecraft: Some(CachedMinecraft {
+                access_token: "cached".into(),
+                expires_at: now_secs() + 3600,
+                name: "Steve".into(),
+                id: Uuid::from_u128(1),
+            }),
+            chat_keys: Some(ChatKeys {
+                private_key_pem: "private".into(),
+                public_key_der: vec![],
+                signature_v2: vec![],
+                expires_at: now_secs() * 1000 + 60_000,
+                refreshed_after: now_secs() * 1000 + 60_000,
+            }),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        let mut auth = Authenticator::new(&path).unwrap();
+        let account = auth
+            .login(|_| panic!("device code prompt for a cached account"))
+            .await
+            .unwrap();
+        assert_eq!(account.access_token, "cached");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

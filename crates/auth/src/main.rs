@@ -1,6 +1,7 @@
 //! `rapidbot-auth`: manage the accounts used by the bot.
 //!
 //!     rapidbot-auth login [alias]
+//!     rapidbot-auth refresh [alias]
 //!     rapidbot-auth status [alias]
 //!     rapidbot-auth logout <alias>
 //!
@@ -48,6 +49,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             println!("Account directory: {}", dir.display());
         }
+        "refresh" => {
+            let alias = args.next().unwrap_or_else(|| "main".into());
+            let mut auth = store.authenticator(&alias)?;
+            if let Ok(client_id) = std::env::var("RAPIDBOT_CLIENT_ID") {
+                auth = auth.with_client_id(client_id);
+            }
+            let account = match auth.refresh().await {
+                Ok(account) => account,
+                Err(e) => return Err(format!("could not refresh {alias}: {e}").into()),
+            };
+            store.remember(&alias, &account)?;
+            println!("Refreshed {} ({}) as {alias}", account.name, account.id);
+        }
         "status" => {
             let aliases: Vec<String> = match args.next() {
                 Some(alias) => vec![alias],
@@ -67,10 +81,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 match store.status(&alias) {
                     Ok(status) => {
                         println!(
-                            "  tokens: {}",
+                            "  Microsoft token: {}",
+                            status
+                                .msa_expires_at
+                                .map_or_else(|| "none".into(), |at| format!("expires at {at}")),
+                        );
+                        println!(
+                            "  Minecraft token: {}",
                             status
                                 .minecraft_expires_at
-                                .map_or_else(|| "none".into(), |at| format!("expire at {at}")),
+                                .map_or_else(|| "none".into(), |at| format!("expires at {at}")),
                         );
                         println!(
                             "  refresh token: {}; chat keys: {}",
@@ -98,7 +118,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         "help" | "-h" | "--help" => {
-            println!("usage: rapidbot-auth <login [alias] | status [alias] | logout <alias>>");
+            println!(
+                "usage: rapidbot-auth <login [alias] | refresh [alias] | status [alias] | logout <alias>>"
+            );
             println!("account directory: {}", dir.display());
         }
         other => return Err(format!("unknown command {other:?}; try `rapidbot-auth help`").into()),

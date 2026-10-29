@@ -118,6 +118,7 @@ cargo run --release -p rapidbot-client --example course -- localhost:25565 Walke
 cargo run --release -p rapidbot-client --example dig -- localhost:25565 Walker 62 150 60  # digs the listed blocks
 cargo run --release -p rapidbot-client --example fight -- localhost:25565 Walker minecraft:husk  # fights the nearest husk
 cargo run -p rapidbot-auth -- login main                        # Microsoft sign-in, encrypted cache (accounts/ is gitignored)
+cargo run -p rapidbot-auth -- refresh main                      # renew tokens without another sign-in prompt
 cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 ```
 

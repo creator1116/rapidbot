@@ -7,8 +7,6 @@ use tracing::debug;
 
 use crate::{AuthError, CachedMsa, now_secs};
 
-const DEVICE_CODE_URL: &str = "https://login.live.com/oauth20_connect.srf";
-const TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
 const SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
 
 /// What the user needs to sign in: open `verification_uri`, enter `user_code`.
@@ -38,10 +36,12 @@ struct ErrorResponse {
 pub(crate) async fn device_code_login(
     http: &reqwest::Client,
     client_id: &str,
+    device_code_url: &str,
+    token_url: &str,
     on_device_code: &impl Fn(&DeviceCode),
 ) -> Result<CachedMsa, AuthError> {
     let code: DeviceCode = http
-        .post(DEVICE_CODE_URL)
+        .post(device_code_url)
         .form(&[
             ("client_id", client_id),
             ("scope", SCOPE),
@@ -59,7 +59,7 @@ pub(crate) async fn device_code_login(
     while now_secs() < deadline {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let response = http
-            .post(TOKEN_URL)
+            .post(token_url)
             .form(&[
                 ("client_id", client_id),
                 ("device_code", code.device_code.as_str()),
@@ -89,10 +89,11 @@ pub(crate) async fn device_code_login(
 pub(crate) async fn refresh(
     http: &reqwest::Client,
     client_id: &str,
+    token_url: &str,
     refresh_token: &str,
 ) -> Result<CachedMsa, AuthError> {
     let response = http
-        .post(TOKEN_URL)
+        .post(token_url)
         .form(&[
             ("client_id", client_id),
             ("scope", SCOPE),

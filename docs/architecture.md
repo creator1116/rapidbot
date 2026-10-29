@@ -16,7 +16,7 @@ everything else is an implementation layer.
 | `rapidbot-world` | Block and item data extracted from the game, chunks, tags, collision shapes, item stacks and components, block ray cast |
 | `rapidbot-physics` | Player movement ported from vanilla, attributes, `Mth`/`Vec3` |
 | `rapidbot-human` | Input models: mouse strokes, response delays, key timing, typing, fatigue; seeded per account |
-| `rapidbot-auth` | Microsoft device code → Xbox → XSTS → Minecraft token, encrypted per-alias token cache, chat keys, session join |
+| `rapidbot-auth` | Microsoft device code and silent token renewal → Xbox → XSTS → Minecraft token, encrypted per-alias token cache, chat keys, session join |
 | `rapidbot-recorder` | Windows raw-input recorder (game keys only, only while Minecraft is focused) and an analyser that fits a mouse profile |
 
 ## Two layers

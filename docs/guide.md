@@ -203,10 +203,19 @@ For a different radius or players outside the default range, use
 the client. The framework exposes state; application-specific meaning and
 policy are left to the package user.
 
+## Riding
+
+`SetPassengers` is tracked for the local player. While mounted, the rider
+follows the vehicle's interpolated position and seat attachment, and sends
+`MovePlayerRot` instead of normal player position packets. If the local player
+is the controlling passenger (for example the first passenger in a boat), the
+client also echoes `MoveVehicle` in the vanilla order. Vehicle motion itself
+remains server-driven: the framework does not simulate boat, horse, or other
+vehicle physics locally.
+
 ## What is not there yet
 
-Placing blocks, using items (eating, bows, shields), clicking inside
-containers, vehicles, swimming and ladders in the route planner. See the
+Client-side vehicle physics, firework boosts, and riptide movement. See the
 issue tracker.
 
 ## Use

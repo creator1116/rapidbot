@@ -4,18 +4,40 @@
 use rapidbot_physics::math::Vec3;
 use rapidbot_physics::{Keys, Player};
 use rapidbot_protocol::packets::play::serverbound::{
-    MovePlayerPos, MovePlayerPosRot, MovePlayerRot, MovePlayerStatusOnly, PlayerAbilities,
-    PlayerCommand, PlayerCommandAction, PlayerInput,
+    MovePlayerPos, MovePlayerPosRot, MovePlayerRot, MovePlayerStatusOnly, MoveVehicle,
+    PlayerAbilities, PlayerCommand, PlayerCommandAction, PlayerInput,
 };
-use rapidbot_protocol::packets::play::{Input, PositionMoveRotation, move_flags, relative};
+use rapidbot_protocol::packets::play::{
+    Input, PositionAndRotation, PositionMoveRotation, move_flags, relative,
+};
 
+use crate::entities::{Entities, Entity};
 use crate::math;
 use crate::net::PacketSender;
+
+/// The server's vehicle state for the local player's seat. Vehicle motion is
+/// server-driven; this mirrors the last position and the attachment needed
+/// for `MovePlayerRot`.
+#[derive(Debug, Clone, Copy)]
+struct Vehicle {
+    id: i32,
+    pos: Vec3,
+    y_rot: f32,
+    x_rot: f32,
+    on_ground: bool,
+    seat: usize,
+    passengers: usize,
+    authoritative: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalPlayer {
     pub id: i32,
     pub physics: Player,
+
+    /// The direct vehicle the local player rides, if any.
+    riding: Option<i32>,
+    vehicle: Option<Vehicle>,
 
     // What the server last heard, for `sendPosition`.
     x_last: f64,
@@ -50,6 +72,8 @@ impl LocalPlayer {
         Self {
             id,
             physics: Player::new(),
+            riding: None,
+            vehicle: None,
             x_last: 0.0,
             y_last: 0.0,
             z_last: 0.0,
@@ -106,6 +130,144 @@ impl LocalPlayer {
         let effects = stack.map(|s| s.use_effects()).unwrap_or_default();
         self.physics
             .set_use_effects(effects.can_sprint, effects.speed_multiplier);
+    }
+
+    /// `ClientboundSetPassengersPacket` for the local player: start riding
+    /// the vehicle, or dismount when this packet no longer lists us.
+    pub fn set_passengers(
+        &mut self,
+        vehicle: &Entity,
+        passengers: &[i32],
+        authoritative: bool,
+    ) -> bool {
+        let Some(seat) = passengers.iter().position(|id| *id == self.id) else {
+            return false;
+        };
+        if self.riding != Some(vehicle.id) {
+            self.riding = Some(vehicle.id);
+            // A boat turns a newly mounted rider to its own yaw.
+            if vehicle.info().is("AbstractBoat") {
+                self.physics.y_rot = vehicle.y_rot;
+            }
+        }
+        self.vehicle = Some(Vehicle {
+            id: vehicle.id,
+            pos: vehicle.pos,
+            y_rot: vehicle.y_rot,
+            x_rot: vehicle.x_rot,
+            on_ground: vehicle.on_ground,
+            seat,
+            passengers: passengers.len(),
+            authoritative,
+        });
+        true
+    }
+
+    pub fn dismount(&mut self) {
+        self.riding = None;
+        self.vehicle = None;
+    }
+
+    pub fn is_riding(&self) -> bool {
+        self.riding.is_some()
+    }
+
+    pub fn riding_vehicle(&self) -> Option<i32> {
+        self.riding
+    }
+
+    /// `Entity.positionRider` for the local player. The vehicle itself is
+    /// ticked by the client entity tracker; this only keeps the rider at its
+    /// seat and copies the state `sendChanges` reports.
+    pub fn sync_vehicle(&mut self, entities: &Entities) {
+        let Some(id) = self.riding else {
+            self.vehicle = None;
+            return;
+        };
+        let Some(entity) = entities.get(id) else {
+            // The server removed the vehicle without a passengers update.
+            self.dismount();
+            return;
+        };
+        let (_, height) = entity.dimensions();
+        let (seat, passengers) = self.vehicle.map_or((0, 1), |v| (v.seat, v.passengers));
+        let offset = if entity.info().is("AbstractBoat") {
+            let y = if entity.info().is("Boat") || entity.info().is("ChestBoat") {
+                height as f64 / 3.0
+            } else {
+                height as f64 * 0.888_888_9
+            };
+            let z = if passengers > 1 {
+                if seat == 0 { 0.2 } else { -0.6 }
+            } else if entity.info().is("AbstractChestBoat") {
+                0.15
+            } else {
+                0.0
+            };
+            Vec3::new(0.0, y, z).y_rot(-entity.y_rot.to_radians())
+        } else {
+            // EntityAttachments.PASSENGER falls back to AT_HEIGHT.
+            Vec3::new(0.0, height as f64, 0.0)
+        };
+        self.vehicle = Some(Vehicle {
+            id,
+            pos: entity.pos,
+            y_rot: entity.y_rot,
+            x_rot: entity.x_rot,
+            on_ground: entity.on_ground,
+            seat,
+            passengers,
+            authoritative: self.vehicle.is_some_and(|v| v.authoritative),
+        });
+        self.physics.set_pos(entity.pos.plus(offset));
+        // Player.tick: `if (isSpectator() || isPassenger()) setOnGround(false)`.
+        // Collision flags are not touched: vanilla does not move the passenger
+        // while riding, so the last values remain until dismount.
+        self.physics.on_ground = false;
+    }
+
+    /// Apply `ClientboundMoveVehiclePacket` to the authoritative vehicle.
+    pub fn snap_vehicle(
+        &mut self,
+        entities: &mut Entities,
+        moving_to: PositionAndRotation,
+    ) -> bool {
+        let Some(vehicle) = self.vehicle else {
+            return false;
+        };
+        if !vehicle.authoritative {
+            return false;
+        }
+        let pos = Vec3::new(
+            moving_to.position.x,
+            moving_to.position.y,
+            moving_to.position.z,
+        );
+        entities.snap_vehicle(
+            vehicle.id,
+            pos,
+            moving_to.y_rot,
+            moving_to.x_rot,
+            vehicle.on_ground,
+        );
+        self.sync_vehicle(entities);
+        true
+    }
+
+    /// The packet `handleMoveVehicle` echoes back to the server.
+    pub fn serverbound_vehicle(&self) -> Option<MoveVehicle> {
+        let vehicle = self.vehicle?;
+        Some(MoveVehicle {
+            moving_to: PositionAndRotation {
+                position: rapidbot_protocol::packets::play::Vec3 {
+                    x: vehicle.pos.x,
+                    y: vehicle.pos.y,
+                    z: vehicle.pos.z,
+                },
+                y_rot: vehicle.y_rot,
+                x_rot: vehicle.x_rot,
+            },
+        })
     }
 
     /// `ClientPacketListener.setValuesFromPositionPacket` (not interpolated)
@@ -171,7 +333,22 @@ impl LocalPlayer {
             });
             self.last_sent_input = keys;
         }
-        self.send_position(net);
+        if self.is_riding() {
+            let p = &self.physics;
+            net.send(&MovePlayerRot {
+                y_rot: p.y_rot,
+                x_rot: p.x_rot,
+                flags: move_flags(p.on_ground, p.horizontal_collision),
+            });
+            if self.vehicle.is_some_and(|v| v.authoritative)
+                && let Some(packet) = self.serverbound_vehicle()
+            {
+                net.send(&packet);
+                self.send_is_sprinting_if_needed(net);
+            }
+        } else {
+            self.send_position(net);
+        }
     }
 
     /// `LocalPlayer.sendPosition`.
@@ -262,7 +439,11 @@ impl LocalPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rapidbot_buf::Decode;
+    use rapidbot_protocol::Packet;
     use rapidbot_protocol::packets::play::Vec3 as WireVec3;
+    use rapidbot_protocol::packets::play::serverbound as sb;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     fn change(x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) -> PositionMoveRotation {
         PositionMoveRotation {
@@ -271,6 +452,16 @@ mod tests {
             y_rot,
             x_rot,
         }
+    }
+
+    fn packets(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<(i32, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let mut body = frame.as_slice();
+            let id = rapidbot_buf::VarInt::decode(&mut body).unwrap().0;
+            out.push((id, body.to_vec()));
+        }
+        out
     }
 
     #[test]
@@ -290,5 +481,101 @@ mod tests {
         assert_eq!(p.physics.x_rot, 85.0);
         // The bounding box follows the position.
         assert_eq!(p.physics.bounding_box().min_y, 0.0);
+    }
+
+    #[test]
+    fn riding_sends_rot_and_vehicle() {
+        let mut p = LocalPlayer::new(7);
+        let mut boat = Entity::test_entity(42, "minecraft:oak_boat", Vec3::new(10.0, 64.0, 10.0));
+        boat.y_rot = 30.0;
+        boat.on_ground = true;
+        let (_, height) = boat.dimensions();
+        let mut entities = Entities::default();
+        entities.insert_for_test(boat.clone());
+
+        p.physics.y_rot = 100.0;
+        assert!(p.set_passengers(&boat, &[7], true));
+        assert_eq!(p.physics.y_rot, 30.0, "a new boat rider takes its yaw");
+        p.sync_vehicle(&entities);
+        assert!((p.physics.pos.y - (64.0 + height as f64 / 3.0)).abs() < 1e-9);
+        assert!(
+            !p.physics.on_ground,
+            "Player.tick clears onGround when riding"
+        );
+
+        let (net, mut rx) = PacketSender::for_test();
+        p.send_changes(&net);
+        let sent = packets(&mut rx);
+        assert_eq!(
+            sent.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [sb::MovePlayerRot::ID, sb::MoveVehicle::ID]
+        );
+        let rot = sb::MovePlayerRot::from_body(&sent[0].1).unwrap();
+        assert_eq!((rot.y_rot, rot.x_rot), (30.0, 0.0));
+        let vehicle = sb::MoveVehicle::from_body(&sent[1].1).unwrap();
+        assert_eq!(
+            (
+                vehicle.moving_to.position.x,
+                vehicle.moving_to.position.y,
+                vehicle.moving_to.position.z,
+                vehicle.moving_to.y_rot,
+            ),
+            (10.0, 64.0, 10.0, 30.0)
+        );
+
+        // A passenger who is not the controlling passenger gets no
+        // MoveVehicle, but still reports rotation every tick.
+        assert!(p.set_passengers(&boat, &[9, 7], false));
+        p.sync_vehicle(&entities);
+        let (net, mut rx) = PacketSender::for_test();
+        p.send_changes(&net);
+        assert_eq!(
+            packets(&mut rx)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [sb::MovePlayerRot::ID]
+        );
+    }
+
+    #[test]
+    fn move_vehicle_snaps_the_authoritative_vehicle() {
+        let mut p = LocalPlayer::new(7);
+        let boat = Entity::test_entity(42, "minecraft:oak_boat", Vec3::new(10.0, 64.0, 10.0));
+        let mut entities = Entities::default();
+        entities.insert_for_test(boat.clone());
+        p.set_passengers(&boat, &[7], true);
+
+        let target = PositionAndRotation {
+            position: WireVec3 {
+                x: 20.0,
+                y: 65.0,
+                z: 20.0,
+            },
+            y_rot: 45.0,
+            x_rot: 10.0,
+        };
+        assert!(p.snap_vehicle(&mut entities, target));
+        let vehicle = entities.get(42).unwrap();
+        assert_eq!(
+            (vehicle.pos, vehicle.y_rot, vehicle.x_rot),
+            (Vec3::new(20.0, 65.0, 20.0), 45.0, 10.0)
+        );
+        let echo = p.serverbound_vehicle().unwrap();
+        assert_eq!(echo.moving_to, target);
+
+        // Without an authoritative seat the packet is ignored.
+        p.set_passengers(&boat, &[9, 7], false);
+        assert!(!p.snap_vehicle(&mut entities, target));
+    }
+
+    #[test]
+    fn missing_vehicle_dismounts() {
+        let mut p = LocalPlayer::new(7);
+        let boat = Entity::test_entity(42, "minecraft:oak_boat", Vec3::new(10.0, 64.0, 10.0));
+        p.set_passengers(&boat, &[7], true);
+        p.sync_vehicle(&Entities::default());
+        assert!(!p.is_riding());
+        assert!(p.serverbound_vehicle().is_none());
     }
 }

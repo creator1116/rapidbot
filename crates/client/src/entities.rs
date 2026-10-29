@@ -210,6 +210,8 @@ pub struct Entity {
     pub pos: Vec3,
     pub y_rot: f32,
     pub x_rot: f32,
+    /// `Entity.onGround`, as last reported by a movement packet.
+    pub on_ground: bool,
     /// `VecDeltaCodec` base: the last position the server sent.
     base: Vec3,
     stepped: Stepped,
@@ -248,9 +250,61 @@ impl Entity {
         self.kind == "minecraft:player"
     }
 
+    /// The entity classes whose `getControllingPassenger` returns a riding
+    /// player. `isLocalInstanceAuthoritative` is true when the first
+    /// passenger is the local player, so only these need client-side
+    /// `MoveVehicle` packets.
+    pub fn is_local_authoritative_vehicle(&self) -> bool {
+        let info = self.info();
+        [
+            "AbstractBoat",
+            "AbstractHorse",
+            "AbstractNautilus",
+            "Pig",
+            "Strider",
+            "HappyGhast",
+        ]
+        .iter()
+        .any(|class| info.is(class))
+    }
+
     /// The `minecraft:entity_type` registry ID.
     pub fn type_id(&self) -> u32 {
         self.type_id as u32
+    }
+
+    /// A bare tracked entity, for tests that need a real registry entry.
+    #[cfg(test)]
+    pub(crate) fn test_entity(id: i32, kind: &str, pos: Vec3) -> Entity {
+        let registry = Registry::get();
+        let type_id = registry
+            .entity_types
+            .iter()
+            .position(|name| name == kind)
+            .unwrap_or_else(|| panic!("unknown entity type {kind}"));
+        Entity {
+            id,
+            uuid: Uuid::from_u128(id as u128),
+            kind: registry.entity_types[type_id].as_str(),
+            type_id,
+            pos,
+            y_rot: 0.0,
+            x_rot: 0.0,
+            on_ground: false,
+            base: pos,
+            stepped: Stepped::default(),
+            linear: (PosRot::default(), 0),
+            flags: 0,
+            pose: pose::STANDING,
+            health: None,
+            scale: 1.0,
+            armor_stand_flags: 0,
+            in_ground: false,
+            interaction_width: 1.0,
+            interaction_height: 1.0,
+            hanging_direction: None,
+            framed_item: None,
+        }
     }
 
     pub fn info(&self) -> &'static EntityKind {
@@ -710,6 +764,22 @@ impl Entities {
         self.by_id.get(&id)
     }
 
+    /// Insert a bare entity without an `AddEntity` packet, for tests.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, entity: Entity) {
+        self.by_id.insert(entity.id, entity);
+    }
+
+    /// `Entity.absSnapTo` for the locally controlled vehicle from
+    /// `ClientboundMoveVehiclePacket`.
+    pub fn snap_vehicle(&mut self, id: i32, pos: Vec3, y_rot: f32, x_rot: f32, on_ground: bool) {
+        if let Some(entity) = self.by_id.get_mut(&id) {
+            entity.base = pos;
+            entity.on_ground = on_ground;
+            entity.snap_to(pos, y_rot, x_rot);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Entity> {
         self.by_id.values()
     }
@@ -858,6 +928,7 @@ impl Entities {
                 pos,
                 y_rot,
                 x_rot,
+                on_ground: false,
                 base: pos,
                 stepped: Stepped::default(),
                 linear: (PosRot::default(), 0),
@@ -895,6 +966,7 @@ impl Entities {
         let Some(entity) = self.by_id.get_mut(&id) else {
             return Ok(());
         };
+        entity.on_ground = properties & 1 != 0;
         let delta = |buf: &mut &[u8], base: Vec3| -> Result<Vec3, DecodeError> {
             let (xa, ya, za) = (i16::decode(buf)?, i16::decode(buf)?, i16::decode(buf)?);
             Ok(Vec3::new(
@@ -933,12 +1005,13 @@ impl Entities {
     pub fn rotate_entity(&mut self, mut body: &[u8]) -> Result<(), DecodeError> {
         let buf = &mut body;
         let id = VarInt::decode(buf)?.0;
-        let _on_ground = bool::decode(buf)?;
+        let on_ground = bool::decode(buf)?;
         let rot = (
             unpack_degrees(i8::decode(buf)?),
             unpack_degrees(i8::decode(buf)?),
         );
         if let Some(entity) = self.by_id.get_mut(&id) {
+            entity.on_ground = on_ground;
             entity.move_or_interpolate_to(None, Some(rot));
         }
         Ok(())
@@ -950,10 +1023,12 @@ impl Entities {
         let id = VarInt::decode(buf)?.0;
         let path = PositionPath::decode(buf)?;
         let (y_rot, x_rot) = (f32::decode(buf)?, f32::decode(buf)?);
+        let on_ground = bool::decode(buf)?;
         let Some(entity) = self.by_id.get_mut(&id) else {
             return Ok(());
         };
         let pos = path.end();
+        entity.on_ground = on_ground;
         entity.base = pos;
         let (dx, dy, dz) = (
             entity.pos.x - pos.x,
@@ -974,9 +1049,11 @@ impl Entities {
         let id = VarInt::decode(buf)?.0;
         let change = PositionMoveRotation::decode(buf)?;
         let relatives = i32::decode(buf)?;
+        let on_ground = bool::decode(buf)?;
         let Some(entity) = self.by_id.get_mut(&id) else {
             return Ok(());
         };
+        entity.on_ground = on_ground;
         // PositionMoveRotation.calculateAbsolute against where it is now.
         let rel =
             |bit: i32, current: f64, v: f64| if relatives & bit != 0 { current + v } else { v };
@@ -1149,6 +1226,15 @@ mod tests {
         assert_eq!(apply_delta(10.0, 4096), 11.0);
         assert_eq!(apply_delta(10.0, -2048), 9.5);
         assert_eq!(apply_delta(10.3, 0), 10.3);
+    }
+
+    #[test]
+    fn movement_packets_update_on_ground() {
+        let mut e = Entities::default();
+        add(&mut e, 1, "minecraft:oak_boat", [0.0, 64.0, 0.0]);
+        assert!(!e.get(1).unwrap().on_ground);
+        mv(&mut e, 1, [0, 0, 0]);
+        assert!(e.get(1).unwrap().on_ground);
     }
 
     #[test]

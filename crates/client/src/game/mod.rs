@@ -483,6 +483,9 @@ impl Game {
                 }
             }
         } else if play.client_loaded {
+            // Entity.positionRider: while mounted, the vehicle's interpolated
+            // position is the rider's position before the controller runs.
+            play.player.sync_vehicle(&play.entities);
             // handleKeybinds(): the controller stands in for the keyboard
             // and mouse. Any change counts as input for the frame limiter.
             let pos = play.player.physics.pos;
@@ -631,7 +634,9 @@ impl Game {
             }
 
             // level.tickEntities() → LocalPlayer.tick()
-            play.player.physics.tick(&play.world, &play.tags);
+            if !play.player.is_riding() {
+                play.player.physics.tick(&play.world, &play.tags);
+            }
             // The end of Player.tick: the attack charge.
             play.game_mode.player_tick(play.inventory.held());
             // player.sendChanges()

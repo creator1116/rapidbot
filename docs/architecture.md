@@ -46,6 +46,10 @@ Like the vanilla client, a bot has network tasks and one main thread.
 - A tick follows `Minecraft.tick`: connection tick, crosshair pick, key
   bindings (the `Controller` runs here), player tick, position packets,
   other entities, end-of-tick packet.
+- While the local player is a passenger, `positionRider` runs before the
+  controller and the normal physics tick is skipped. `sendChanges` sends
+  `MovePlayerRot` instead of a player position packet, plus `MoveVehicle`
+  when the local player controls the root vehicle.
 
 Tick regularity is visible to servers, so bots are run in release builds.
 
@@ -55,7 +59,7 @@ Tick regularity is visible to servers, so bots are run in release builds.
 |---|---|
 | `game/mod.rs` | Frame loop and tick order |
 | `game/configuration.rs`, `game/play.rs` | Packet handlers for the two states |
-| `game/player.rs` | `LocalPlayer`: when and which movement packets are sent |
+| `game/player.rs` | `LocalPlayer`: when and which movement packets are sent, and passenger/vehicle state |
 | `controller.rs` | `Controller` trait and `TickContext` (aim, keys, clicks, chat) |
 | `mouse.rs` | Vanilla sensitivity maths: mouse counts to rotation |
 | `entities.rs` | Other entities: interpolation, sizes, entity data, tab list |

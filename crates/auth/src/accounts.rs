@@ -19,6 +19,8 @@ const INDEX: &str = "accounts.json";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStatus {
     pub alias: String,
+    /// Unix seconds; `None` when no Microsoft token is cached.
+    pub msa_expires_at: Option<i64>,
     /// Unix seconds; `None` when no Minecraft token is cached.
     pub minecraft_expires_at: Option<i64>,
     pub has_refresh_token: bool,
@@ -133,6 +135,7 @@ impl AccountStore {
         let cache = store.load()?;
         Ok(AccountStatus {
             alias: alias.to_owned(),
+            msa_expires_at: cache.msa.as_ref().map(|msa| msa.expires_at),
             minecraft_expires_at: cache.minecraft.as_ref().map(|mc| mc.expires_at),
             has_refresh_token: cache.msa.is_some(),
             chat_keys_expire_at: cache.chat_keys.as_ref().map(|keys| keys.expires_at),

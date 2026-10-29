@@ -5,8 +5,6 @@ use serde_json::json;
 
 use crate::AuthError;
 
-const USER_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
-const XSTS_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_RELYING_PARTY: &str = "rp://api.minecraftservices.com/";
 
 pub(crate) struct XboxToken {
@@ -42,6 +40,7 @@ struct XboxError {
 
 pub(crate) async fn user_token(
     http: &reqwest::Client,
+    user_auth_url: &str,
     msa_access_token: &str,
 ) -> Result<XboxToken, AuthError> {
     // live.com tokens use the "t=" ticket prefix; Azure (MSAL) ones use "d=".
@@ -54,11 +53,12 @@ pub(crate) async fn user_token(
         "RelyingParty": "http://auth.xboxlive.com",
         "TokenType": "JWT",
     });
-    post(http, USER_AUTH_URL, &body, "2").await
+    post(http, user_auth_url, &body, "2").await
 }
 
 pub(crate) async fn xsts_token(
     http: &reqwest::Client,
+    xsts_url: &str,
     user_token: &str,
 ) -> Result<XboxToken, AuthError> {
     let body = json!({
@@ -69,7 +69,7 @@ pub(crate) async fn xsts_token(
         "RelyingParty": MINECRAFT_RELYING_PARTY,
         "TokenType": "JWT",
     });
-    post(http, XSTS_URL, &body, "1").await
+    post(http, xsts_url, &body, "1").await
 }
 
 async fn post(

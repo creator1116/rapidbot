@@ -8,10 +8,6 @@ use uuid::Uuid;
 
 use crate::AuthError;
 
-const LOGIN_WITH_XBOX_URL: &str =
-    "https://api.minecraftservices.com/authentication/login_with_xbox";
-const PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
-const CERTIFICATES_URL: &str = "https://api.minecraftservices.com/player/certificates";
 const JOIN_URL: &str = "https://sessionserver.mojang.com/session/minecraft/join";
 
 #[derive(Deserialize)]
@@ -22,11 +18,12 @@ struct LoginResponse {
 
 pub(crate) async fn login_with_xbox(
     http: &reqwest::Client,
+    login_url: &str,
     uhs: &str,
     xsts_token: &str,
 ) -> Result<(String, i64), AuthError> {
     let response = http
-        .post(LOGIN_WITH_XBOX_URL)
+        .post(login_url)
         .json(&json!({ "identityToken": format!("XBL3.0 x={uhs};{xsts_token}") }))
         .send()
         .await?;
@@ -54,10 +51,11 @@ struct ProfileResponse {
 
 pub(crate) async fn profile(
     http: &reqwest::Client,
+    profile_url: &str,
     access_token: &str,
 ) -> Result<Profile, AuthError> {
     let response = http
-        .get(PROFILE_URL)
+        .get(profile_url)
         .bearer_auth(access_token)
         .send()
         .await?;
@@ -104,10 +102,11 @@ struct KeyPair {
 
 pub(crate) async fn certificates(
     http: &reqwest::Client,
+    certificates_url: &str,
     access_token: &str,
 ) -> Result<ChatKeys, AuthError> {
     let r: CertificatesResponse = http
-        .post(CERTIFICATES_URL)
+        .post(certificates_url)
         .bearer_auth(access_token)
         .send()
         .await?

@@ -167,9 +167,11 @@ cargo run -p rapidbot-auth -- login main
 cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 ```
 
-`rapidbot-auth status` shows the aliases and cached token state, and
-`rapidbot-auth logout main` forgets one. `RAPIDBOT_ACCOUNTS` chooses the
-directory (default `accounts`, which is gitignored).
+`rapidbot-auth refresh main` renews all cached tokens from the stored refresh
+token without a device-code prompt; it is safe to run from a timer or another
+background task. `rapidbot-auth status` shows the aliases and cached token
+state, and `rapidbot-auth logout main` forgets one. `RAPIDBOT_ACCOUNTS` chooses
+the directory (default `accounts`, which is gitignored).
 
 ## Configuration
 

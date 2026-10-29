@@ -935,6 +935,174 @@ pub mod serverbound {
     }
     packet!(ContainerClose, play, serverbound, CONTAINER_CLOSE);
 
+    /// `ContainerInput`: the kind of click in `ServerboundContainerClickPacket`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub enum ContainerInput {
+        Pickup = 0,
+        QuickMove = 1,
+        Swap = 2,
+        Clone = 3,
+        Throw = 4,
+        QuickCraft = 5,
+        PickupAll = 6,
+    }
+
+    /// `HashedStack`: an item stack whose component values are represented by
+    /// hashes. The client only needs the empty form and the no-components form
+    /// for prediction; any stack carrying component changes is sent as empty,
+    /// which makes the server send authoritative slot updates.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HashedStack {
+        Empty,
+        Actual {
+            item: u32,
+            count: i32,
+            added_components: Vec<(u32, i32)>,
+            removed_components: Vec<u32>,
+        },
+    }
+
+    impl Encode for HashedStack {
+        fn encode(&self, buf: &mut Vec<u8>) {
+            match self {
+                Self::Empty => false.encode(buf),
+                Self::Actual {
+                    item,
+                    count,
+                    added_components,
+                    removed_components,
+                } => {
+                    true.encode(buf);
+                    rapidbot_buf::VarInt(*item as i32).encode(buf);
+                    rapidbot_buf::VarInt(*count).encode(buf);
+                    rapidbot_buf::VarInt(added_components.len() as i32).encode(buf);
+                    for (component, hash) in added_components {
+                        rapidbot_buf::VarInt(*component as i32).encode(buf);
+                        hash.encode(buf);
+                    }
+                    rapidbot_buf::VarInt(removed_components.len() as i32).encode(buf);
+                    for component in removed_components {
+                        rapidbot_buf::VarInt(*component as i32).encode(buf);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Decode for HashedStack {
+        fn decode(buf: &mut &[u8]) -> Result<Self, rapidbot_buf::DecodeError> {
+            if !bool::decode(buf)? {
+                return Ok(Self::Empty);
+            }
+            let item = rapidbot_buf::VarInt::decode(buf)?.0 as u32;
+            let count = rapidbot_buf::VarInt::decode(buf)?.0;
+            let added_count = rapidbot_buf::VarInt::decode(buf)?.0;
+            if !(0..=256).contains(&added_count) {
+                return Err(rapidbot_buf::DecodeError::Custom(
+                    "hashed stack has too many added components".into(),
+                ));
+            }
+            let mut added_components = Vec::with_capacity(added_count as usize);
+            for _ in 0..added_count {
+                let component = rapidbot_buf::VarInt::decode(buf)?.0 as u32;
+                let hash = i32::decode(buf)?;
+                added_components.push((component, hash));
+            }
+            let removed_count = rapidbot_buf::VarInt::decode(buf)?.0;
+            if !(0..=256).contains(&removed_count) {
+                return Err(rapidbot_buf::DecodeError::Custom(
+                    "hashed stack has too many removed components".into(),
+                ));
+            }
+            let mut removed_components = Vec::with_capacity(removed_count as usize);
+            for _ in 0..removed_count {
+                removed_components.push(rapidbot_buf::VarInt::decode(buf)?.0 as u32);
+            }
+            Ok(Self::Actual {
+                item,
+                count,
+                added_components,
+                removed_components,
+            })
+        }
+    }
+
+    /// `ServerboundContainerClickPacket`: a click in a container menu.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ClickContainer {
+        pub container_id: i32,
+        pub state_id: i32,
+        pub slot: i16,
+        pub button: i8,
+        pub input: ContainerInput,
+        pub changed_slots: Vec<(i16, HashedStack)>,
+        pub carried_item: HashedStack,
+    }
+
+    impl Encode for ClickContainer {
+        fn encode(&self, buf: &mut Vec<u8>) {
+            rapidbot_buf::VarInt(self.container_id).encode(buf);
+            rapidbot_buf::VarInt(self.state_id).encode(buf);
+            self.slot.encode(buf);
+            self.button.encode(buf);
+            self.input.encode(buf);
+            rapidbot_buf::VarInt(self.changed_slots.len() as i32).encode(buf);
+            for (slot, stack) in &self.changed_slots {
+                slot.encode(buf);
+                stack.encode(buf);
+            }
+            self.carried_item.encode(buf);
+        }
+    }
+
+    impl Decode for ClickContainer {
+        fn decode(buf: &mut &[u8]) -> Result<Self, rapidbot_buf::DecodeError> {
+            let container_id = rapidbot_buf::VarInt::decode(buf)?.0;
+            let state_id = rapidbot_buf::VarInt::decode(buf)?.0;
+            let slot = i16::decode(buf)?;
+            let button = i8::decode(buf)?;
+            let input = ContainerInput::decode(buf)?;
+            let changed_count = rapidbot_buf::VarInt::decode(buf)?.0;
+            if !(0..=128).contains(&changed_count) {
+                return Err(rapidbot_buf::DecodeError::Custom(
+                    "container click has too many changed slots".into(),
+                ));
+            }
+            let mut changed_slots = Vec::with_capacity(changed_count as usize);
+            for _ in 0..changed_count {
+                changed_slots.push((i16::decode(buf)?, HashedStack::decode(buf)?));
+            }
+            let carried_item = HashedStack::decode(buf)?;
+            Ok(Self {
+                container_id,
+                state_id,
+                slot,
+                button,
+                input,
+                changed_slots,
+                carried_item,
+            })
+        }
+    }
+
+    packet!(ClickContainer, play, serverbound, CONTAINER_CLICK);
+
+    /// `ServerboundContainerButtonClickPacket`: an enchantment table or
+    /// stonecutter button.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct ClickContainerButton {
+        #[var]
+        pub container_id: i32,
+        #[var]
+        pub button_id: i32,
+    }
+    packet!(
+        ClickContainerButton,
+        play,
+        serverbound,
+        CONTAINER_BUTTON_CLICK
+    );
+
     /// `ServerboundChatSessionUpdatePacket` (`RemoteChatSession.Data`).
     #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
     pub struct ChatSessionUpdate {
@@ -1079,6 +1247,69 @@ mod tests {
         assert_eq!(&bytes[2..6], &packet.y_rot.to_be_bytes());
         assert_eq!(&bytes[6..10], &packet.x_rot.to_be_bytes());
         assert_eq!(bytes.len(), 10);
+    }
+
+    #[test]
+    fn container_click_uses_vanilla_field_order() {
+        let packet = serverbound::ClickContainer {
+            container_id: 3,
+            state_id: 7,
+            slot: 12,
+            button: 0,
+            input: serverbound::ContainerInput::Pickup,
+            changed_slots: vec![(
+                36,
+                serverbound::HashedStack::Actual {
+                    item: 5,
+                    count: 2,
+                    added_components: Vec::new(),
+                    removed_components: Vec::new(),
+                },
+            )],
+            carried_item: serverbound::HashedStack::Empty,
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        assert_eq!(
+            bytes,
+            [
+                3, 7, // container, state
+                0, 12, // short slot
+                0, 0, // button, ContainerInput::Pickup
+                1, 0, 36, // one changed slot, short key
+                1, 5, 2, 0, 0, // ActualItem: item, count, no components
+                0, // empty carried stack
+            ]
+        );
+        assert_eq!(
+            serverbound::ClickContainer::decode(&mut bytes.as_slice()),
+            Ok(packet)
+        );
+    }
+
+    #[test]
+    fn hashed_stack_roundtrips_components() {
+        let stack = serverbound::HashedStack::Actual {
+            item: 17,
+            count: 3,
+            added_components: vec![(4, 0x0102_0304), (5, -7)],
+            removed_components: vec![6, 7],
+        };
+        let bytes = rapidbot_buf::to_bytes(&stack);
+        assert_eq!(
+            serverbound::HashedStack::decode(&mut bytes.as_slice()),
+            Ok(stack)
+        );
+        assert_eq!(
+            rapidbot_buf::to_bytes(&serverbound::HashedStack::Empty),
+            [0]
+        );
+    }
+
+    #[test]
+    fn container_click_rejects_oversized_slot_maps() {
+        let mut bytes = vec![0, 0, 0, 0, 0, 0];
+        rapidbot_buf::write_var_int(&mut bytes, 129);
+        assert!(serverbound::ClickContainer::decode(&mut bytes.as_slice()).is_err());
     }
 
     #[test]

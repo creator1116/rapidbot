@@ -561,6 +561,18 @@ impl Game {
             };
             self.controller.tick(&mut ctx);
             self.loaded_ticks += 1;
+            if !chat_open {
+                if let Some((slot, button, input)) = actions.container_click
+                    && let Some(packet) = play.inventory.click(slot, button, input)
+                {
+                    self.net.send(&packet);
+                }
+                if let Some(button_id) = actions.container_button
+                    && let Some(packet) = play.inventory.click_button(button_id)
+                {
+                    self.net.send(&packet);
+                }
+            }
             if let Some(slot) = actions.select_slot {
                 let pending = self.slot_press.map(|(s, _)| s);
                 if pending != Some(slot) && (pending.is_some() || slot != play.inventory.selected) {

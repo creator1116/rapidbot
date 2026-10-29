@@ -59,7 +59,7 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `controller.rs` | `Controller` trait and `TickContext` (aim, keys, clicks, chat) |
 | `mouse.rs` | Vanilla sensitivity maths: mouse counts to rotation |
 | `entities.rs` | Other entities: interpolation, sizes, entity data, tab list |
-| `inventory.rs` | Inventory and server-opened containers |
+| `inventory.rs` | Inventory and server-opened containers; menu clicks and predictions |
 | `interact.rs` | Crosshair pick, digging, block-change predictions, block placement and entity interaction, attacking |
 | `chat.rs`, `commands.rs` | Chat sending and signing, last-seen tracking, the server's command tree |
 | `packs.rs` | Resource pack prompt, download and status packets; best-effort `pack.mcmeta` validation |
@@ -67,6 +67,11 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
 | `combat.rs` | Target approach, aiming, strafing/retreating, and attack timing |
 | `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
+
+`inventory.rs` models pickup, quick-move, swap and throw clicks. A
+`HashedStack` prediction is only sent for stacks without a component patch;
+patched stacks use the empty form, so the server sends authoritative slot
+updates instead of suppressing them.
 
 `packs.rs` reports `SUCCESSFULLY_LOADED` after a best-effort check of the
 downloaded zip, its root `pack.mcmeta`, the `pack` object, the component

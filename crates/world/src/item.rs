@@ -548,6 +548,12 @@ impl ItemStack {
         Ok(Some(ItemStack { item, count, patch }))
     }
 
+    /// `getComponentsPatch().isEmpty()`: no components differ from the
+    /// item's defaults.
+    pub fn patch_is_empty(&self) -> bool {
+        self.patch.added.is_empty() && self.patch.removed.is_empty()
+    }
+
     /// The item's name, such as `minecraft:elytra`.
     pub fn name(&self) -> &'static str {
         ItemData::get()

@@ -3,6 +3,7 @@
 use rapidbot_human::Aim;
 use rapidbot_physics::math::{self, Vec3};
 use rapidbot_physics::{Keys, Player};
+use rapidbot_protocol::packets::play::serverbound::ContainerInput;
 use rapidbot_world::World;
 
 /// Called once per client tick at the point where vanilla handles key
@@ -58,6 +59,8 @@ pub(crate) struct Actions {
     pub use_block: bool,
     pub use_item: Option<bool>,
     pub close_container: bool,
+    pub container_click: Option<(i16, i8, ContainerInput)>,
+    pub container_button: Option<i32>,
 }
 
 impl TickContext<'_> {
@@ -124,6 +127,22 @@ impl TickContext<'_> {
             id,
             height,
         )
+    }
+
+    /// Clicks a slot in the open container menu. `slot` is the menu slot
+    /// (`Inventory::menu_item`); `-999` means outside the menu. `button` is
+    /// the vanilla button number: 0 primary, 1 secondary, 0 to 8 or 40 for a
+    /// swap, and 0/1 for a throw. `input` selects pickup, shift-move, swap or
+    /// throw; unsupported inputs are ignored. The client applies the click
+    /// locally and sends its prediction; the server's slot updates win.
+    pub fn click_container(&mut self, slot: i16, button: i8, input: ContainerInput) {
+        self.actions.container_click = Some((slot, button, input));
+    }
+
+    /// Presses a menu button (enchantment table, stonecutter) in the open
+    /// container.
+    pub fn click_container_button(&mut self, button_id: i32) {
+        self.actions.container_button = Some(button_id);
     }
 
     /// Closes the container screen the server opened (Escape), after the

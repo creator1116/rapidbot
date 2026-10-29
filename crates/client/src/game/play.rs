@@ -570,6 +570,63 @@ impl Game {
                 abilities.flying_speed = a.flying_speed;
                 abilities.walking_speed = a.walking_speed;
             }
+            cb::InitializeBorder::ID => {
+                let border = packet.decode::<cb::InitializeBorder>()?;
+                let play = play_mut(&mut self.play)?;
+                let world_border = &mut play.player.physics.world_border;
+                world_border.set_center(border.center_x, border.center_z);
+                let ticks = u32::try_from(border.lerp_time.0.max(0)).unwrap_or(u32::MAX);
+                if ticks > 0 {
+                    world_border.lerp_size_between(border.old_size, border.new_size, ticks);
+                } else {
+                    world_border.set_size(border.new_size);
+                }
+                world_border.set_absolute_max_size(border.absolute_max_size);
+                world_border.set_warning_blocks(border.warning_blocks);
+                world_border.set_warning_time(border.warning_time);
+            }
+            cb::SetBorderCenter::ID => {
+                let border = packet.decode::<cb::SetBorderCenter>()?;
+                play_mut(&mut self.play)?
+                    .player
+                    .physics
+                    .world_border
+                    .set_center(border.center_x, border.center_z);
+            }
+            cb::SetBorderLerpSize::ID => {
+                let border = packet.decode::<cb::SetBorderLerpSize>()?;
+                let ticks = u32::try_from(border.lerp_time.0.max(0)).unwrap_or(u32::MAX);
+                let world_border = &mut play_mut(&mut self.play)?.player.physics.world_border;
+                if ticks == 0 {
+                    world_border.set_size(border.new_size);
+                } else {
+                    world_border.lerp_size_between(border.old_size, border.new_size, ticks);
+                }
+            }
+            cb::SetBorderSize::ID => {
+                let border = packet.decode::<cb::SetBorderSize>()?;
+                play_mut(&mut self.play)?
+                    .player
+                    .physics
+                    .world_border
+                    .set_size(border.size);
+            }
+            cb::SetBorderWarningDelay::ID => {
+                let border = packet.decode::<cb::SetBorderWarningDelay>()?;
+                play_mut(&mut self.play)?
+                    .player
+                    .physics
+                    .world_border
+                    .set_warning_time(border.warning_delay);
+            }
+            cb::SetBorderWarningDistance::ID => {
+                let border = packet.decode::<cb::SetBorderWarningDistance>()?;
+                play_mut(&mut self.play)?
+                    .player
+                    .physics
+                    .world_border
+                    .set_warning_blocks(border.warning_blocks);
+            }
             cb::SetHealth::ID => {
                 let health = packet.decode::<cb::SetHealth>()?;
                 let play = play_mut(&mut self.play)?;

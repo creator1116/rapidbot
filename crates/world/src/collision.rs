@@ -30,6 +30,13 @@ impl EntityCollisionContext {
         self.entity_bottom
             .is_some_and(|bottom| bottom > y as f64 + shape_top - 1.0e-5)
     }
+
+    /// `CollisionContext.isAbove(shape, pos, defaultValue)`: with no entity,
+    /// callers that pass `true` treat the shape as above.
+    fn is_above_or(&self, y: i32, shape_top: f64, default: bool) -> bool {
+        self.entity_bottom
+            .map_or(default, |bottom| bottom > y as f64 + shape_top - 1.0e-5)
+    }
 }
 
 fn full_block_shape() -> &'static Shape {
@@ -54,6 +61,68 @@ fn falling_powder_snow_shape() -> &'static Shape {
     })
 }
 
+/// `ScaffoldingBlock.SHAPE_STABLE`: the 16x16 top slab at y 14-16 and the
+/// four 2x2 corner posts.
+fn scaffolding_stable_shape() -> &'static Shape {
+    static SHAPE: OnceLock<Shape> = OnceLock::new();
+    SHAPE.get_or_init(|| {
+        let coords = [0.0, 2.0 / 16.0, 14.0 / 16.0, 1.0];
+        let mut fill = Vec::with_capacity(3 * 2 * 3);
+        for x in 0..3 {
+            for y in 0..2 {
+                for z in 0..3 {
+                    let corner = (x == 0 || x == 2) && (z == 0 || z == 2);
+                    fill.push(corner || y == 1);
+                }
+            }
+        }
+        Shape::new(
+            [
+                coords.to_vec(),
+                vec![0.0, 14.0 / 16.0, 1.0],
+                coords.to_vec(),
+            ],
+            fill,
+            false,
+        )
+    })
+}
+
+/// `ScaffoldingBlock.SHAPE_UNSTABLE_BOTTOM`: the 16x16 base at y 0-2.
+fn scaffolding_bottom_shape() -> &'static Shape {
+    static SHAPE: OnceLock<Shape> = OnceLock::new();
+    SHAPE.get_or_init(|| {
+        Shape::new(
+            [vec![0.0, 1.0], vec![0.0, 2.0 / 16.0], vec![0.0, 1.0]],
+            vec![true],
+            false,
+        )
+    })
+}
+
+/// `ScaffoldingBlock.getCollisionShape` with an entity context.
+fn scaffolding_shape(
+    state: u32,
+    y: i32,
+    registry: &Registry,
+    context: &EntityCollisionContext,
+) -> Option<&'static Shape> {
+    if context.is_above_or(y, 1.0, true) && !context.descending {
+        return Some(scaffolding_stable_shape());
+    }
+    let distance = registry
+        .property(state, "distance")
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+    if distance != 0
+        && registry.property(state, "bottom") == Some("true")
+        && context.is_above_or(y, 0.0, true)
+    {
+        return Some(scaffolding_bottom_shape());
+    }
+    None
+}
+
 /// `PowderSnowBlock.getCollisionShape` with an entity context.
 fn powder_snow_shape(y: i32, context: &EntityCollisionContext) -> Option<&'static Shape> {
     context.entity_bottom?;
@@ -69,7 +138,7 @@ fn powder_snow_shape(y: i32, context: &EntityCollisionContext) -> Option<&'stati
 /// Every block collision shape touching `bbox`, in `BlockCollisions` order.
 ///
 /// Entity-dependent shapes are supplied through `context`; entity colliders
-/// (boats, shulkers), scaffolding, and the world border are not modelled yet.
+/// and the world border are joined by the physics layer.
 pub fn block_collisions<'r>(
     world: &World,
     registry: &'r Registry,
@@ -111,7 +180,8 @@ pub fn block_collisions_with<'r>(
                 let info = registry.state(state);
                 let block = registry.block_of(state);
                 let powder_snow = block.name == "minecraft:powder_snow";
-                if !powder_snow {
+                let scaffolding = block.name == "minecraft:scaffolding";
+                if !powder_snow && !scaffolding {
                     if face_type == 1 && !info.has_large_collision_shape {
                         continue;
                     }
@@ -119,7 +189,12 @@ pub fn block_collisions_with<'r>(
                         continue;
                     }
                 }
-                let shape = if powder_snow {
+                let shape = if scaffolding {
+                    let Some(shape) = scaffolding_shape(state, y, registry, &context) else {
+                        continue;
+                    };
+                    shape
+                } else if powder_snow {
                     let Some(shape) = powder_snow_shape(y, &context) else {
                         continue;
                     };

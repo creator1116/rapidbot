@@ -1,6 +1,8 @@
 //! Server resource packs, as far as the server can tell: the prompt, the
 //! HTTP download, and the status packets in vanilla's order (`ACCEPTED`,
-//! `DOWNLOADED`, `SUCCESSFULLY_LOADED`). The pack itself is not used.
+//! `DOWNLOADED`, `SUCCESSFULLY_LOADED`). The selected pack files are kept for
+//! lookups and their `en_us` language map is applied to rendered chat
+//! components; textures, models and sounds are not interpreted.
 //!
 //! The download is real because servers can see it: some check their web
 //! server's log for the request before letting a player through. The
@@ -9,6 +11,7 @@
 //! the JVM). The TLS handshake of an `https`
 //! download is rustls', not Java's.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +68,10 @@ struct Pack {
     reported: bool,
     /// Loaded by a finished reload (or failed to).
     settled: bool,
+    /// The reload that settled this pack succeeded, so its files are active.
+    loaded: bool,
+    /// The files selected by the pack's overlays.
+    resources: Option<Arc<LoadedPack>>,
 }
 
 type DownloadResult = (Uuid, Result<Downloaded, String>);
@@ -77,7 +84,31 @@ struct Downloaded {
     /// parseable feature and overlay sections. Format errors use vanilla's
     /// fallback rather than failing the pack.
     valid: bool,
+    /// `Some` exactly when `valid` is true.
+    resources: Option<Arc<LoadedPack>>,
     from_cache: bool,
+}
+
+/// The files from one pack after selecting the overlays that apply to this
+/// client's resource format. The zip's `pack.mcmeta` and `assets/`/`data/`
+/// files are kept; textures and models are not interpreted, but their bytes
+/// are available to callers that need them.
+struct LoadedPack {
+    files: HashMap<String, Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for LoadedPack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedPack")
+            .field("files", &self.files.len())
+            .finish()
+    }
+}
+
+impl LoadedPack {
+    fn get(&self, path: &str) -> Option<&[u8]> {
+        self.files.get(path).map(|bytes| bytes.as_ref())
+    }
 }
 
 pub(crate) struct PackManager {
@@ -93,6 +124,8 @@ pub(crate) struct PackManager {
     /// A resource reload in progress: when it ends and which packs it loads.
     reload: Option<(Instant, Vec<Uuid>)>,
     downloaded_bytes: u64,
+    /// `en_us` strings from the active packs, later packs overriding earlier.
+    translations: HashMap<String, String>,
 }
 
 /// What the game loop should do after giving the manager a turn.
@@ -130,12 +163,67 @@ impl PackManager {
             results,
             reload: None,
             downloaded_bytes: 0,
+            translations: HashMap::new(),
         }
     }
 
     /// True while the pack prompt is on screen: no keys, no mouse.
     pub fn screen_open(&self) -> bool {
         matches!(self.prompt, Prompt::Showing { .. })
+    }
+
+    /// A file from the active pack stack. Packs pushed later win, as when
+    /// vanilla appends a server pack to the selected pack list.
+    pub(crate) fn resource(&self, path: &str) -> Option<&[u8]> {
+        self.packs.iter().rev().find_map(|pack| {
+            if !pack.loaded {
+                return None;
+            }
+            pack.resources.as_ref()?.get(path)
+        })
+    }
+
+    /// The `en_us` language map built from the active packs.
+    pub(crate) fn translations(&self) -> &HashMap<String, String> {
+        &self.translations
+    }
+
+    /// Re-read every active pack's `en_us.json`, low to high priority.
+    fn rebuild_translations(&mut self) {
+        let mut translations = HashMap::new();
+        for pack in &self.packs {
+            if !pack.loaded {
+                continue;
+            }
+            let Some(files) = &pack.resources else {
+                continue;
+            };
+            let Some(bytes) = files.get("assets/minecraft/lang/en_us.json") else {
+                continue;
+            };
+            let value: serde_json::Value = match serde_json::from_slice(bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(id = %pack.id, %error, "resource pack language file is not JSON");
+                    continue;
+                }
+            };
+            let Some(object) = value.as_object() else {
+                warn!(id = %pack.id, "resource pack language file is not an object");
+                continue;
+            };
+            for (key, value) in object {
+                if let Some(value) = value.as_str() {
+                    translations.insert(key.clone(), value.to_owned());
+                }
+            }
+        }
+        self.translations = translations;
+        debug!(
+            strings = self.translations.len(),
+            has_language_file = self.resource("assets/minecraft/lang/en_us.json").is_some(),
+            "resource pack language data"
+        );
     }
 
     /// `handleResourcePackPush`.
@@ -173,6 +261,7 @@ impl PackManager {
         }
         // markExistingPacksAsRemoved: a pack pushed again replaces itself.
         self.packs.retain(|p| p.id != id);
+        self.rebuild_translations();
         self.packs.push(Pack {
             id,
             url,
@@ -180,6 +269,8 @@ impl PackManager {
             download: Download::Waiting,
             reported: false,
             settled: false,
+            loaded: false,
+            resources: None,
         });
         if self.prompt == Prompt::Allowed {
             self.accept(self.packs.len() - 1, &mut turn);
@@ -195,6 +286,7 @@ impl PackManager {
             Some(id) => self.packs.retain(|p| p.id != id),
             None => self.packs.clear(),
         }
+        self.rebuild_translations();
     }
 
     /// `acceptPack`, then the download starts (`updateDownloads`).
@@ -266,10 +358,12 @@ impl PackManager {
                     info!(%id, size = done.size, sha1 = %done.sha1, cached = done.from_cache, "resource pack downloaded");
                     self.downloaded_bytes += done.size;
                     pack.download = Download::Done { valid: done.valid };
+                    pack.resources = done.resources;
                 }
                 Err(error) => {
                     warn!(%id, "resource pack download failed: {error}");
                     pack.download = Download::Failed;
+                    pack.resources = None;
                 }
             }
         }
@@ -326,6 +420,7 @@ impl PackManager {
             });
             for pack in self.packs.iter_mut().filter(|p| ready.contains(&p.id)) {
                 pack.settled = true;
+                pack.loaded = batch_loads && pack.resources.is_some();
                 turn.responses.push((
                     pack.id,
                     if batch_loads {
@@ -335,6 +430,7 @@ impl PackManager {
                     },
                 ));
             }
+            self.rebuild_translations();
         }
         turn
     }
@@ -364,14 +460,16 @@ async fn download(request: Request) -> Result<Downloaded, String> {
     {
         match std::fs::read(marker) {
             Ok(body) if sha1_hex(&body) == *hash => {
-                let valid = validate_pack(&body);
-                if let Err(error) = &valid {
+                let loaded = read_pack(&body);
+                if let Err(error) = &loaded {
                     warn!(%error, "cached resource pack would fail vanilla's reload");
                 }
+                let resources = loaded.ok().map(Arc::new);
                 return Ok(Downloaded {
                     sha1: hash.clone(),
                     size: body.len() as u64,
-                    valid: valid.is_ok(),
+                    valid: resources.is_some(),
+                    resources,
                     from_cache: true,
                 });
             }
@@ -392,13 +490,11 @@ async fn download(request: Request) -> Result<Downloaded, String> {
             "hash of downloaded file ({sha1}) did not match requested ({hash})"
         ));
     }
-    let valid = match validate_pack(&body) {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(%error, "downloaded resource pack would fail vanilla's reload");
-            false
-        }
-    };
+    let loaded = read_pack(&body);
+    if let Err(error) = &loaded {
+        warn!(%error, "downloaded resource pack would fail vanilla's reload");
+    }
+    let resources = loaded.ok().map(Arc::new);
     if let Some(dir) = &request.cache {
         let marker = dir.join(request.id.to_string()).join(&sha1);
         if let Some(parent) = marker.parent() {
@@ -409,7 +505,8 @@ async fn download(request: Request) -> Result<Downloaded, String> {
     Ok(Downloaded {
         sha1,
         size: body.len() as u64,
-        valid,
+        valid: resources.is_some(),
+        resources,
         from_cache: false,
     })
 }
@@ -421,17 +518,18 @@ fn sha1_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `Pack.readPackMetadata` for a downloaded zip: `FilePackResources` opens
-/// the archive and reads the root `pack.mcmeta`; a missing pack section or
-/// description makes `loadRequestedPacks` fail the reload. The pack's
-/// declared version does not have to match the game: vanilla only labels it
-/// incompatible, it still loads.
+/// `Pack.readPackMetadata` and the resource load for a downloaded zip:
+/// `FilePackResources` opens the archive and reads the root `pack.mcmeta`;
+/// a missing pack section or description makes `loadRequestedPacks` fail the
+/// reload. The pack's declared version does not have to match the game:
+/// vanilla only labels it incompatible, it still loads.
 ///
 /// This is a best-effort version of that reader. It checks the component
-/// shape, feature flags and overlays, but does not compile selectors or NBT
-/// paths, does not inspect every object/click/hover payload, and does not load
-/// the pack's resource files; see `docs/architecture.md`.
-fn validate_pack(body: &[u8]) -> Result<(), String> {
+/// shape, feature flags and overlays, then keeps the files under the root and
+/// the overlays selected for this client's resource format. It does not
+/// compile selectors or NBT paths or inspect every object/click/hover payload;
+/// see `docs/architecture.md`.
+fn read_pack(body: &[u8]) -> Result<LoadedPack, String> {
     let mut archive =
         ZipArchive::new(Cursor::new(body)).map_err(|e| format!("not a valid zip: {e}"))?;
     let mut meta = archive
@@ -463,8 +561,85 @@ fn validate_pack(body: &[u8]) -> Result<(), String> {
     // error in either one makes readPackMetadata return null for the whole
     // pack rather than falling back.
     validate_features(root)?;
-    validate_overlays(root)?;
-    Ok(())
+    let overlays = validate_overlays(root)?;
+
+    let mut files = HashMap::new();
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("could not read zip entry: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry
+            .name()
+            .map_err(|e| format!("could not read zip entry name: {e}"))?
+            .replace('\\', "/");
+        let Some(path) = safe_resource_path(&name) else {
+            continue;
+        };
+        let target = overlay_target(&path, &overlays).unwrap_or(path);
+        if !is_resource_path(&target) {
+            continue;
+        }
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .map_err(|e| format!("could not read {name}: {e}"))?;
+        total = total.saturating_add(data.len() as u64);
+        if total > MAX_PACK_SIZE * 2 {
+            return Err("resource pack expands beyond the size limit".into());
+        }
+        files.insert(target, Arc::from(data));
+    }
+    Ok(LoadedPack { files })
+}
+
+/// The metadata check in tests; a pack is valid when it can also be loaded
+/// into the resource stack.
+#[cfg(test)]
+fn validate_pack(body: &[u8]) -> Result<(), String> {
+    read_pack(body).map(|_| ())
+}
+
+/// Zip paths are relative and never leave the archive. This also drops
+/// absolute paths and `..` segments, which vanilla's `Path.resolve` would
+/// reject or confine.
+fn safe_resource_path(name: &str) -> Option<String> {
+    if name.starts_with('/')
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// A client resource reload reads the `assets` tree; `data` is kept for
+/// callers that want pack metadata. `pack.mcmeta` is kept for inspection but
+/// is not a resource.
+fn is_resource_path(path: &str) -> bool {
+    path == "pack.mcmeta" || path.starts_with("assets/") || path.starts_with("data/")
+}
+
+/// Strip the selected overlay directory from a path. A `pack.mcmeta` inside
+/// an overlay is not allowed to replace the root metadata.
+fn overlay_target(path: &str, overlays: &[String]) -> Option<String> {
+    for directory in overlays {
+        let Some(rest) = path
+            .strip_prefix(directory.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        if rest == "pack.mcmeta" {
+            return None;
+        }
+        return Some(rest.to_owned());
+    }
+    None
 }
 
 /// The component shapes `ComponentSerialization.CODEC` accepts. Strings and
@@ -843,12 +1018,16 @@ fn validate_features(root: &serde_json::Map<String, serde_json::Value>) -> Resul
 /// `OverlayMetadataSection`: the top-level `overlays.entries` list. The
 /// per-entry format rules are the same as `PackFormat.validateHolderList`,
 /// including the `formats` requirement when any entry supports a pre-minor
-/// version.
-fn validate_overlays(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+/// version. Returns the directories whose range contains `97.1`, in entry
+/// order (later overlays take priority).
+fn validate_overlays(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, String> {
     const LAST_PRE_MINOR: i64 = 64;
+    const CLIENT_FORMAT: (i64, i64) = (97, 1);
 
     let Some(overlays) = root.get("overlays") else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let overlays = overlays
         .as_object()
@@ -892,12 +1071,12 @@ fn validate_overlays(root: &serde_json::Map<String, serde_json::Value>) -> Resul
                 "pack.mcmeta overlays entry must declare both min_format and max_format".into(),
             );
         }
-        parsed.push((min, max, formats));
+        parsed.push((directory.to_owned(), min, max, formats));
     }
 
     let min_version = parsed
         .iter()
-        .filter_map(|(min, _, formats)| match (min, formats) {
+        .filter_map(|(_, min, _, formats)| match (min, formats) {
             (Some(min), Some((lo, _))) => Some(min.0.min(*lo)),
             (Some(min), None) => Some(min.0),
             (None, Some((lo, _))) => Some(*lo),
@@ -907,7 +1086,7 @@ fn validate_overlays(root: &serde_json::Map<String, serde_json::Value>) -> Resul
         .unwrap_or(i64::from(i32::MAX));
     let require_old_field = min_version <= LAST_PRE_MINOR;
 
-    for (min, max, formats) in parsed {
+    for (_, min, max, formats) in parsed.iter().cloned() {
         if min.is_none() && formats.is_none() {
             // PackFormat.validateHolderList logs and skips such entries.
             continue;
@@ -945,7 +1124,23 @@ fn validate_overlays(root: &serde_json::Map<String, serde_json::Value>) -> Resul
             );
         }
     }
-    Ok(())
+
+    Ok(parsed
+        .into_iter()
+        .filter_map(|(directory, min, max, formats)| {
+            let (low, high) = match (min, max) {
+                (Some(min), Some(max)) => (min, max),
+                // The old field is an inclusive range of major versions; a
+                // minor version inside that major is supported.
+                (None, None) => {
+                    formats.map(|(low, high)| ((low, 0), (high, i64::from(i32::MAX))))?
+                }
+                // `validateHolderList` has already rejected a half range.
+                _ => return None,
+            };
+            (low <= CLIENT_FORMAT && CLIENT_FORMAT <= high).then_some(directory)
+        })
+        .collect())
 }
 
 /// The part of `PackFormat.packCodec` that `Pack.readPackMetadata` tries
@@ -1358,13 +1553,19 @@ mod tests {
         r#"{"pack":{"description":"test","min_format":[97,0],"max_format":[97,1]}}"#;
 
     fn pack_zip(meta: &str) -> Vec<u8> {
+        pack_zip_with(&[("pack.mcmeta", meta.as_bytes())])
+    }
+
+    fn pack_zip_with(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut out);
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file("pack.mcmeta", options).unwrap();
-            zip.write_all(meta.as_bytes()).unwrap();
+            for (name, data) in files {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
             zip.finish().unwrap();
         }
         out.into_inner()
@@ -1773,6 +1974,8 @@ mod tests {
                 download: Download::Done { valid },
                 reported: true,
                 settled: false,
+                loaded: false,
+                resources: None,
             });
         }
         assert!(manager.poll(false).responses.is_empty());
@@ -1782,6 +1985,110 @@ mod tests {
             manager.poll(false).responses,
             [(a, Action::FailedReload), (b, Action::FailedReload)]
         );
+    }
+
+    #[test]
+    fn overlay_resources_follow_the_client_format() {
+        let meta = r#"{"pack":{"description":"x"},"overlays":{"entries":[
+            {"directory":"old","formats":[64,64]},
+            {"directory":"active","min_format":[97,0],"max_format":[97,1],"formats":[97,97]},
+            {"directory":"future","min_format":[98,0],"max_format":[98,1],"formats":[98,98]}
+        ]}}"#;
+        let zip = pack_zip_with(&[
+            ("pack.mcmeta", meta.as_bytes()),
+            ("assets/minecraft/lang/en_us.json", br#"{"key":"root"}"#),
+            ("data/example/root.txt", b"root data"),
+            (
+                "active/assets/minecraft/lang/en_us.json",
+                br#"{"key":"active"}"#,
+            ),
+            (
+                "future/assets/minecraft/lang/en_us.json",
+                br#"{"key":"future"}"#,
+            ),
+            ("old/assets/minecraft/lang/en_us.json", br#"{"key":"old"}"#),
+            ("assets/minecraft/texts/unsafe.txt", b"kept"),
+        ]);
+        let pack = read_pack(&zip).unwrap();
+        assert_eq!(
+            pack.get("assets/minecraft/lang/en_us.json"),
+            Some(&br#"{"key":"active"}"#[..])
+        );
+        assert_eq!(pack.get("data/example/root.txt"), Some(&b"root data"[..]));
+        assert!(pack.get("old/assets/minecraft/lang/en_us.json").is_none());
+        assert!(
+            pack.get("future/assets/minecraft/lang/en_us.json")
+                .is_none()
+        );
+        assert!(pack.get("assets/minecraft/texts/unsafe.txt").is_some());
+    }
+
+    fn loaded_pack(language: &str) -> Arc<LoadedPack> {
+        let zip = pack_zip_with(&[
+            ("pack.mcmeta", VALID_META.as_bytes()),
+            ("assets/minecraft/lang/en_us.json", language.as_bytes()),
+        ]);
+        Arc::new(read_pack(&zip).unwrap())
+    }
+
+    fn loaded_entry(id: Uuid, language: &str) -> Pack {
+        Pack {
+            id,
+            url: Url::parse("http://127.0.0.1:1/pack.zip").unwrap(),
+            hash: None,
+            download: Download::Done { valid: true },
+            reported: true,
+            settled: true,
+            loaded: true,
+            resources: Some(loaded_pack(language)),
+        }
+    }
+
+    #[test]
+    fn pack_stack_and_language_after_pop() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut manager = PackManager::new(
+            ResourcePackPolicy::Enabled,
+            "Steve".into(),
+            profile(),
+            None,
+            1,
+        );
+        manager
+            .packs
+            .push(loaded_entry(a, r#"{"key":"one","first":"a"}"#));
+        manager.packs.push(loaded_entry(b, r#"{"key":"two"}"#));
+        manager.rebuild_translations();
+
+        assert_eq!(manager.translations().get("key").unwrap(), "two");
+        assert_eq!(manager.translations().get("first").unwrap(), "a");
+        assert_eq!(
+            manager.resource("assets/minecraft/lang/en_us.json"),
+            Some(&br#"{"key":"two"}"#[..])
+        );
+
+        manager.pop(Some(b));
+        assert_eq!(manager.translations().get("key").unwrap(), "one");
+        assert_eq!(
+            manager.resource("assets/minecraft/lang/en_us.json"),
+            Some(&br#"{"key":"one","first":"a"}"#[..])
+        );
+
+        manager.pop(None);
+        assert!(manager.translations().is_empty());
+        assert!(
+            manager
+                .resource("assets/minecraft/lang/en_us.json")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsafe_zip_paths_are_ignored() {
+        assert!(safe_resource_path("../escape").is_none());
+        assert!(safe_resource_path("assets/../escape").is_none());
+        assert!(safe_resource_path("/absolute").is_none());
+        assert!(safe_resource_path("assets/minecraft/ok.txt").is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

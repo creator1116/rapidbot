@@ -123,6 +123,7 @@ impl PlayState {
             carried_index: 0,
             game_mode: crate::interact::GameMode::new(),
         };
+        state.inventory.creative = state.game_type == GameType::Creative;
         state.start_waiting_for_new_level();
         state
     }
@@ -451,6 +452,7 @@ impl Game {
                         let mut id: &[u8] = &[event.param as u8];
                         play.game_type = GameType::decode(&mut id)?;
                         play.player.physics.spectator = play.game_type == GameType::Spectator;
+                        play.inventory.creative = play.game_type == GameType::Creative;
                     }
                     _ => {}
                 }
@@ -828,6 +830,7 @@ impl Game {
                 self.slot_press = None;
                 self.close_press = None;
                 play.game_type = respawn.spawn.game_type;
+                play.inventory.creative = play.game_type == GameType::Creative;
                 play.player.physics.spectator = play.game_type == GameType::Spectator;
                 play.player.physics.fast_lava =
                     fast_lava(&self.session, respawn.spawn.dimension_type);

@@ -60,12 +60,12 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `mouse.rs` | Vanilla sensitivity maths: mouse counts to rotation |
 | `entities.rs` | Other entities: interpolation, sizes, entity data, tab list |
 | `inventory.rs` | Inventory and server-opened containers |
-| `interact.rs` | Crosshair pick, digging, block-change predictions, attacking |
+| `interact.rs` | Crosshair pick, digging, block-change predictions, block placement and entity interaction, attacking |
 | `chat.rs`, `commands.rs` | Chat sending and signing, last-seen tracking, the server's command tree |
 | `packs.rs` | Resource pack prompt, download and status packets; best-effort `pack.mcmeta` validation |
 | `status.rs` | Server list ping: raw handshake address, SRV-resolved socket |
 | `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
-| `combat.rs` | Target approach, aiming, and attack timing |
+| `combat.rs` | Target approach, aiming, strafing/retreating, and attack timing |
 | `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
 
 `packs.rs` reports `SUCCESSFULLY_LOADED` after a best-effort check of the

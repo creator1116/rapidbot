@@ -228,6 +228,14 @@ pub struct Entity {
     armor_stand_flags: u8,
     /// `AbstractArrow.IN_GROUND`.
     in_ground: bool,
+    /// `Interaction.DATA_WIDTH_ID`.
+    interaction_width: f32,
+    /// `Interaction.DATA_HEIGHT_ID`.
+    interaction_height: f32,
+    /// `HangingEntity.DATA_DIRECTION`: a `Direction` ordinal.
+    hanging_direction: Option<i32>,
+    /// The stack in an `ItemFrame`; a filled map makes its box larger.
+    framed_item: Option<ItemStack>,
 }
 
 /// `Mth.unpackDegrees`.
@@ -257,6 +265,13 @@ impl Entity {
     /// whose size is entity data (slimes) come out at the type's size.
     pub fn dimensions(&self) -> (f32, f32) {
         let info = self.info();
+        if info.is("Interaction") {
+            return (self.interaction_width, self.interaction_height);
+        }
+        if info.is("ItemFrame") {
+            let size = if self.has_framed_map() { 1.0 } else { 0.75 };
+            return (size, size);
+        }
         let (width, height, _) = Registry::get().entity_dimensions[self.type_id];
         let scaled = |w: f32, h: f32| {
             if self.scale != 1.0 {
@@ -292,8 +307,37 @@ impl Entity {
         scaled(width, height)
     }
 
-    /// `EntityDimensions.makeBoundingBox`: min and max corners.
+    /// The stack shown by an item frame, if any.
+    pub fn framed_item(&self) -> Option<&ItemStack> {
+        self.framed_item.as_ref()
+    }
+
+    fn has_framed_map(&self) -> bool {
+        self.framed_item
+            .as_ref()
+            .is_some_and(|stack| stack.name() == "minecraft:filled_map")
+    }
+
+    /// `EntityDimensions.makeBoundingBox`: min and max corners. Hanging
+    /// item frames are centered on their position and thin along the wall
+    /// they are attached to (`ItemFrame.createBoundingBox`).
     pub fn bounding_box(&self) -> ([f64; 3], [f64; 3]) {
+        if self.info().is("ItemFrame") {
+            let size = if self.has_framed_map() { 0.5 } else { 0.375 };
+            let thin = 0.03125;
+            let (x, y, z) = match self.hanging_direction.unwrap_or(3) {
+                // DOWN, UP: flat on a floor or ceiling.
+                0 | 1 => (size, thin, size),
+                // NORTH, SOUTH: thin along Z.
+                2 | 3 => (size, size, thin),
+                // WEST, EAST: thin along X.
+                _ => (thin, size, size),
+            };
+            return (
+                [self.pos.x - x, self.pos.y - y, self.pos.z - z],
+                [self.pos.x + x, self.pos.y + y, self.pos.z + z],
+            );
+        }
         let (width, height) = self.dimensions();
         let w = (width / 2.0) as f64;
         let h = height as f64;
@@ -311,9 +355,8 @@ impl Entity {
         )
     }
 
-    /// `Entity.isPickable`. Entities whose box is not the plain one around
-    /// their position (item frames, paintings, `interaction` entities,
-    /// dragon parts) are left out.
+    /// `Entity.isPickable`. Item frames and `interaction` entities have
+    /// boxes modeled here; paintings and dragon parts still do not.
     pub fn is_pickable(&self, tags: &Tags) -> bool {
         let info = self.info();
         if info.is("ArmorStand") {
@@ -321,6 +364,9 @@ impl Entity {
         }
         if info.is("EnderDragon") {
             return false;
+        }
+        if info.is("ItemFrame") || info.is("Interaction") {
+            return true;
         }
         if info.living {
             return true;
@@ -531,13 +577,15 @@ pub struct EntityHit {
 }
 
 /// One value of a `ClientboundSetEntityDataPacket`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DataValue {
     Byte(u8),
     Int(i32),
     Float(f32),
     Bool(bool),
     Pose(i32),
+    Direction(i32),
+    Item(Option<ItemStack>),
     Other,
 }
 
@@ -575,10 +623,7 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
                 }
                 DataValue::Other
             }
-            7 => {
-                ItemStack::decode(buf)?;
-                DataValue::Other
-            }
+            7 => DataValue::Item(ItemStack::decode(buf)?),
             8 => DataValue::Bool(bool::decode(buf)?),
             // Rotations, Vector3f.
             9 | 39 => {
@@ -597,8 +642,9 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
                 }
                 DataValue::Other
             }
-            // Direction, block states, optional unsigned int, arm, dye.
-            12 | 14 | 15 | 19 | 42 | 43 => {
+            12 => DataValue::Direction(VarInt::decode(buf)?.0),
+            // Block states, optional unsigned int, arm, dye.
+            14 | 15 | 19 | 42 | 43 => {
                 VarInt::decode(buf)?;
                 DataValue::Other
             }
@@ -821,6 +867,10 @@ impl Entities {
                 scale: 1.0,
                 armor_stand_flags: 0,
                 in_ground: false,
+                interaction_width: 1.0,
+                interaction_height: 1.0,
+                hanging_direction: None,
+                framed_item: None,
             },
         );
         Ok(self.by_id.get(&id))
@@ -977,6 +1027,18 @@ impl Entities {
                 (10, DataValue::Bool(in_ground)) if info.is("AbstractArrow") => {
                     entity.in_ground = in_ground
                 }
+                (8, DataValue::Direction(direction)) if info.is("HangingEntity") => {
+                    entity.hanging_direction = Some(direction);
+                }
+                (8, DataValue::Float(width)) if info.is("Interaction") => {
+                    entity.interaction_width = width;
+                }
+                (9, DataValue::Float(height)) if info.is("Interaction") => {
+                    entity.interaction_height = height;
+                }
+                (9, DataValue::Item(item)) if info.is("ItemFrame") => {
+                    entity.framed_item = item;
+                }
                 _ => {}
             }
         }
@@ -1049,6 +1111,7 @@ impl Entities {
 mod tests {
     use super::*;
     use rapidbot_buf::Encode;
+    use rapidbot_world::item::ItemData;
 
     fn type_id(name: &str) -> i32 {
         Registry::get()
@@ -1203,6 +1266,47 @@ mod tests {
         assert_eq!((min[0], max[1]), (-(0.3f32 as f64), 64.0 + 1.5));
         e.set_scale(7, 2.0);
         assert_eq!(e.get(7).unwrap().dimensions(), (1.2, 3.0));
+    }
+
+    #[test]
+    fn item_frames_and_interactions_have_their_own_boxes() {
+        let mut e = Entities::default();
+        add(&mut e, 7, "minecraft:item_frame", [1.0, 64.0, 0.0]);
+        // Hanging direction SOUTH (3), no item yet.
+        e.set_entity_data(7, &[8, 12, 3, 0xff]).unwrap();
+        let frame = e.get(7).unwrap();
+        assert!(frame.is_pickable(&Tags::default()));
+        assert_eq!(frame.dimensions(), (0.75, 0.75));
+        let (min, max) = frame.bounding_box();
+        assert_eq!(min, [0.625, 63.625, -0.03125]);
+        assert_eq!(max, [1.375, 64.375, 0.03125]);
+
+        // A filled map makes the frame a full block square.
+        let map = ItemData::get().item_id("minecraft:filled_map").unwrap();
+        let mut data = vec![9u8, 7];
+        VarInt(1).encode(&mut data);
+        VarInt(map as i32).encode(&mut data);
+        data.extend_from_slice(&[0, 0, 0xff]);
+        e.set_entity_data(7, &data).unwrap();
+        let frame = e.get(7).unwrap();
+        assert_eq!(frame.dimensions(), (1.0, 1.0));
+        let (min, max) = frame.bounding_box();
+        assert_eq!(min, [0.5, 63.5, -0.03125]);
+        assert_eq!(max, [1.5, 64.5, 0.03125]);
+
+        // An interaction entity's width and height are entity data.
+        add(&mut e, 8, "minecraft:interaction", [1.0, 64.0, 0.0]);
+        let mut data = vec![8u8, 3];
+        2.0f32.encode(&mut data);
+        data.extend_from_slice(&[9, 3]);
+        3.0f32.encode(&mut data);
+        data.push(0xff);
+        e.set_entity_data(8, &data).unwrap();
+        let interaction = e.get(8).unwrap();
+        assert!(interaction.is_pickable(&Tags::default()));
+        assert_eq!(interaction.dimensions(), (2.0, 3.0));
+        assert_eq!(interaction.bounding_box().0, [0.0, 64.0, -1.0]);
+        assert_eq!(interaction.bounding_box().1, [2.0, 67.0, 1.0]);
     }
 
     #[test]

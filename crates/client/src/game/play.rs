@@ -199,14 +199,34 @@ impl PlayState {
         });
     }
 
-    /// Right-clicks a block: `MultiPlayerGameMode.useItemOn`, without local
-    /// block prediction. The server answers with block updates, which the
-    /// world applies when they arrive.
-    pub fn use_block(&self, net: &PacketSender, hit: &rapidbot_world::raycast::BlockHit) {
+    /// Right-clicks a block: `MultiPlayerGameMode.useItemOn`, including
+    /// the local block prediction. The server answers with block updates,
+    /// which the world applies when their acknowledgement arrives.
+    pub fn use_block(&mut self, net: &PacketSender, hit: &rapidbot_world::raycast::BlockHit) {
         if self.game_type == GameType::Spectator {
             return;
         }
-        crate::interact::send_use_item_on(net, hit);
+        let Self {
+            player,
+            world,
+            inventory,
+            entities,
+            tags,
+            game_mode,
+            game_type,
+            ..
+        } = self;
+        let mut hands = crate::interact::Hands {
+            player: &mut player.physics,
+            world,
+            inventory,
+            entities,
+            tags,
+            net,
+            restricted: matches!(game_type, GameType::Spectator | GameType::Adventure),
+            survival: *game_type != GameType::Creative,
+        };
+        game_mode.use_item_on(&mut hands, hit);
     }
 
     /// The use button: `Minecraft.startUseItem` plus `handleKeybinds`.

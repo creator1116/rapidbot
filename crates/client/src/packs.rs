@@ -73,8 +73,9 @@ struct Downloaded {
     sha1: String,
     size: u64,
     /// Passes our best-effort `Pack.readPackMetadata`: a zip with a root
-    /// `pack.mcmeta`, a `pack` object and a component-shaped description.
-    /// Format errors use vanilla's fallback rather than failing the pack.
+    /// `pack.mcmeta`, a `pack` object, a component-shaped description, and
+    /// parseable feature and overlay sections. Format errors use vanilla's
+    /// fallback rather than failing the pack.
     valid: bool,
     from_cache: bool,
 }
@@ -426,9 +427,10 @@ fn sha1_hex(bytes: &[u8]) -> String {
 /// declared version does not have to match the game: vanilla only labels it
 /// incompatible, it still loads.
 ///
-/// This is a best-effort version of that reader. In particular it does not
-/// decode the full component codec behind `description`, and it does not
-/// read `features` or `overlays`; see `docs/architecture.md`.
+/// This is a best-effort version of that reader. It checks the component
+/// shape, feature flags and overlays, but does not compile selectors or NBT
+/// paths, does not inspect every object/click/hover payload, and does not load
+/// the pack's resource files; see `docs/architecture.md`.
 fn validate_pack(body: &[u8]) -> Result<(), String> {
     let mut archive =
         ZipArchive::new(Cursor::new(body)).map_err(|e| format!("not a valid zip: {e}"))?;
@@ -442,6 +444,7 @@ fn validate_pack(body: &[u8]) -> Result<(), String> {
 
     let root: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("pack.mcmeta is not JSON: {e}"))?;
+    let root = root.as_object().ok_or("pack.mcmeta is not a JSON object")?;
     let pack = root
         .get("pack")
         .and_then(serde_json::Value::as_object)
@@ -456,16 +459,22 @@ fn validate_pack(body: &[u8]) -> Result<(), String> {
     if let Err(error) = validate_pack_formats(pack) {
         debug!(%error, "pack.mcmeta format declaration failed; vanilla uses its fallback codec");
     }
+    // The other metadata sections are read after the pack section, and an
+    // error in either one makes readPackMetadata return null for the whole
+    // pack rather than falling back.
+    validate_features(root)?;
+    validate_overlays(root)?;
     Ok(())
 }
 
-/// The shape `ComponentSerialization.CODEC` accepts without descending into
-/// every content codec: a string, a non-empty list of components, or an
-/// object. An empty list is rejected as vanilla does; object contents are not
-/// decoded any further.
+/// The component shapes `ComponentSerialization.CODEC` accepts. Strings and
+/// non-empty lists are complete; object contents are checked against the
+/// content codecs and style fields below. The check is deliberately
+/// conservative where vanilla would need a command parser (selector and NBT
+/// paths).
 fn validate_description(value: &serde_json::Value) -> Result<(), String> {
     match value {
-        serde_json::Value::String(_) | serde_json::Value::Object(_) => Ok(()),
+        serde_json::Value::String(_) => Ok(()),
         serde_json::Value::Array(items) if !items.is_empty() => {
             for item in items {
                 validate_description(item)?;
@@ -475,8 +484,468 @@ fn validate_description(value: &serde_json::Value) -> Result<(), String> {
         serde_json::Value::Array(_) => {
             Err("pack.mcmeta pack description is an empty component list".into())
         }
+        serde_json::Value::Object(object) => validate_component_object(object),
         _ => Err("pack.mcmeta pack description is not a JSON text component".into()),
     }
+}
+
+type ComponentValidator = fn(&serde_json::Map<String, serde_json::Value>) -> Result<(), String>;
+
+fn validate_component_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(kind) = object.get("type") {
+        let kind = kind
+            .as_str()
+            .ok_or("pack.mcmeta description type is not a string")?;
+        match kind {
+            "text" => validate_text(object),
+            "translatable" => validate_translatable(object),
+            "keybind" => validate_keybind(object),
+            "score" => validate_score(object),
+            "selector" => validate_selector(object),
+            "nbt" => validate_nbt(object),
+            "object" => validate_object(object),
+            _ => Err(format!("pack.mcmeta description has unknown type {kind}")),
+        }?;
+    } else {
+        // Without a discriminator vanilla tries the content codecs in turn.
+        let validators: [ComponentValidator; 7] = [
+            validate_text,
+            validate_translatable,
+            validate_keybind,
+            validate_score,
+            validate_selector,
+            validate_nbt,
+            validate_object,
+        ];
+        if !validators.iter().any(|validate| validate(object).is_ok()) {
+            return Err("pack.mcmeta description object has no valid component content".into());
+        }
+    }
+    validate_extra(object)?;
+    validate_style(object)
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("pack.mcmeta description field {name} is not a string"))
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(value) = object.get(name)
+        && !value.is_string()
+    {
+        return Err(format!(
+            "pack.mcmeta description field {name} is not a string"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_text(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    string_field(object, "text").map(|_| ())
+}
+
+fn validate_translatable(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    string_field(object, "translate")?;
+    optional_string_field(object, "fallback")?;
+    if let Some(with) = object.get("with") {
+        let with = with
+            .as_array()
+            .ok_or("pack.mcmeta description translatable `with` is not a list")?;
+        for argument in with {
+            if argument.is_number() || argument.is_boolean() || argument.is_string() {
+                continue;
+            }
+            validate_description(argument)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_keybind(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    string_field(object, "keybind").map(|_| ())
+}
+
+fn validate_score(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let score = object
+        .get("score")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("pack.mcmeta description score is not an object")?;
+    string_field(score, "name")?;
+    string_field(score, "objective").map(|_| ())
+}
+
+fn validate_selector(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    string_field(object, "selector")?;
+    if let Some(separator) = object.get("separator") {
+        validate_description(separator)?;
+    }
+    Ok(())
+}
+
+fn validate_nbt(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    string_field(object, "nbt")?;
+    for name in ["interpret", "plain"] {
+        if let Some(value) = object.get(name)
+            && !value.is_boolean()
+        {
+            return Err(format!(
+                "pack.mcmeta description NBT field {name} is not a boolean"
+            ));
+        }
+    }
+    if object
+        .get("interpret")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && object
+            .get("plain")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err("pack.mcmeta description NBT flags interpret and plain are both true".into());
+    }
+    if let Some(separator) = object.get("separator") {
+        validate_description(separator)?;
+    }
+    // DataSources.CODEC has no default; one of its fuzzy fields is required.
+    if !["entity", "block", "storage"]
+        .iter()
+        .any(|name| object.get(*name).is_some_and(serde_json::Value::is_string))
+    {
+        return Err("pack.mcmeta description NBT component has no data source".into());
+    }
+    Ok(())
+}
+
+fn validate_object(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let kind = string_field(object, "object")?;
+    match kind {
+        "atlas" => {
+            let sprite = string_field(object, "sprite")?;
+            if !valid_identifier(sprite) {
+                return Err("pack.mcmeta description atlas sprite is not an identifier".into());
+            }
+            if let Some(atlas) = object.get("atlas") {
+                let atlas = atlas
+                    .as_str()
+                    .ok_or("pack.mcmeta description atlas id is not a string")?;
+                if !valid_identifier(atlas) {
+                    return Err("pack.mcmeta description atlas id is not an identifier".into());
+                }
+            }
+        }
+        "player" => {
+            if !matches!(
+                object.get("player"),
+                Some(serde_json::Value::String(_) | serde_json::Value::Object(_))
+            ) {
+                return Err("pack.mcmeta description player object has no player profile".into());
+            }
+            if let Some(hat) = object.get("hat")
+                && !hat.is_boolean()
+            {
+                return Err("pack.mcmeta description player hat is not a boolean".into());
+            }
+        }
+        _ => {
+            return Err(format!(
+                "pack.mcmeta description has unknown object type {kind}"
+            ));
+        }
+    }
+    if let Some(fallback) = object.get("fallback") {
+        validate_description(fallback)?;
+    }
+    Ok(())
+}
+
+fn validate_extra(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    if let Some(extra) = object.get("extra") {
+        let extra = extra
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .ok_or("pack.mcmeta description extra is not a non-empty list")?;
+        for item in extra {
+            validate_description(item)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_style(object: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    for name in [
+        "bold",
+        "italic",
+        "underlined",
+        "strikethrough",
+        "obfuscated",
+    ] {
+        if let Some(value) = object.get(name)
+            && !value.is_boolean()
+        {
+            return Err(format!(
+                "pack.mcmeta description style field {name} is not a boolean"
+            ));
+        }
+    }
+    if let Some(color) = object.get("color") {
+        let color = color
+            .as_str()
+            .ok_or("pack.mcmeta description color is not a string")?;
+        if !valid_color(color) {
+            return Err(format!("pack.mcmeta description has invalid color {color}"));
+        }
+    }
+    if let Some(shadow) = object.get("shadow_color")
+        && !(shadow.is_i64()
+            || shadow
+                .as_array()
+                .is_some_and(|values| values.len() == 4 && values.iter().all(|v| v.is_number())))
+    {
+        return Err("pack.mcmeta description shadow_color is not an integer or four floats".into());
+    }
+    optional_string_field(object, "insertion")?;
+    if let Some(font) = object.get("font") {
+        let font = font
+            .as_str()
+            .ok_or("pack.mcmeta description font is not a string")?;
+        if !valid_identifier(font) {
+            return Err("pack.mcmeta description font is not an identifier".into());
+        }
+    }
+    for (name, actions) in [
+        (
+            "click_event",
+            &[
+                "open_url",
+                "open_file",
+                "run_command",
+                "suggest_command",
+                "show_dialog",
+                "change_page",
+                "copy_to_clipboard",
+                "custom",
+            ][..],
+        ),
+        (
+            "hover_event",
+            &["show_text", "show_item", "show_entity"][..],
+        ),
+    ] {
+        if let Some(event) = object.get(name) {
+            let event = event
+                .as_object()
+                .ok_or_else(|| format!("pack.mcmeta description {name} is not an object"))?;
+            let action = string_field(event, "action")?;
+            if !actions.contains(&action) {
+                return Err(format!(
+                    "pack.mcmeta description {name} has unknown action {action}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_color(color: &str) -> bool {
+    const NAMED: [&str; 16] = [
+        "black",
+        "dark_blue",
+        "dark_green",
+        "dark_aqua",
+        "dark_red",
+        "dark_purple",
+        "gold",
+        "gray",
+        "dark_gray",
+        "blue",
+        "green",
+        "aqua",
+        "red",
+        "light_purple",
+        "yellow",
+        "white",
+    ];
+    if let Some(hex) = color.strip_prefix('#') {
+        return !hex.is_empty()
+            && hex.len() <= 8
+            && hex.chars().all(|c| c.is_ascii_hexdigit())
+            && u32::from_str_radix(hex, 16).is_ok_and(|value| value <= 0xFF_FF_FF);
+    }
+    NAMED.contains(&color)
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let (namespace, path) = match value.split_once(':') {
+        Some((namespace, path)) => (namespace, path),
+        None => ("minecraft", value),
+    };
+    !namespace.is_empty()
+        && !path.is_empty()
+        && namespace
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+        && path.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+        })
+}
+
+fn valid_overlay_directory(directory: &str) -> bool {
+    !directory.is_empty()
+        && directory
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// `FeatureFlagsMetadataSection`: the top-level `features.enabled` list.
+/// Unknown flags are an error in `FeatureFlagRegistry.codec`, not a warning.
+fn validate_features(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let Some(features) = root.get("features") else {
+        return Ok(());
+    };
+    let features = features
+        .as_object()
+        .ok_or("pack.mcmeta features is not an object")?;
+    let enabled = features
+        .get("enabled")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("pack.mcmeta features.enabled is not a list")?;
+    for flag in enabled {
+        let flag = flag
+            .as_str()
+            .ok_or("pack.mcmeta features.enabled contains a non-string")?;
+        let (namespace, path) = flag.split_once(':').unwrap_or(("minecraft", flag));
+        let known = namespace == "minecraft"
+            && matches!(
+                path,
+                "vanilla" | "trade_rebalance" | "redstone_experiments" | "minecart_improvements"
+            );
+        if !valid_identifier(flag) || !known {
+            return Err(format!("pack.mcmeta requests unknown feature flag {flag}"));
+        }
+    }
+    Ok(())
+}
+
+/// `OverlayMetadataSection`: the top-level `overlays.entries` list. The
+/// per-entry format rules are the same as `PackFormat.validateHolderList`,
+/// including the `formats` requirement when any entry supports a pre-minor
+/// version.
+fn validate_overlays(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    const LAST_PRE_MINOR: i64 = 64;
+
+    let Some(overlays) = root.get("overlays") else {
+        return Ok(());
+    };
+    let overlays = overlays
+        .as_object()
+        .ok_or("pack.mcmeta overlays is not an object")?;
+    let entries = overlays
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("pack.mcmeta overlays.entries is not a list")?;
+
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or("pack.mcmeta overlays entry is not an object")?;
+        let directory = entry
+            .get("directory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("pack.mcmeta overlays entry has no directory")?;
+        if !valid_overlay_directory(directory) {
+            return Err(format!(
+                "pack.mcmeta overlays entry has invalid directory {directory}"
+            ));
+        }
+        let min = entry
+            .get("min_format")
+            .map(|value| pack_version(value, 0))
+            .transpose()
+            .map_err(|e| format!("pack.mcmeta overlays min_format: {e}"))?;
+        let max = entry
+            .get("max_format")
+            .map(|value| pack_version(value, i64::from(i32::MAX)))
+            .transpose()
+            .map_err(|e| format!("pack.mcmeta overlays max_format: {e}"))?;
+        let formats = entry
+            .get("formats")
+            .map(int_range)
+            .transpose()
+            .map_err(|e| format!("pack.mcmeta overlays formats: {e}"))?;
+        if min.is_some() != max.is_some() {
+            return Err(
+                "pack.mcmeta overlays entry must declare both min_format and max_format".into(),
+            );
+        }
+        parsed.push((min, max, formats));
+    }
+
+    let min_version = parsed
+        .iter()
+        .filter_map(|(min, _, formats)| match (min, formats) {
+            (Some(min), Some((lo, _))) => Some(min.0.min(*lo)),
+            (Some(min), None) => Some(min.0),
+            (None, Some((lo, _))) => Some(*lo),
+            (None, None) => None,
+        })
+        .min()
+        .unwrap_or(i64::from(i32::MAX));
+    let require_old_field = min_version <= LAST_PRE_MINOR;
+
+    for (min, max, formats) in parsed {
+        if min.is_none() && formats.is_none() {
+            // PackFormat.validateHolderList logs and skips such entries.
+            continue;
+        }
+        if let (Some(min), Some(max)) = (min, max) {
+            if min > max {
+                return Err("pack.mcmeta overlays min_format is greater than max_format".into());
+            }
+            if min.0 > LAST_PRE_MINOR && !require_old_field {
+                if formats.is_some() {
+                    return Err(
+                        "pack.mcmeta overlays has formats alongside the newer min/max format"
+                            .into(),
+                    );
+                }
+            } else {
+                let Some((lo, hi)) = formats else {
+                    return Err(
+                        "pack.mcmeta overlays entry supporting old versions needs formats".into(),
+                    );
+                };
+                if lo != min.0 {
+                    return Err("pack.mcmeta overlays formats and min_format disagree".into());
+                }
+                if hi != max.0 && hi != LAST_PRE_MINOR {
+                    return Err("pack.mcmeta overlays formats and max_format disagree".into());
+                }
+            }
+        } else if let Some((_, hi)) = formats
+            && hi > LAST_PRE_MINOR
+        {
+            return Err(
+                "pack.mcmeta overlays supports a newer format without min_format and max_format"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The part of `PackFormat.packCodec` that `Pack.readPackMetadata` tries
@@ -1190,6 +1659,100 @@ mod tests {
         )
         .unwrap();
         assert!(validate_pack_formats(pack["pack"].as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn description_component_validation() {
+        for description in [
+            r##"{"text":"hello","color":"#abcdef","bold":true,"extra":[{"translate":"key","with":["x",1,true]}]}"##,
+            r#"["a",{"text":"b"}]"#,
+            r#"{"type":"selector","selector":"@e","separator":";"}"#,
+            r#"{"nbt":"foo","entity":"@e","interpret":true}"#,
+            r#"{"object":"atlas","sprite":"block/stone"}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":{description}}}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_ok(),
+                "should accept {description}"
+            );
+        }
+        for description in [
+            "{}",
+            r#"{"color":"red"}"#,
+            r#"{"text":5}"#,
+            r#"{"text":"x","extra":[]}"#,
+            r#"{"text":"x","bold":"yes"}"#,
+            r#"{"type":"nope","text":"x"}"#,
+            r#"{"nbt":"foo"}"#,
+            r#"{"object":"atlas"}"#,
+            r#"{"text":"x","click_event":{"action":"nope"}}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":{description}}}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_err(),
+                "should reject {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_flags_are_validated() {
+        for features in [
+            r#"{"enabled":[]}"#,
+            r#"{"enabled":["minecraft:vanilla","trade_rebalance"]}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":"x"}},"features":{features}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_ok(),
+                "should accept features {features}"
+            );
+        }
+        for features in [
+            r#"[]"#,
+            r#"{"enabled":"vanilla"}"#,
+            r#"{"enabled":[1]}"#,
+            r#"{"enabled":["minecraft:nope"]}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":"x"}},"features":{features}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_err(),
+                "should reject features {features}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_metadata_is_validated() {
+        for overlays in [
+            r#"{"entries":[]}"#,
+            r#"{"entries":[{"directory":"overlay","min_format":97,"max_format":97}]}"#,
+            r#"{"entries":[{"directory":"overlay","formats":[64,64]}]}"#,
+            r#"{"entries":[{"directory":"no-format"}]}"#,
+            r#"{"entries":[{"directory":"old","formats":[64,64]},{"directory":"new","min_format":97,"max_format":97,"formats":[97,97]}]}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":"x"}},"overlays":{overlays}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_ok(),
+                "should accept overlays {overlays}"
+            );
+        }
+        for overlays in [
+            r#"[]"#,
+            r#"{}"#,
+            r#"{"entries":[{}]}"#,
+            r#"{"entries":[{"directory":"bad/name"}]}"#,
+            r#"{"entries":[{"directory":"x","min_format":97}]}"#,
+            r#"{"entries":[{"directory":"x","min_format":98,"max_format":97}]}"#,
+            r#"{"entries":[{"directory":"x","min_format":64,"max_format":64}]}"#,
+            r#"{"entries":[{"directory":"x","min_format":97,"max_format":97,"formats":[97,97]}]}"#,
+            r#"{"entries":[{"directory":"x","formats":[65,65]}]}"#,
+        ] {
+            let meta = format!(r#"{{"pack":{{"description":"x"}},"overlays":{overlays}}}"#);
+            assert!(
+                validate_pack(&pack_zip(&meta)).is_err(),
+                "should reject overlays {overlays}"
+            );
+        }
     }
 
     #[test]

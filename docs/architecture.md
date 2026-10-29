@@ -69,12 +69,13 @@ Tick regularity is visible to servers, so bots are run in release builds.
 | `entities.rs` | Tracks server-provided entity and player state; exposes snapshots, player-info metadata, and distance queries without interpreting roles |
 
 `packs.rs` reports `SUCCESSFULLY_LOADED` after a best-effort check of the
-downloaded zip, its root `pack.mcmeta`, the `pack` object and the shape of
-`description`. It does not decode the full text-component codec, does not
-read the `features` or `overlays` sections, and does not load the pack's
-resource files, so a pack that only fails vanilla's real resource reload can
-still be reported as loaded. Download batches are per-pack here; vanilla
-discards the rest of a download batch when one request fails.
+downloaded zip, its root `pack.mcmeta`, the `pack` object, the component
+shape of `description`, and the top-level `features` and `overlays` sections.
+It does not compile selector or NBT paths, inspect every object/click/hover
+payload, or load the pack's resource files, so a pack that only fails
+vanilla's real resource reload can still be reported as loaded. Download
+batches are per-pack here; vanilla discards the rest of a download batch when
+one request fails.
 
 ## Generated data
 

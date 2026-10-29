@@ -112,6 +112,38 @@ fn water_walking_is_slow() {
 }
 
 #[test]
+fn dolphins_grace_speeds_up_water_movement() {
+    let world = pool("minecraft:water", 65);
+    let tags = Tags::default();
+
+    let mut normal = player_at(0.5, 64.0, 0.5);
+    normal.tick(&world, &tags);
+    normal.held_keys = Keys {
+        forward: true,
+        ..Keys::default()
+    };
+
+    let mut graceful = player_at(0.5, 64.0, 0.5);
+    graceful.tick(&world, &tags);
+    assert!(graceful.effects.set("minecraft:dolphins_grace", Some(0)));
+    graceful.held_keys = Keys {
+        forward: true,
+        ..Keys::default()
+    };
+
+    for _ in 0..12 {
+        normal.tick(&world, &tags);
+        graceful.tick(&world, &tags);
+    }
+    let normal_distance = normal.pos.z - 0.5;
+    let graceful_distance = graceful.pos.z - 0.5;
+    assert!(
+        graceful_distance > normal_distance * 1.5,
+        "normal {normal_distance}, dolphins grace {graceful_distance}"
+    );
+}
+
+#[test]
 fn sprint_swimming_under_water() {
     let world = pool("minecraft:water", 72);
     let tags = Tags::default();

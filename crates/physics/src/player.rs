@@ -11,14 +11,17 @@
 //!
 //! Blocks that act on whatever is inside them are covered too: cobwebs,
 //! sweet berry bushes and powder snow (stuck multipliers), honey (sliding),
-//! bubble columns, and slime's slowdown when stepped on.
+//! bubble columns, and slime's slowdown when stepped on. Powder snow's
+//! context-dependent collision shape (leather boots, sneaking, a hard
+//! landing) and suffocation push-out (`moveTowardsClosestSpace`) are
+//! modelled as well.
 //!
-//! Not yet: riding, powder snow's and scaffolding's
-//! context-dependent collision shapes, entity collisions, world border,
-//! firework boosts, dolphin's grace, suffocation push-out
-//! (`moveTowardsClosestSpace`).
+//! Not yet: riding, scaffolding's context-dependent collision shape,
+//! entity collisions, world border, firework boosts.
 
-use rapidbot_world::collision::{block_collisions, collide as shapes_collide};
+use rapidbot_world::collision::{
+    EntityCollisionContext, block_collisions_with, collide as shapes_collide,
+};
 use rapidbot_world::fluid::{self, FluidKind};
 use rapidbot_world::shape::PlacedShape;
 use rapidbot_world::tags::Tags;
@@ -105,6 +108,7 @@ pub struct Effects {
     pub jump_boost: Option<i32>,
     pub levitation: Option<i32>,
     pub slow_falling: bool,
+    pub dolphins_grace: bool,
     pub blindness: bool,
     pub weaving: bool,
     pub haste: Option<i32>,
@@ -120,6 +124,7 @@ impl Effects {
             "minecraft:jump_boost" => self.jump_boost = amplifier,
             "minecraft:levitation" => self.levitation = amplifier,
             "minecraft:slow_falling" => self.slow_falling = amplifier.is_some(),
+            "minecraft:dolphins_grace" => self.dolphins_grace = amplifier.is_some(),
             "minecraft:blindness" => self.blindness = amplifier.is_some(),
             "minecraft:weaving" => self.weaving = amplifier.is_some(),
             "minecraft:haste" => self.haste = amplifier,
@@ -187,9 +192,11 @@ pub struct Player {
     pub swimming: bool,
     /// Shared flag 7: gliding with an elytra.
     pub fall_flying: bool,
-    /// Whether a glider (elytra) is equipped. Inventory is not decoded yet,
-    /// so the owner of the bot has to say.
+    /// Whether a glider (elytra) is equipped. The client keeps this in sync
+    /// with the equipment slots.
     pub has_elytra: bool,
+    /// Leather boots, which let the player stand on powder snow.
+    pub has_leather_boots: bool,
     /// Set on the tick gliding starts; the client sends
     /// `player_command(START_FALL_FLYING)` and clears it.
     pub started_fall_flying: bool,
@@ -265,6 +272,7 @@ impl Player {
             swimming: false,
             fall_flying: false,
             has_elytra: false,
+            has_leather_boots: false,
             started_fall_flying: false,
             using_item: false,
             using_item_offhand: false,
@@ -602,6 +610,10 @@ impl Player {
             world,
             registry: Registry::get(),
             tags,
+            entity_bottom: self.pos.y,
+            descending: self.held_keys.shift,
+            fall_distance: self.fall_distance,
+            can_walk_on_powder_snow: self.has_leather_boots,
         };
 
         // Player.tick
@@ -621,6 +633,80 @@ impl Player {
             self.set_pos(Vec3::new(nx, self.pos.y, nz));
         }
         self.update_player_pose(&ctx);
+    }
+
+    /// `LocalPlayer.suffocatesAt`: a suffocating full block overlapping the
+    /// player's current height in the `(x, z)` block column.
+    fn suffocates_at(&self, ctx: &Ctx<'_>, x: i32, z: i32) -> bool {
+        let area = Aabb::new(
+            x as f64,
+            self.bb.min_y,
+            z as f64,
+            x as f64 + 1.0,
+            self.bb.max_y,
+            z as f64 + 1.0,
+        )
+        .deflate(1.0e-7, 1.0e-7, 1.0e-7);
+        for y in math::floor(area.min_y)..=math::floor(area.max_y) {
+            let Some(state) = ctx.world.block_state(x, y, z) else {
+                continue;
+            };
+            let block = ctx.registry.block_of(state);
+            if !ctx.tags.block_is("minecraft:causes_suffocation", block.id) {
+                continue;
+            }
+            let Some(shape) = ctx.registry.collision_shape(state) else {
+                continue;
+            };
+            if shape.is_block
+                && area.intersects(
+                    x as f64,
+                    y as f64,
+                    z as f64,
+                    x as f64 + 1.0,
+                    y as f64 + 1.0,
+                    z as f64 + 1.0,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `LocalPlayer.moveTowardsClosestSpace`: nudge the player towards the
+    /// nearest non-suffocating side of a block it is standing in.
+    fn move_towards_closest_space(&mut self, ctx: &Ctx<'_>, x: f64, z: f64) {
+        let block_x = math::floor(x);
+        let block_z = math::floor(z);
+        if !self.suffocates_at(ctx, block_x, block_z) {
+            return;
+        }
+        let xd = x - block_x as f64;
+        let zd = z - block_z as f64;
+        let mut closest = f64::MAX;
+        let mut direction = None;
+        // Direction order in LocalPlayer: WEST, EAST, NORTH, SOUTH.
+        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let axis_distance = if dx != 0 { xd } else { zd };
+            let distance_to_edge = if dx > 0 || dz > 0 {
+                1.0 - axis_distance
+            } else {
+                axis_distance
+            };
+            if distance_to_edge < closest && !self.suffocates_at(ctx, block_x + dx, block_z + dz) {
+                closest = distance_to_edge;
+                direction = Some((dx, dz));
+            }
+        }
+        if let Some((dx, dz)) = direction {
+            let old = self.delta_movement;
+            if dx != 0 {
+                self.delta_movement = Vec3::new(0.1 * dx as f64, old.y, old.z);
+            } else {
+                self.delta_movement = Vec3::new(old.x, old.y, 0.1 * dz as f64);
+            }
+        }
     }
 
     /// `LocalPlayer.aiStep`.
@@ -652,6 +738,18 @@ impl Player {
         let forward = impulse(self.key_presses.forward, self.key_presses.backward);
         let left = impulse(self.key_presses.left, self.key_presses.right);
         self.move_vector = vec2_normalized(left, forward);
+
+        // A spectator has noPhysics; otherwise walk out of blocks that
+        // suffocate the player.
+        if !self.spectator {
+            let half_width = self.bb.get_xsize() * 0.35;
+            let x = self.pos.x;
+            let z = self.pos.z;
+            self.move_towards_closest_space(ctx, x - half_width, z + half_width);
+            self.move_towards_closest_space(ctx, x - half_width, z - half_width);
+            self.move_towards_closest_space(ctx, x + half_width, z - half_width);
+            self.move_towards_closest_space(ctx, x + half_width, z + half_width);
+        }
 
         if was_shift_key_down || self.is_slow_due_to_using_item() || self.key_presses.backward {
             self.sprint_trigger_time = 0;
@@ -1188,6 +1286,9 @@ impl Player {
             if water_walker > 0.0 {
                 slow_down += (0.54600006f32 - slow_down) * water_walker;
                 speed += (self.speed() - speed) * water_walker;
+            }
+            if self.effects.dolphins_grace {
+                slow_down = 0.96;
             }
             self.move_relative(speed, input);
             self.move_self(ctx, self.delta_movement);
@@ -1873,11 +1974,25 @@ pub struct Ctx<'a> {
     pub world: &'a World,
     pub registry: &'static Registry,
     pub tags: &'a Tags,
+    entity_bottom: f64,
+    descending: bool,
+    fall_distance: f64,
+    can_walk_on_powder_snow: bool,
 }
 
 impl Ctx<'_> {
     fn colliders(&self, bbox: &Aabb) -> Vec<PlacedShape<'static>> {
-        block_collisions(self.world, self.registry, bbox)
+        block_collisions_with(
+            self.world,
+            self.registry,
+            bbox,
+            EntityCollisionContext {
+                entity_bottom: Some(self.entity_bottom),
+                descending: self.descending,
+                fall_distance: self.fall_distance,
+                can_walk_on_powder_snow: self.can_walk_on_powder_snow,
+            },
+        )
     }
 
     fn no_collision(&self, bbox: &Aabb) -> bool {

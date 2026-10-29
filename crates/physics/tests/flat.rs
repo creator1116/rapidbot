@@ -247,6 +247,71 @@ fn sneaking_stops_at_the_edge() {
 }
 
 #[test]
+fn suffocation_pushes_the_player_out_of_a_block() {
+    let mut world = flat_world("minecraft:stone");
+    let stone = state("minecraft:stone");
+    for y in 64..66 {
+        world.set_block_state(0, y, 0, stone);
+    }
+    let mut tags = Tags::default();
+    tags.insert(
+        "minecraft:block",
+        "minecraft:causes_suffocation",
+        Registry::get().block_of(stone).id,
+    );
+    let mut p = player_at(0.5, 64.0, 0.5);
+    for _ in 0..10 {
+        p.tick(&world, &tags);
+    }
+    // LocalPlayer.moveTowardsClosestSpace picks the nearest side (west)
+    // and adds 0.1 to that axis each tick.
+    assert!(p.pos.x > 0.6, "x {}", p.pos.x);
+}
+
+#[test]
+fn leather_boots_stand_on_powder_snow() {
+    let mut world = flat_world("minecraft:stone");
+    let snow = state("minecraft:powder_snow");
+    world.set_block_state(0, 64, 0, snow);
+    let tags = Tags::default();
+
+    let mut boots = player_at(0.5, 65.0, 0.5);
+    boots.has_leather_boots = true;
+    for _ in 0..40 {
+        boots.tick(&world, &tags);
+    }
+    assert!(boots.on_ground);
+    assert_eq!(boots.pos.y, 65.0);
+
+    // Without boots the collision shape is empty and the player falls
+    // through to the stone floor.
+    let mut barefoot = player_at(0.5, 65.0, 0.5);
+    for _ in 0..100 {
+        barefoot.tick(&world, &tags);
+    }
+    assert!(barefoot.on_ground);
+    assert_eq!(barefoot.pos.y, 64.0);
+}
+
+#[test]
+fn sneaking_falls_through_powder_snow() {
+    let mut world = flat_world("minecraft:stone");
+    world.set_block_state(0, 64, 0, state("minecraft:powder_snow"));
+    let tags = Tags::default();
+    let mut p = player_at(0.5, 65.0, 0.5);
+    p.has_leather_boots = true;
+    p.held_keys = Keys {
+        shift: true,
+        ..Keys::default()
+    };
+    for _ in 0..100 {
+        p.tick(&world, &tags);
+    }
+    assert!(p.on_ground);
+    assert_eq!(p.pos.y, 64.0);
+}
+
+#[test]
 fn ice_is_slippery() {
     let world = flat_world("minecraft:ice");
     let tags = Tags::default();

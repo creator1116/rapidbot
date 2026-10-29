@@ -32,7 +32,9 @@ lives in `crates/human` and in `nav.rs` / `combat.rs` of the client.
 Bot logic never writes rotation or packets directly. It states intent ("look
 there", "hold forward", "click"), the input model turns that into events over
 the following frames, and the vanilla layer turns input into what the server
-sees.
+sees. `InputMode::Direct` is the explicit test/debug exception: it applies the
+same intent in the current tick without human timing while keeping vanilla
+packet order and gating.
 
 ## Threads and timing
 
@@ -46,6 +48,10 @@ Like the vanilla client, a bot has network tasks and one main thread.
 - A tick follows `Minecraft.tick`: connection tick, crosshair pick, key
   bindings (the `Controller` runs here), player tick, position packets,
   other entities, end-of-tick packet.
+- While the local player is a passenger, `positionRider` runs before the
+  controller and the normal physics tick is skipped. `sendChanges` sends
+  `MovePlayerRot` instead of a player position packet, plus `MoveVehicle`
+  when the local player controls the root vehicle.
 
 Tick regularity is visible to servers, so bots are run in release builds.
 
@@ -55,14 +61,14 @@ Tick regularity is visible to servers, so bots are run in release builds.
 |---|---|
 | `game/mod.rs` | Frame loop and tick order |
 | `game/configuration.rs`, `game/play.rs` | Packet handlers for the two states |
-| `game/player.rs` | `LocalPlayer`: when and which movement packets are sent |
+| `game/player.rs` | `LocalPlayer`: when and which movement packets are sent, and passenger/vehicle state |
 | `controller.rs` | `Controller` trait and `TickContext` (aim, keys, clicks, chat) |
 | `mouse.rs` | Vanilla sensitivity maths: mouse counts to rotation |
 | `entities.rs` | Other entities: interpolation, sizes, entity data, tab list |
 | `inventory.rs` | Inventory and server-opened containers; menu clicks and predictions |
 | `interact.rs` | Crosshair pick, digging, block-change predictions, block placement and entity interaction, attacking |
 | `chat.rs`, `commands.rs` | Chat sending and signing, last-seen tracking, the server's command tree |
-| `packs.rs` | Resource pack prompt, download and status packets; best-effort `pack.mcmeta` validation |
+| `packs.rs` | Resource pack prompt, download and status packets; best-effort `pack.mcmeta` validation, selected assets and `en_us` translations |
 | `status.rs` | Server list ping: raw handshake address, SRV-resolved socket |
 | `path.rs`, `nav.rs` | A* route finding; movement along routes using modeled input |
 | `combat.rs` | Target approach, aiming, strafing/retreating, and attack timing |
@@ -76,8 +82,12 @@ updates instead of suppressing them.
 `packs.rs` reports `SUCCESSFULLY_LOADED` after a best-effort check of the
 downloaded zip, its root `pack.mcmeta`, the `pack` object, the component
 shape of `description`, and the top-level `features` and `overlays` sections.
+It then keeps `assets/` and `data/` from the root and from the overlays whose
+format ranges contain the client resource format (`97.1`); later overlays and
+later packs override earlier ones. `assets/minecraft/lang/en_us.json` is
+merged in that order and used when rendering system chat and title components.
 It does not compile selector or NBT paths, inspect every object/click/hover
-payload, or load the pack's resource files, so a pack that only fails
+payload, or interpret textures, models and sounds, so a pack that only fails
 vanilla's real resource reload can still be reported as loaded. Download
 batches are per-pack here; vanilla discards the rest of a download batch when
 one request fails.

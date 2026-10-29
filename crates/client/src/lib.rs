@@ -76,6 +76,22 @@ impl Account {
     }
 }
 
+/// How controller instructions reach the game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// The default: keys, mouse movement, clicks, hotbar keys, chat and
+    /// container closes pass through the human input model and happen with
+    /// human timing.
+    #[default]
+    Human,
+    /// For tests and debugging: controller instructions are applied in the
+    /// same tick without reaction, travel, typing or key-press delays. The
+    /// vanilla packet order and screen/death/loading gates are still kept.
+    /// Servers can see the difference, so do not use this to imitate a
+    /// person.
+    Direct,
+}
+
 /// What to do when a server pushes a resource pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResourcePackPolicy {
@@ -98,6 +114,9 @@ pub struct ClientConfig {
     pub account: Account,
     pub information: ClientInformation,
     pub resource_packs: ResourcePackPolicy,
+    /// Human input timing, or direct instruction execution for tests and
+    /// debugging. The default is [`InputMode::Human`].
+    pub input_mode: InputMode,
     pub display: DisplaySettings,
     pub mouse: MouseSettings,
     /// Seed for this bot's human traits (reaction speed, aim habits). By
@@ -127,6 +146,7 @@ impl ClientConfig {
             account,
             information: ClientInformation::default(),
             resource_packs: ResourcePackPolicy::default(),
+            input_mode: InputMode::default(),
             display: DisplaySettings::default(),
             mouse: MouseSettings::default(),
             human_seed: None,
@@ -309,7 +329,18 @@ fn transfer_address(host: &str, port: i32) -> Result<String, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::transfer_address;
+    use super::{Account, ClientConfig, InputMode, transfer_address};
+
+    #[test]
+    fn direct_input_is_opt_in() {
+        let config = ClientConfig::new(
+            "localhost:25565",
+            Account::Offline {
+                name: "Steve".into(),
+            },
+        );
+        assert_eq!(config.input_mode, InputMode::Human);
+    }
 
     #[test]
     fn transfer_addresses() {

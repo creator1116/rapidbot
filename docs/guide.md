@@ -97,6 +97,23 @@ where to look: `interact::aim_point` for a block,
 `ctx.snap_look` sets the view instantly and bypasses the modeled mouse-input
 path; reserve it for tests.
 
+### Direct input mode
+
+To bypass the human input layer entirely, set `ClientConfig::input_mode` to
+`InputMode::Direct`:
+
+```rust
+let mut config = ClientConfig::new("localhost:25565", account);
+config.input_mode = InputMode::Direct;
+```
+
+Controller calls then take effect in the same tick: views snap, keys are
+already held, clicks and hotbar changes are immediate, chat is sent without
+typing, and containers close at once. Vanilla packet order and the screen,
+container, death, loading, and chat-state gates are still applied. This mode is
+for tests and debugging; it is deliberately observable as non-human input.
+`InputMode::Human` is the default.
+
 ## Creative flight
 
 Creative flight is supported when the server grants the `may_fly` ability
@@ -208,10 +225,19 @@ For a different radius or players outside the default range, use
 the client. The framework exposes state; application-specific meaning and
 policy are left to the package user.
 
+## Riding
+
+`SetPassengers` is tracked for the local player. While mounted, the rider
+follows the vehicle's interpolated position and seat attachment, and sends
+`MovePlayerRot` instead of normal player position packets. If the local player
+is the controlling passenger (for example the first passenger in a boat), the
+client also echoes `MoveVehicle` in the vanilla order. Vehicle motion itself
+remains server-driven: the framework does not simulate boat, horse, or other
+vehicle physics locally.
+
 ## What is not there yet
 
-Placing blocks, using items (eating, bows, shields), clicking inside
-containers, vehicles, swimming and ladders in the route planner. See the
+Client-side vehicle physics, firework boosts, and riptide movement. See the
 issue tracker.
 
 ## Use

@@ -232,8 +232,8 @@ vehicle physics locally.
 
 ## What is not there yet
 
-Client-side vehicle physics, firework boosts, and riptide movement. See the
-issue tracker.
+Client-side vehicle physics. Attached firework rockets boost the player while
+gliding, and riptide launches arrive as the server's `SetEntityMotion`.
 
 ## Use
 

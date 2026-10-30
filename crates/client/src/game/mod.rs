@@ -725,8 +725,13 @@ impl Game {
             play.player.send_changes(&self.net);
         }
         // level.tickEntities(): the others glide towards where the server
-        // last put them.
-        play.entities.tick();
+        // last put them. Attached firework rockets then boost the local
+        // player, matching FireworkRocketEntity.tick after LocalPlayer.tick.
+        for target in play.entities.tick() {
+            if target == play.player.id {
+                play.player.physics.apply_firework_boost();
+            }
+        }
         // level.tick(), particles, ...
         self.net
             .send(&rapidbot_protocol::packets::play::serverbound::ClientTickEnd);

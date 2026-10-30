@@ -16,8 +16,8 @@
 //! landing) and suffocation push-out (`moveTowardsClosestSpace`) are
 //! modelled as well.
 //!
-//! Not yet: riding, scaffolding's context-dependent collision shape,
-//! entity collisions, world border, firework boosts.
+//! Not yet: scaffolding's context-dependent collision shape. Riding is
+//! tracked by the client, which mirrors the vehicle's server position.
 
 use rapidbot_world::collision::{
     EntityCollisionContext, block_collisions_with, collide as shapes_collide,
@@ -456,6 +456,24 @@ impl Player {
             (-x_sin) as f64,
             (y_cos * x_cos) as f64,
         )
+    }
+
+    /// The boost an attached firework rocket gives on its client tick
+    /// (`FireworkRocketEntity.tick`): while gliding, the look direction is
+    /// mixed into the current velocity. The rocket entity calls this after
+    /// the local player has ticked, so the new velocity is seen by the next
+    /// movement tick.
+    pub fn apply_firework_boost(&mut self) {
+        if !self.fall_flying {
+            return;
+        }
+        let look = self.look_angle();
+        let movement = self.delta_movement;
+        self.delta_movement = movement.plus(Vec3::new(
+            look.x * 0.1 + (look.x * 1.5 - movement.x) * 0.5,
+            look.y * 0.1 + (look.y * 1.5 - movement.y) * 0.5,
+            look.z * 0.1 + (look.z * 1.5 - movement.z) * 0.5,
+        ));
     }
 
     /// `Entity.baseTick`: fluid state for this tick, currents, swimming.
@@ -2252,5 +2270,22 @@ mod tests {
         assert!(!player.using_item);
         assert!(!player.using_item_offhand);
         assert!(!player.is_slow_due_to_using_item());
+    }
+
+    #[test]
+    fn firework_boost_only_applies_while_gliding() {
+        let mut player = Player::new();
+        player.y_rot = 0.0;
+        player.x_rot = 0.0;
+        player.delta_movement = Vec3::new(0.2, 0.4, 0.6);
+        player.apply_firework_boost();
+        assert_eq!(player.delta_movement, Vec3::new(0.2, 0.4, 0.6));
+
+        player.fall_flying = true;
+        player.apply_firework_boost();
+        let movement = player.delta_movement;
+        assert!((movement.x - 0.1).abs() < 1e-9);
+        assert!((movement.y - 0.2).abs() < 1e-9);
+        assert!((movement.z - 1.15).abs() < 1e-9);
     }
 }

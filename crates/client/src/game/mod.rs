@@ -645,6 +645,12 @@ impl Game {
                     }
                 }
             }
+            // MouseHandler.onScroll changes the selected slot immediately;
+            // with a screen open the wheel belongs to the screen instead.
+            if actions.scroll != 0 && !screen_open {
+                play.inventory.selected =
+                    crate::inventory::scroll_selection(play.inventory.selected, actions.scroll);
+            }
             if direct {
                 if let Some(down) = actions.attack {
                     self.attack_intent = down;

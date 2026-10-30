@@ -946,9 +946,14 @@ impl GameMode {
         if self.cannot_attack_with(h.player, held) {
             return false;
         }
-        // Spears stab instead of swinging; not supported.
+        // `PiercingWeapon`: a spear sends `STAB` instead of the attack
+        // packet and never digs.
         if held.is_some_and(|s| s.has("minecraft:piercing_weapon")) {
-            return false;
+            carried(h.net);
+            Self::send_action(h, PlayerActionKind::Stab, (0, 0, 0), Direction::Down, 0);
+            // player.onAttack()
+            self.attack_strength_ticker = 0;
+            return true;
         }
         let hit = &pick.block;
         let mut end = false;
@@ -1287,6 +1292,26 @@ mod tests {
             PlayerActionKind::StartDestroyBlock
         );
         assert_eq!(action(&next[0].1).sequence, 3);
+    }
+
+    /// A spear never sends `attack` or `punch`; a click sends `STAB` with
+    /// the zero position and DOWN direction vanilla uses.
+    #[test]
+    fn spear_stabs_instead_of_attacking() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:iron_spear");
+        scene.mode.attack_strength_ticker = 100;
+        scene.mode.last_item_in_main_hand = scene.inventory.held().cloned();
+        let packets = scene.tick(1, false);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].0, PlayerAction::ID);
+        let stab = action(&packets[0].1);
+        assert_eq!(stab.action, PlayerActionKind::Stab);
+        assert_eq!(rapidbot_world::unpack_block_pos(stab.pos), (0, 0, 0));
+        assert_eq!(stab.direction, Direction::Down as u8);
+        assert_eq!(stab.sequence, 0);
+        // player.onAttack() resets the charge; the tick after it adds one.
+        assert_eq!(scene.mode.attack_strength_ticker, 1);
     }
 
     /// Letting go early aborts; the server refusing a break puts the block

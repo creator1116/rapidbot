@@ -1370,6 +1370,10 @@ mod tests {
 
     /// Puts an entity of `kind` at `pos` with entity ID 7.
     fn spawn(scene: &mut Scene, kind: &str, pos: [f64; 3]) {
+        spawn_with_data(scene, kind, pos, 0);
+    }
+
+    fn spawn_with_data(scene: &mut Scene, kind: &str, pos: [f64; 3], data: i32) {
         use rapidbot_buf::Encode;
         let mut add = Vec::new();
         VarInt(7).encode(&mut add);
@@ -1385,7 +1389,8 @@ mod tests {
         for v in pos {
             v.encode(&mut add);
         }
-        add.extend_from_slice(&[0, 0, 0, 0, 0]);
+        add.extend_from_slice(&[0, 0, 0, 0]);
+        VarInt(data).encode(&mut add);
         scene.entities.add_entity(&add).unwrap();
     }
 
@@ -1558,7 +1563,8 @@ mod tests {
     fn picks_item_frames_and_interactions() {
         let mut scene = Scene::new();
         scene.player.x_rot = 0.0;
-        spawn(&mut scene, "minecraft:item_frame", [2.0, 65.5, 0.5]);
+        // The add packet carries the block position and facing direction.
+        spawn_with_data(&mut scene, "minecraft:item_frame", [2.0, 65.0, 0.0], 5);
         let hit = pick(&scene.player, &scene.world, &scene.entities, 1, &scene.tags);
         assert_eq!(hit.entity.map(|e| e.id), Some(7));
 

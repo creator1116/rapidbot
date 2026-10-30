@@ -258,6 +258,12 @@ pub struct Entity {
     interaction_height: f32,
     /// `HangingEntity.DATA_DIRECTION`: a `Direction` ordinal.
     hanging_direction: Option<i32>,
+    /// The block a hanging entity is attached to. `ClientboundAddEntityPacket`
+    /// sends `BlockAttachedEntity.getPos()` for item frames and paintings,
+    /// which is a block position rather than the entity's center.
+    hanging_pos: Option<[i32; 3]>,
+    /// A painting's `width` and `height` in blocks, from its variant.
+    painting_size: Option<(i32, i32)>,
     /// The stack in an `ItemFrame`; a filled map makes its box larger.
     framed_item: Option<ItemStack>,
     /// `FireworkRocketEntity.DATA_ATTACHED_TO_TARGET`: the entity ID a
@@ -269,6 +275,28 @@ pub struct Entity {
 /// `Mth.unpackDegrees`.
 fn unpack_degrees(b: i8) -> f32 {
     (b as i32 * 360) as f32 / 256.0
+}
+
+/// `Direction` steps: DOWN, UP, NORTH, SOUTH, WEST, EAST.
+fn direction_vector(direction: i32) -> [f64; 3] {
+    match direction {
+        0 => [0.0, -1.0, 0.0],
+        1 => [0.0, 1.0, 0.0],
+        2 => [0.0, 0.0, -1.0],
+        3 => [0.0, 0.0, 1.0],
+        4 => [-1.0, 0.0, 0.0],
+        _ => [1.0, 0.0, 0.0],
+    }
+}
+
+/// `Direction.getCounterClockWise`, for the horizontal directions.
+fn counter_clockwise(direction: i32) -> i32 {
+    match direction {
+        2 => 4,
+        3 => 5,
+        4 => 3,
+        _ => 2,
+    }
 }
 
 impl Entity {
@@ -338,6 +366,8 @@ impl Entity {
             interaction_width: 1.0,
             interaction_height: 1.0,
             hanging_direction: None,
+            hanging_pos: None,
+            painting_size: None,
             framed_item: None,
             firework_attached_to: None,
         }
@@ -537,13 +567,21 @@ impl Entity {
     }
 
     /// `EntityDimensions.makeBoundingBox`: min and max corners. Hanging
-    /// item frames are centered on their position and thin along the wall
-    /// they are attached to (`ItemFrame.createBoundingBox`).
+    /// entities are attached to a block and thin along its wall
+    /// (`ItemFrame.createBoundingBox`, `Painting.calculateBoundingBox`).
     pub fn bounding_box(&self) -> ([f64; 3], [f64; 3]) {
         if self.info().is("ItemFrame") {
             let size = if self.has_framed_map() { 0.5 } else { 0.375 };
             let thin = 0.03125;
-            let (x, y, z) = match self.hanging_direction.unwrap_or(3) {
+            let direction = self.hanging_direction.unwrap_or(3);
+            let block = self.hanging_block();
+            let offset = direction_vector(direction);
+            let position = [
+                block[0] + 0.5 - offset[0] * 0.46875,
+                block[1] + 0.5 - offset[1] * 0.46875,
+                block[2] + 0.5 - offset[2] * 0.46875,
+            ];
+            let (x, y, z) = match direction {
                 // DOWN, UP: flat on a floor or ceiling.
                 0 | 1 => (size, thin, size),
                 // NORTH, SOUTH: thin along Z.
@@ -552,8 +590,52 @@ impl Entity {
                 _ => (thin, size, size),
             };
             return (
-                [self.pos.x - x, self.pos.y - y, self.pos.z - z],
-                [self.pos.x + x, self.pos.y + y, self.pos.z + z],
+                [position[0] - x, position[1] - y, position[2] - z],
+                [position[0] + x, position[1] + y, position[2] + z],
+            );
+        }
+        if self.info().is("Painting") {
+            let (width, height) = self
+                .painting_size
+                .map(|(w, h)| (w.clamp(1, 16), h.clamp(1, 16)))
+                .unwrap_or((1, 1));
+            let (width, height) = (width as f64, height as f64);
+            // Paintings are only placed on horizontal walls.
+            let direction = match self.hanging_direction.unwrap_or(3) {
+                2..=5 => self.hanging_direction.unwrap_or(3),
+                _ => 3,
+            };
+            let block = self.hanging_block();
+            let offset = direction_vector(direction);
+            let attached = [
+                block[0] + 0.5 - offset[0] * 0.46875,
+                block[1] + 0.5 - offset[1] * 0.46875,
+                block[2] + 0.5 - offset[2] * 0.46875,
+            ];
+            let left = direction_vector(counter_clockwise(direction));
+            let horizontal = if width as i32 % 2 == 0 { 0.5 } else { 0.0 };
+            let vertical = if height as i32 % 2 == 0 { 0.5 } else { 0.0 };
+            let position = [
+                attached[0] + left[0] * horizontal,
+                attached[1] + vertical,
+                attached[2] + left[2] * horizontal,
+            ];
+            let (x, z) = if matches!(direction, 4 | 5) {
+                (0.0625, width)
+            } else {
+                (width, 0.0625)
+            };
+            return (
+                [
+                    position[0] - x / 2.0,
+                    position[1] - height / 2.0,
+                    position[2] - z / 2.0,
+                ],
+                [
+                    position[0] + x / 2.0,
+                    position[1] + height / 2.0,
+                    position[2] + z / 2.0,
+                ],
             );
         }
         if self.info().is("Shulker") {
@@ -566,6 +648,31 @@ impl Entity {
             [self.pos.x - w, self.pos.y, self.pos.z - w],
             [self.pos.x + w, self.pos.y + h, self.pos.z + w],
         )
+    }
+
+    fn hanging_block(&self) -> [f64; 3] {
+        let block = self.hanging_pos.unwrap_or_else(|| {
+            [
+                self.pos.x.floor() as i32,
+                self.pos.y.floor() as i32,
+                self.pos.z.floor() as i32,
+            ]
+        });
+        [block[0] as f64, block[1] as f64, block[2] as f64]
+    }
+
+    /// `HangingEntity.recalculateBoundingBox`: keep `pos` at the box center.
+    fn recenter_hanging(&mut self) {
+        if self.hanging_pos.is_none() {
+            return;
+        }
+        let (min, max) = self.bounding_box();
+        self.pos = Vec3::new(
+            (min[0] + max[0]) / 2.0,
+            (min[1] + max[1]) / 2.0,
+            (min[2] + max[2]) / 2.0,
+        );
+        self.base = self.pos;
     }
 
     /// `Shulker.makeBoundingBox`: a unit cube that grows toward the face
@@ -608,8 +715,8 @@ impl Entity {
         )
     }
 
-    /// `Entity.isPickable`. Item frames and `interaction` entities have
-    /// boxes modeled here; paintings and dragon parts still do not.
+    /// `Entity.isPickable`. Hanging entities and `interaction` entities have
+    /// boxes modeled here; dragon parts still do not.
     pub fn is_pickable(&self, tags: &Tags) -> bool {
         let info = self.info();
         if info.is("ArmorStand") {
@@ -618,7 +725,7 @@ impl Entity {
         if info.is("EnderDragon") {
             return false;
         }
-        if info.is("ItemFrame") || info.is("Interaction") {
+        if info.is("HangingEntity") || info.is("Interaction") {
             return true;
         }
         if info.living {
@@ -858,12 +965,19 @@ pub(crate) enum DataValue {
     Direction(i32),
     OptionalInt(Option<i32>),
     Item(Option<ItemStack>),
+    PaintingVariant {
+        /// Registry ID; `None` for an inline variant.
+        id: Option<i32>,
+        /// Inline width and height in blocks.
+        size: Option<(i32, i32)>,
+    },
     Other,
 }
 
 /// The data items of a `set_entity_data` packet after the entity ID, by
-/// index, up to the first whose type is not decoded (particles, variants
-/// that can be sent inline, profiles).
+/// index, up to the first whose type is not decoded (particles, other
+/// variants, profiles). Inline painting variants stop after their
+/// dimensions; their text components are not needed for picking.
 pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>, DecodeError> {
     let buf = &mut body;
     let mut out = Vec::new();
@@ -941,6 +1055,31 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
                 DataValue::Other
             }
             20 => DataValue::Pose(VarInt::decode(buf)?.0),
+            // Holder<PaintingVariant>: VarInt 0 followed by the inline variant,
+            // otherwise registry ID + 1.
+            34 => {
+                let holder = VarInt::decode(buf)?.0;
+                if holder == 0 {
+                    let width = VarInt::decode(buf)?.0;
+                    let height = VarInt::decode(buf)?.0;
+                    String::decode(buf)?;
+                    // The optional title and author components follow. No
+                    // vanilla painting uses an inline holder, and the fields
+                    // after this data item are not needed for picking.
+                    out.push((
+                        index,
+                        DataValue::PaintingVariant {
+                            id: None,
+                            size: Some((width, height)),
+                        },
+                    ));
+                    return Ok(out);
+                }
+                DataValue::PaintingVariant {
+                    id: Some(holder - 1),
+                    size: None,
+                }
+            }
             // Sniffer.State, armadillo/copper/weathering enums.
             35..=38 => DataValue::Int(VarInt::decode(buf)?.0),
             40 => {
@@ -959,6 +1098,8 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
 pub struct Entities {
     by_id: HashMap<i32, Entity>,
     players: HashMap<Uuid, PlayerInfo>,
+    /// `minecraft:painting_variant` dimensions by registry ID.
+    painting_variants: Vec<(i32, i32)>,
 }
 
 /// `VecDeltaCodec.encode`: `Math.round(v * 4096)`.
@@ -1000,6 +1141,12 @@ impl Entities {
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, entity: Entity) {
         self.by_id.insert(entity.id, entity);
+    }
+
+    /// Dimensions of the server's `minecraft:painting_variant` registry, in
+    /// registry-ID order.
+    pub(crate) fn set_painting_variants(&mut self, variants: Vec<(i32, i32)>) {
+        self.painting_variants = variants;
     }
 
     /// `Entity.absSnapTo` for the locally controlled vehicle from
@@ -1178,45 +1325,58 @@ impl Entities {
         let _movement = LpVec3::decode(buf)?;
         let x_rot = unpack_degrees(i8::decode(buf)?);
         let y_rot = unpack_degrees(i8::decode(buf)?);
+        let _y_head_rot = unpack_degrees(i8::decode(buf)?);
+        let data = VarInt::decode(buf)?.0;
         let Some(kind) = Registry::get().entity_types.get(type_id) else {
             return Ok(None);
         };
-        self.by_id.insert(
+        let mut entity = Entity {
             id,
-            Entity {
-                id,
-                uuid,
-                kind: kind.as_str(),
-                type_id,
-                pos,
-                y_rot,
-                x_rot,
-                on_ground: false,
-                base: pos,
-                stepped: Stepped::default(),
-                linear: (PosRot::default(), 0),
-                flags: 0,
-                pose: pose::STANDING,
-                health: None,
-                scale: 1.0,
-                baby: false,
-                cube_mob_size: 1,
-                puff_state: 0,
-                salmon_size: 1,
-                phantom_size: 0,
-                sniffer_state: 0,
-                shulker_attach_face: 0,
-                shulker_raw_peek: 0,
-                shulker_peek: 0.0,
-                armor_stand_flags: 0,
-                in_ground: false,
-                interaction_width: 1.0,
-                interaction_height: 1.0,
-                hanging_direction: None,
-                framed_item: None,
-                firework_attached_to: None,
-            },
-        );
+            uuid,
+            kind: kind.as_str(),
+            type_id,
+            pos,
+            y_rot,
+            x_rot,
+            on_ground: false,
+            base: pos,
+            stepped: Stepped::default(),
+            linear: (PosRot::default(), 0),
+            flags: 0,
+            pose: pose::STANDING,
+            health: None,
+            scale: 1.0,
+            baby: false,
+            cube_mob_size: 1,
+            puff_state: 0,
+            salmon_size: 1,
+            phantom_size: 0,
+            sniffer_state: 0,
+            shulker_attach_face: 0,
+            shulker_raw_peek: 0,
+            shulker_peek: 0.0,
+            armor_stand_flags: 0,
+            in_ground: false,
+            interaction_width: 1.0,
+            interaction_height: 1.0,
+            hanging_direction: None,
+            hanging_pos: None,
+            painting_size: None,
+            framed_item: None,
+            firework_attached_to: None,
+        };
+        if entity.info().is("HangingEntity") {
+            // The add packet carries the attached block, not the box center.
+            // `setDirection` puts the entity at the center of that box.
+            entity.hanging_direction = Some(data);
+            entity.hanging_pos = Some([
+                pos.x.floor() as i32,
+                pos.y.floor() as i32,
+                pos.z.floor() as i32,
+            ]);
+            entity.recenter_hanging();
+        }
+        self.by_id.insert(id, entity);
         Ok(self.by_id.get(&id))
     }
 
@@ -1362,6 +1522,7 @@ impl Entities {
     /// `ClientboundSetEntityDataPacket` for another entity: `body` starts
     /// after the entity ID.
     pub(crate) fn set_entity_data(&mut self, id: i32, body: &[u8]) -> Result<(), DecodeError> {
+        let painting_variants = self.painting_variants.clone();
         let Some(entity) = self.by_id.get_mut(&id) else {
             return Ok(());
         };
@@ -1382,12 +1543,23 @@ impl Entities {
                 }
                 (8, DataValue::Direction(direction)) if info.is("HangingEntity") => {
                     entity.hanging_direction = Some(direction);
+                    entity.recenter_hanging();
                 }
                 (8, DataValue::Float(width)) if info.is("Interaction") => {
                     entity.interaction_width = width;
                 }
                 (9, DataValue::Float(height)) if info.is("Interaction") => {
                     entity.interaction_height = height;
+                }
+                (9, DataValue::PaintingVariant { id, size }) if info.is("Painting") => {
+                    entity.painting_size = size.or_else(|| {
+                        id.and_then(|id| {
+                            usize::try_from(id)
+                                .ok()
+                                .and_then(|id| painting_variants.get(id).copied())
+                        })
+                    });
+                    entity.recenter_hanging();
                 }
                 (9, DataValue::Item(item)) if info.is("ItemFrame") => {
                     entity.framed_item = item;
@@ -1516,6 +1688,10 @@ mod tests {
     }
 
     fn add(e: &mut Entities, id: i32, kind: &str, pos: [f64; 3]) {
+        add_with_data(e, id, kind, pos, 0);
+    }
+
+    fn add_with_data(e: &mut Entities, id: i32, kind: &str, pos: [f64; 3], data: i32) {
         let mut add = Vec::new();
         VarInt(id).encode(&mut add);
         Uuid::from_u128(id as u128).encode(&mut add);
@@ -1524,7 +1700,8 @@ mod tests {
             v.encode(&mut add);
         }
         // No movement, three rotation bytes, data.
-        add.extend_from_slice(&[0, 0, 0, 0, 0]);
+        add.extend_from_slice(&[0, 0, 0, 0]);
+        VarInt(data).encode(&mut add);
         e.add_entity(&add).unwrap().unwrap();
     }
 
@@ -1844,15 +2021,23 @@ mod tests {
     #[test]
     fn item_frames_and_interactions_have_their_own_boxes() {
         let mut e = Entities::default();
-        add(&mut e, 7, "minecraft:item_frame", [1.0, 64.0, 0.0]);
-        // Hanging direction SOUTH (3), no item yet.
-        e.set_entity_data(7, &[8, 12, 3, 0xff]).unwrap();
+        // Hanging direction NORTH (2) comes in the add packet.
+        add_with_data(&mut e, 7, "minecraft:item_frame", [1.0, 64.0, 0.0], 2);
         let frame = e.get(7).unwrap();
         assert!(frame.is_pickable(&Tags::default()));
         assert_eq!(frame.dimensions(), (0.75, 0.75));
+        assert_eq!(frame.pos, Vec3::new(1.5, 64.5, 0.96875));
         let (min, max) = frame.bounding_box();
-        assert_eq!(min, [0.625, 63.625, -0.03125]);
-        assert_eq!(max, [1.375, 64.375, 0.03125]);
+        assert_eq!(min, [1.125, 64.125, 0.9375]);
+        assert_eq!(max, [1.875, 64.875, 1.0]);
+
+        // A later direction update moves the box to the SOUTH wall.
+        e.set_entity_data(7, &[8, 12, 3, 0xff]).unwrap();
+        let frame = e.get(7).unwrap();
+        assert_eq!(frame.pos, Vec3::new(1.5, 64.5, 0.03125));
+        let (min, max) = frame.bounding_box();
+        assert_eq!(min, [1.125, 64.125, 0.0]);
+        assert_eq!(max, [1.875, 64.875, 0.0625]);
 
         // A filled map makes the frame a full block square.
         let map = ItemData::get().item_id("minecraft:filled_map").unwrap();
@@ -1864,8 +2049,8 @@ mod tests {
         let frame = e.get(7).unwrap();
         assert_eq!(frame.dimensions(), (1.0, 1.0));
         let (min, max) = frame.bounding_box();
-        assert_eq!(min, [0.5, 63.5, -0.03125]);
-        assert_eq!(max, [1.5, 64.5, 0.03125]);
+        assert_eq!(min, [1.0, 64.0, 0.0]);
+        assert_eq!(max, [2.0, 65.0, 0.0625]);
 
         // An interaction entity's width and height are entity data.
         add(&mut e, 8, "minecraft:interaction", [1.0, 64.0, 0.0]);
@@ -1880,6 +2065,53 @@ mod tests {
         assert_eq!(interaction.dimensions(), (2.0, 3.0));
         assert_eq!(interaction.bounding_box().0, [0.0, 64.0, -1.0]);
         assert_eq!(interaction.bounding_box().1, [2.0, 67.0, 1.0]);
+    }
+
+    #[test]
+    fn painting_boxes_follow_the_variant_and_can_be_picked() {
+        let mut e = Entities::default();
+        e.set_painting_variants(vec![(4, 3)]);
+        add_with_data(&mut e, 7, "minecraft:painting", [1.0, 64.0, 1.0], 3);
+        // Registry holder 1 means registry ID 0: the 4x3 painting above.
+        e.set_entity_data(7, &[9, 34, 1, 0xff]).unwrap();
+
+        let painting = e.get(7).unwrap();
+        assert!(painting.is_pickable(&Tags::default()));
+        assert_eq!(painting.pos, Vec3::new(2.0, 64.5, 1.03125));
+        let (min, max) = painting.bounding_box();
+        assert_eq!(min, [0.0, 63.0, 1.0]);
+        assert_eq!(max, [4.0, 66.0, 1.0625]);
+
+        let tags = Tags::default();
+        let hit = e
+            .pick(
+                1,
+                [2.0, 64.5, 0.0],
+                [2.0, 64.5, 2.0],
+                ([-10.0; 3], [100.0; 3]),
+                25.0,
+                &tags,
+            )
+            .unwrap();
+        assert_eq!(
+            hit,
+            EntityHit {
+                id: 7,
+                location: [2.0, 64.5, 1.0],
+            }
+        );
+
+        // An inline holder carries its dimensions directly. The text
+        // components after the asset ID are not needed for the box.
+        add_with_data(&mut e, 8, "minecraft:painting", [5.0, 64.0, 1.0], 3);
+        let mut data = vec![9u8, 34, 0, 2, 1, 14];
+        data.extend_from_slice(b"minecraft:test");
+        e.set_entity_data(8, &data).unwrap();
+        let painting = e.get(8).unwrap();
+        assert_eq!(painting.pos, Vec3::new(6.0, 64.5, 1.03125));
+        let (min, max) = painting.bounding_box();
+        assert_eq!(min, [5.0, 64.0, 1.0]);
+        assert_eq!(max, [7.0, 65.0, 1.0625]);
     }
 
     #[test]

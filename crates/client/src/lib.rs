@@ -25,6 +25,7 @@ pub mod path;
 mod proxy;
 pub mod status;
 pub mod text;
+pub mod webshare;
 
 use std::collections::HashMap;
 
@@ -45,6 +46,7 @@ pub use proxy::{Proxy, ProxyAuth, ProxyError};
 pub use rapidbot_human as human;
 pub use rapidbot_physics::{Keys, math};
 pub use rapidbot_world as world;
+pub use webshare::{WebshareClient, WebshareError, WebshareMode, WebshareProxy};
 
 #[derive(Debug, Clone)]
 pub enum Account {

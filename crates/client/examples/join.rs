@@ -46,6 +46,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ClientConfig::new(address, account);
     if let Ok(proxy) = std::env::var("RAPIDBOT_PROXY") {
         config.proxy = Some(proxy.parse()?);
+    } else if let Ok(key) = std::env::var("RAPIDBOT_WEBSHARE_KEY") {
+        let proxies = rapidbot_client::WebshareClient::new(key.trim())
+            .list_valid()
+            .await?;
+        let proxy = proxies
+            .into_iter()
+            .next()
+            .ok_or("Webshare returned no valid proxies")?;
+        println!("Using Webshare proxy {}:{}", proxy.host, proxy.port);
+        config.proxy = Some(proxy.proxy());
     }
     let reason = rapidbot_client::run(config).await;
     tracing::warn!("connection ended: {reason}");

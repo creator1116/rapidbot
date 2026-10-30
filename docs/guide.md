@@ -216,7 +216,11 @@ before showing the world list.
   example reads `RAPIDBOT_PROXY`, e.g. `socks5://user:pass@127.0.0.1:1080` or
   `http://127.0.0.1:8080`; `Proxy::parse` accepts a bare `host:port` as HTTP.
   The server address is still resolved (SRV included) locally, and the
-  handshake carries the same host as a direct connection.
+  handshake carries the same host as a direct connection. With no
+  `RAPIDBOT_PROXY`, setting `RAPIDBOT_WEBSHARE_KEY` makes the example fetch
+  the account's direct proxies from Webshare and use the first valid one;
+  library code can call `WebshareClient::list_valid` and pick a different
+  entry per bot.
 - `resource_packs`: `Decline` (default) or `Accept`. Accepted packs are
   really downloaded, with the request the Java client sends.
 - `human_seed`: seeds input-model randomness. One seed per account keeps

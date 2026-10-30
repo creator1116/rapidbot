@@ -285,6 +285,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relative_pagination_urls_resolve_against_the_base() {
+        let client = WebshareClient::with_base("test-key", "https://proxy.example/api/v2");
+        assert_eq!(
+            client.resolve("/proxy/list/?mode=direct&page=2"),
+            "https://proxy.example/api/v2/proxy/list/?mode=direct&page=2"
+        );
+        assert_eq!(
+            client.resolve("proxy/list/?mode=direct&page=3"),
+            "https://proxy.example/api/v2/proxy/list/?mode=direct&page=3"
+        );
+    }
+
+    #[tokio::test]
     async fn list_valid_drops_invalid_proxies() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());

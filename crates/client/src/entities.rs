@@ -238,6 +238,10 @@ pub struct Entity {
     hanging_direction: Option<i32>,
     /// The stack in an `ItemFrame`; a filled map makes its box larger.
     framed_item: Option<ItemStack>,
+    /// `FireworkRocketEntity.DATA_ATTACHED_TO_TARGET`: the entity ID a
+    /// rocket is riding. The rocket gives that entity a boost each tick
+    /// while it is gliding.
+    firework_attached_to: Option<i32>,
 }
 
 /// `Mth.unpackDegrees`.
@@ -304,6 +308,7 @@ impl Entity {
             interaction_height: 1.0,
             hanging_direction: None,
             framed_item: None,
+            firework_attached_to: None,
         }
     }
 
@@ -641,6 +646,7 @@ pub(crate) enum DataValue {
     Bool(bool),
     Pose(i32),
     Direction(i32),
+    OptionalInt(Option<i32>),
     Item(Option<ItemStack>),
     Other,
 }
@@ -699,11 +705,18 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
                 DataValue::Other
             }
             12 => DataValue::Direction(VarInt::decode(buf)?.0),
-            // Block states, optional unsigned int, arm, dye.
-            14 | 15 | 19 | 42 | 43 => {
+            // Block states, arm, dye.
+            14 | 15 | 42 | 43 => {
                 VarInt::decode(buf)?;
                 DataValue::Other
             }
+            // Optional unsigned int: used by firework rockets for the
+            // entity they are attached to.
+            19 => DataValue::OptionalInt(if bool::decode(buf)? {
+                Some(VarInt::decode(buf)?.0)
+            } else {
+                None
+            }),
             13 => {
                 if bool::decode(buf)? {
                     Uuid::decode(buf)?;
@@ -924,10 +937,18 @@ impl Entities {
     }
 
     /// `ClientLevel.tickEntities` for everything but the local player.
-    pub fn tick(&mut self) {
+    /// Returns the target IDs of attached firework rockets: the caller is
+    /// the local player's vehicle and applies their `FireworkRocketEntity`
+    /// boost after its own tick.
+    pub fn tick(&mut self) -> Vec<i32> {
+        let mut attached = Vec::new();
         for entity in self.by_id.values_mut() {
             entity.tick();
+            if let Some(target) = entity.firework_attached_to {
+                attached.push(target);
+            }
         }
+        attached
     }
 
     /// `ClientboundAddEntityPacket`. Returns the entity if it was added.
@@ -967,6 +988,7 @@ impl Entities {
                 interaction_height: 1.0,
                 hanging_direction: None,
                 framed_item: None,
+                firework_attached_to: None,
             },
         );
         Ok(self.by_id.get(&id))
@@ -1122,6 +1144,9 @@ impl Entities {
             match (index, value) {
                 (0, DataValue::Byte(flags)) => entity.flags = flags,
                 (6, DataValue::Pose(pose)) => entity.pose = pose,
+                (9, DataValue::OptionalInt(target)) if info.is("FireworkRocketEntity") => {
+                    entity.firework_attached_to = target;
+                }
                 (9, DataValue::Float(health)) if info.living => entity.health = Some(health),
                 (15, DataValue::Byte(flags)) if info.is("ArmorStand") => {
                     entity.armor_stand_flags = flags
@@ -1440,6 +1465,23 @@ mod tests {
         assert_eq!(interaction.dimensions(), (2.0, 3.0));
         assert_eq!(interaction.bounding_box().0, [0.0, 64.0, -1.0]);
         assert_eq!(interaction.bounding_box().1, [2.0, 67.0, 1.0]);
+    }
+
+    #[test]
+    fn firework_attachment_is_read_and_returned_on_tick() {
+        let mut e = Entities::default();
+        add(&mut e, 1, "minecraft:firework_rocket", [0.0, 64.0, 0.0]);
+        add(&mut e, 7, "minecraft:player", [0.0, 64.0, 0.0]);
+
+        let mut data = vec![9u8, 19, 1];
+        VarInt(7).encode(&mut data);
+        data.push(0xff);
+        e.set_entity_data(1, &data).unwrap();
+        assert_eq!(e.tick(), [7]);
+
+        // Clearing the optional int stops the boost.
+        e.set_entity_data(1, &[9, 19, 0, 0xff]).unwrap();
+        assert!(e.tick().is_empty());
     }
 
     #[test]

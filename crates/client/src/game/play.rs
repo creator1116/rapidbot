@@ -50,6 +50,9 @@ pub(super) struct PlayState {
     biome_count: usize,
     load: Option<LoadState>,
     pub client_loaded: bool,
+    /// `ClientPacketListener.enforcesSecureChat`: reject messages whose
+    /// sender has no chat session when the server enforces secure profiles.
+    enforces_secure_chat: bool,
     /// `deathTime`: ticks since dying. At 20 the player entity is removed
     /// and stops ticking; the death screen's buttons unlock at 20 too.
     pub death_time: u32,
@@ -113,6 +116,7 @@ impl PlayState {
             biome_count: registry_len(session, "minecraft:worldgen/biome"),
             load: None,
             client_loaded: false,
+            enforces_secure_chat: login.enforces_secure_chat,
             death_time: 0,
             respawn_in: None,
             dimension: login.spawn.dimension.to_string(),
@@ -823,24 +827,28 @@ impl Game {
                 let play = play_mut(&mut self.play)?;
                 let entities = &play.entities;
                 // A broken chat chain disconnects, as vanilla does.
-                let message = play
+                let processed = play
                     .chat
-                    .player_chat(&packet.body, |sender| {
-                        entities.player_info(sender).is_some()
-                    })
+                    .player_chat(
+                        &packet.body,
+                        |sender| entities.player_info(sender),
+                        play.enforces_secure_chat,
+                    )
                     .map_err(|e| ClientError::Protocol(e.to_string()))?;
-                if let Some(offset) = message.ack {
+                if let Some(offset) = processed.ack {
                     self.net.send(&sb::ChatAck { offset });
                 }
-                let from = entities
-                    .player_info(&message.sender)
-                    .map(|i| i.name.clone());
-                debug!(?from, "chat: {}", message.text);
-                self.link.emit(crate::BotEvent::Chat {
-                    sender: message.sender,
-                    name: from,
-                    text: message.text,
-                });
+                if let Some(message) = processed.incoming {
+                    let from = entities
+                        .player_info(&message.sender)
+                        .map(|i| i.name.clone());
+                    debug!(?from, "chat: {}", message.text);
+                    self.link.emit(crate::BotEvent::Chat {
+                        sender: message.sender,
+                        name: from,
+                        text: message.text,
+                    });
+                }
             }
             ids::DELETE_CHAT => {
                 play_mut(&mut self.play)?

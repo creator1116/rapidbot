@@ -606,6 +606,8 @@ pub struct PlayerInfo {
     pub game_mode: i32,
     pub listed: bool,
     pub latency: i32,
+    /// `PlayerInfo.chatSession`: the sender's `RemoteChatSession.Data`.
+    pub chat_session: Option<crate::chat::ChatSession>,
 }
 
 /// Another player close to the bot.
@@ -1169,12 +1171,24 @@ impl Entities {
                 self.players.entry(uuid).or_default().name = name;
             }
             let info = self.players.entry(uuid).or_default();
-            if actions & 2 != 0 && bool::decode(buf)? {
+            if actions & 2 != 0 {
                 // RemoteChatSession.Data: session ID, expiry, key, signature.
-                Uuid::decode(buf)?;
-                i64::decode(buf)?;
-                ByteArray::decode(buf)?;
-                ByteArray::decode(buf)?;
+                info.chat_session = if bool::decode(buf)? {
+                    let session_id = Uuid::decode(buf)?;
+                    let expires_at = i64::decode(buf)?;
+                    let public_key_der = ByteArray::decode(buf)?.0;
+                    // Mojang's signature over the profile key is not
+                    // validated here; the key still authenticates messages
+                    // within this connection.
+                    let _key_signature = ByteArray::decode(buf)?;
+                    Some(crate::chat::ChatSession {
+                        session_id,
+                        expires_at,
+                        public_key_der,
+                    })
+                } else {
+                    None
+                };
             }
             if actions & 4 != 0 {
                 info.game_mode = VarInt::decode(buf)?.0;
@@ -1265,10 +1279,16 @@ mod tests {
         let mut e = Entities::default();
         let uuid = Uuid::from_u128(42);
 
-        let mut info = vec![1u8 | 4 | 8 | 16, 1];
+        let session = Uuid::from_u128(99);
+        let mut info = vec![1u8 | 2 | 4 | 8 | 16, 1];
         uuid.encode(&mut info);
         "PlayerOne".encode(&mut info);
         info.push(0); // no properties
+        info.push(1); // has a chat session
+        session.encode(&mut info);
+        1_700_000_000_000i64.encode(&mut info);
+        ByteArray(vec![1, 2, 3]).encode(&mut info); // public key
+        ByteArray(vec![4, 5]).encode(&mut info); // Mojang's signature
         info.push(3); // spectator
         info.push(1); // listed
         VarInt(73).encode(&mut info);
@@ -1286,6 +1306,10 @@ mod tests {
         assert_eq!(player_info.game_mode, 3);
         assert!(player_info.listed);
         assert_eq!(player_info.latency, 73);
+        let session = player_info.chat_session.as_ref().unwrap();
+        assert_eq!(session.session_id, Uuid::from_u128(99));
+        assert_eq!(session.expires_at, 1_700_000_000_000);
+        assert_eq!(session.public_key_der, [1, 2, 3]);
         assert!(e.players_near(Vec3::new(0.0, 64.0, 0.0), 3.0, 1).is_empty());
         assert!(
             e.players_near(Vec3::new(0.0, 64.0, 0.0), 10.0, 42)

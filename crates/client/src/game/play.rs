@@ -5,7 +5,9 @@ use rapidbot_buf::{ByteArray, Decode, VarInt};
 use rapidbot_physics::attributes::Operation;
 use rapidbot_physics::math::Vec3;
 use rapidbot_protocol::ids::play::clientbound as ids;
-use rapidbot_protocol::packets::play::{GameType, clientbound as cb, serverbound as sb};
+use rapidbot_protocol::packets::play::{
+    CommonPlayerSpawnInfo, GameType, clientbound as cb, serverbound as sb,
+};
 use rapidbot_protocol::{Packet, RawPacket, State};
 use rapidbot_world::chunk::Chunk;
 use rapidbot_world::tags::Tags;
@@ -159,6 +161,38 @@ impl PlayState {
         self.load = Some(LoadState::WaitingForServer {
             timeout_after: clock::millis() + CLIENT_WAIT_TIMEOUT_MS,
         });
+    }
+
+    /// The level and player half of `handleRespawn`. Returns true when the
+    /// dimension changed, which is when vanilla creates a new `ClientLevel`.
+    /// `height` is the new dimension type's height range.
+    fn apply_respawn(
+        &mut self,
+        spawn: &CommonPlayerSpawnInfo,
+        data_to_keep: u8,
+        height: DimensionHeight,
+    ) -> bool {
+        let dimension = spawn.dimension.to_string();
+        let dimension_changed = dimension != self.dimension;
+        if dimension_changed {
+            // A new ClientLevel: chunks and entities start over. Vanilla
+            // keeps the same MultiPlayerGameMode across a respawn.
+            self.world = World::new(height);
+            self.entities = Default::default();
+            self.dimension = dimension;
+        }
+        self.player = LocalPlayer::respawned(&self.player, data_to_keep);
+        // A new LocalPlayer: empty inventory, slot 0, no screen. The server
+        // sends the contents again.
+        self.inventory = Default::default();
+        self.game_type = spawn.game_type;
+        self.inventory.creative = self.game_type == GameType::Creative;
+        self.player.physics.spectator = self.game_type == GameType::Spectator;
+        self.client_loaded = false;
+        self.death_time = 0;
+        self.respawn_in = None;
+        self.start_waiting_for_new_level();
+        dimension_changed
     }
 
     /// `ClientPacketListener.tick`: chat session, then level loading.
@@ -878,31 +912,21 @@ impl Game {
             cb::Respawn::ID => {
                 let respawn = packet.decode::<cb::Respawn>()?;
                 let height = dimension_height(&self.session, respawn.spawn.dimension_type);
-                let play = play_mut(&mut self.play)?;
                 let dimension = respawn.spawn.dimension.to_string();
-                info!(%dimension, keep = respawn.data_to_keep, "respawn");
-                if dimension != play.dimension {
-                    play.game_mode = crate::interact::GameMode::new();
-                    // A new ClientLevel: chunks and entities start over.
-                    play.world = World::new(height);
-                    play.entities = Default::default();
-                    play.dimension = dimension.clone();
+                let play = play_mut(&mut self.play)?;
+                // handleRespawn closes an open container on the old player
+                // before replacing them.
+                if let Some(container) = &play.inventory.container {
+                    self.net.send(&sb::ContainerClose {
+                        container_id: container.id,
+                    });
                 }
-                play.player = LocalPlayer::respawned(&play.player, respawn.data_to_keep);
-                // A new LocalPlayer: empty inventory, slot 0, no screen.
-                // The server sends the contents again.
-                play.inventory = Default::default();
-                self.slot_press = None;
-                self.close_press = None;
-                play.game_type = respawn.spawn.game_type;
-                play.inventory.creative = play.game_type == GameType::Creative;
-                play.player.physics.spectator = play.game_type == GameType::Spectator;
+                let changed = play.apply_respawn(&respawn.spawn, respawn.data_to_keep, height);
+                info!(%dimension, keep = respawn.data_to_keep, changed, "respawn");
                 play.player.physics.fast_lava =
                     fast_lava(&self.session, respawn.spawn.dimension_type);
-                play.client_loaded = false;
-                play.death_time = 0;
-                play.respawn_in = None;
-                play.start_waiting_for_new_level();
+                self.slot_press = None;
+                self.close_press = None;
                 self.aim = None;
                 self.key_intent = Default::default();
                 self.link.emit(crate::BotEvent::Spawned {
@@ -1067,6 +1091,81 @@ fn dimension_height(session: &SessionData, id: i32) -> DimensionHeight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rapidbot_buf::Identifier;
+
+    fn spawn_info(dimension: &str, dimension_type: i32) -> CommonPlayerSpawnInfo {
+        CommonPlayerSpawnInfo {
+            dimension_type,
+            dimension: Identifier::from(dimension),
+            seed: 0,
+            game_type: GameType::Survival,
+            previous_game_type: rapidbot_protocol::packets::play::OptionalGameType(None),
+            is_debug: false,
+            is_flat: false,
+            last_death_location: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+        }
+    }
+
+    fn play_state() -> PlayState {
+        let login = cb::Login {
+            player_id: 7,
+            hardcore: false,
+            levels: Vec::new(),
+            max_players: 20,
+            chunk_radius: 10,
+            simulation_distance: 10,
+            reduced_debug_info: false,
+            show_death_screen: true,
+            do_limited_crafting: false,
+            spawn: spawn_info("minecraft:overworld", 0),
+            online_mode: false,
+            enforces_secure_chat: false,
+        };
+        PlayState::new(&login, None, &SessionData::default())
+    }
+
+    #[test]
+    fn respawn_replaces_the_level_only_when_the_dimension_changes() {
+        let mut play = play_state();
+        play.client_loaded = true;
+        play.world.insert_chunk(0, 0, Chunk::empty(24));
+        play.entities
+            .insert_for_test(crate::entities::Entity::test_entity(
+                42,
+                "minecraft:zombie",
+                Vec3::new(1.0, 64.0, 1.0),
+            ));
+        play.player.physics.pos = Vec3::new(1.0, 64.0, 1.0);
+        play.inventory.selected = 5;
+
+        // Same dimension: the level and its entities stay, but a new player
+        // starts with an empty inventory and waits for the chunks again.
+        assert!(!play.apply_respawn(
+            &spawn_info("minecraft:overworld", 0),
+            0,
+            DimensionHeight::OVERWORLD
+        ));
+        assert!(play.world.has_chunk(0, 0));
+        assert!(play.entities.get(42).is_some());
+        assert_eq!(play.player.physics.pos, Vec3::ZERO);
+        assert_eq!(play.inventory.selected, 0);
+        assert!(!play.client_loaded);
+        assert!(play.load.is_some());
+
+        // A different dimension creates a ClientLevel: no chunks, entities,
+        // or old height range survive.
+        assert!(play.apply_respawn(
+            &spawn_info("minecraft:the_nether", 1),
+            0,
+            DimensionHeight::NETHER
+        ));
+        assert_eq!(play.dimension, "minecraft:the_nether");
+        assert_eq!(play.world.height, DimensionHeight::NETHER);
+        assert_eq!(play.world.chunk_count(), 0);
+        assert!(play.entities.get(42).is_none());
+    }
 
     #[test]
     fn own_living_flags_are_metadata_index_eight() {

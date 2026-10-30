@@ -226,6 +226,16 @@ For a different radius or players outside the default range, use
 the client. The framework exposes state; application-specific meaning and
 policy are left to the package user.
 
+## Chat verification
+
+Player chat packets are checked against the sender's chat session from the
+player list, including the RSA/SHA-256 signature, message index, and the
+per-sender chain. A message that fails validation is not emitted as chat and
+breaks that sender's chain until a new session is announced. Servers without
+secure profiles can still use unsigned chat. The Mojang signature over the
+profile key itself is not verified yet, so the client trusts the key the
+server supplied for that player.
+
 ## Riding
 
 `SetPassengers` is tracked for the local player. While mounted, the rider

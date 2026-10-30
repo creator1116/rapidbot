@@ -3,17 +3,66 @@
 //! packed against (`MessageSignatureCache`), and the signing chain for its
 //! own messages (`SignedMessageChain`).
 
+use std::collections::HashMap;
+
 use rapidbot_buf::{Decode, DecodeError, VarInt};
 use rapidbot_protocol::packets::play::serverbound as sb;
 pub use rapidbot_protocol::packets::play::serverbound::LastSeenUpdate;
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
+use rsa::RsaPublicKey;
+use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey, VerifyingKey};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::sha2::Sha256;
-use rsa::signature::{SignatureEncoding, Signer};
+use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use uuid::Uuid;
+
+use crate::entities::PlayerInfo;
 
 pub const SIGNATURE_BYTES: usize = 256;
 pub type Signature = [u8; SIGNATURE_BYTES];
+
+/// The sender's `RemoteChatSession.Data` from `player_info_update`: the
+/// session ID and profile key a signed chat message is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSession {
+    pub session_id: Uuid,
+    /// Unix milliseconds.
+    pub expires_at: i64,
+    /// X.509 SubjectPublicKeyInfo DER.
+    pub public_key_der: Vec<u8>,
+}
+
+/// `ProfilePublicKey.EXPIRY_GRACE_PERIOD`.
+const PROFILE_KEY_GRACE_MS: i64 = 8 * 60 * 60 * 1000;
+
+/// `SignedMessageValidator.KeyBased`: one per sender and chat session.
+/// Once a message fails, every later message from that session is rejected
+/// until the sender initializes a new session.
+#[derive(Debug, Clone)]
+struct SenderValidator {
+    session_id: Uuid,
+    expires_at: i64,
+    public_key_der: Vec<u8>,
+    last_index: Option<i32>,
+    last_signature: Option<Signature>,
+    chain_valid: bool,
+}
+
+impl SenderValidator {
+    fn new(session: &ChatSession) -> Self {
+        Self {
+            session_id: session.session_id,
+            expires_at: session.expires_at,
+            public_key_der: session.public_key_der.clone(),
+            last_index: None,
+            last_signature: None,
+            chain_valid: true,
+        }
+    }
+
+    fn same_session(&self, session: &ChatSession) -> bool {
+        self.session_id == session.session_id && self.public_key_der == session.public_key_der
+    }
+}
 
 /// `LastSeenMessages.LAST_SEEN_MESSAGES_MAX_LENGTH`.
 const LAST_SEEN: usize = 20;
@@ -176,6 +225,15 @@ struct Session {
 pub struct Incoming {
     pub sender: Uuid,
     pub text: String,
+}
+
+/// One `player_chat` packet after validation. `incoming` is `None` for an
+/// unknown sender, an invalid signature, or a fully filtered message; those
+/// are not shown but still count towards the last-seen acknowledgement when
+/// they carried a signature, as `handleChatMessageError` does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessedChat {
+    pub incoming: Option<Incoming>,
     /// `chat_ack` to send: more than 64 messages seen since the last
     /// message or acknowledgement of ours.
     pub ack: Option<i32>,
@@ -206,6 +264,8 @@ pub struct ChatState {
     cache: SignatureCache,
     next_chat_index: i32,
     session: Option<Session>,
+    /// The per-sender `SignedMessageValidator.KeyBased` chain state.
+    validators: HashMap<Uuid, SenderValidator>,
 }
 
 impl ChatState {
@@ -216,6 +276,7 @@ impl ChatState {
             cache: SignatureCache::new(),
             next_chat_index: 0,
             session: None,
+            validators: HashMap::new(),
         }
     }
 
@@ -236,14 +297,16 @@ impl ChatState {
         Some(session_id)
     }
 
-    /// `handlePlayerChat`, up to deciding whether the message was shown.
-    /// `known_sender` is whether the sender is in the tab list (a message
-    /// from an unknown player is an error line, not shown as chat).
-    pub fn player_chat(
+    /// `handlePlayerChat`, including the sender's `PlayerInfo` chat session
+    /// and `SignedMessageValidator.KeyBased`. `sender_info` is the tab-list
+    /// entry for the sender; `enforces_secure_chat` is the server's
+    /// `enforcesSecureChat` flag.
+    pub fn player_chat<'a>(
         &mut self,
         mut body: &[u8],
-        known_sender: impl Fn(&Uuid) -> bool,
-    ) -> Result<Incoming, ChatError> {
+        sender_info: impl Fn(&Uuid) -> Option<&'a PlayerInfo>,
+        enforces_secure_chat: bool,
+    ) -> Result<ProcessedChat, ChatError> {
         let buf = &mut body;
         let global_index = VarInt::decode(buf)?.0;
         let expected = self.next_chat_index;
@@ -255,7 +318,7 @@ impl ChatState {
             });
         }
         let sender = Uuid::decode(buf)?;
-        let _index = VarInt::decode(buf)?;
+        let index = VarInt::decode(buf)?.0;
         let signature = if bool::decode(buf)? {
             Some(read_signature(buf)?)
         } else {
@@ -263,8 +326,8 @@ impl ChatState {
         };
         // SignedMessageBody.Packed
         let text = String::decode(buf)?;
-        let _timestamp = i64::decode(buf)?;
-        let _salt = i64::decode(buf)?;
+        let timestamp = i64::decode(buf)?;
+        let salt = i64::decode(buf)?;
         let count = VarInt::decode(buf)?.0;
         let mut last_seen = Vec::with_capacity(count.clamp(0, LAST_SEEN as i32) as usize);
         for _ in 0..count {
@@ -278,16 +341,127 @@ impl ChatState {
         let fully_filtered = VarInt::decode(buf)?.0 == 1;
 
         self.cache.push(&last_seen, signature.as_ref());
+        let info = sender_info(&sender);
+        let mut incoming = None;
+        let mut tracked = None;
+        match info {
+            None => {
+                // Vanilla shows a chat-error line; the message is not chat.
+                tracked = signature;
+            }
+            Some(info) => match &info.chat_session {
+                None => {
+                    // `PlayerInfo.clearChatSession`: no verifiable key.
+                    self.validators.remove(&sender);
+                    if enforces_secure_chat {
+                        tracked = signature;
+                    } else if !fully_filtered {
+                        // `SignedMessageValidator.ACCEPT_UNSIGNED` strips a
+                        // signature and shows the content.
+                        incoming = Some(Incoming {
+                            sender,
+                            text: text.clone(),
+                        });
+                    }
+                }
+                Some(session) => {
+                    if self.validate_signed(
+                        session,
+                        sender,
+                        index,
+                        signature.as_ref(),
+                        &text,
+                        timestamp,
+                        salt,
+                        &last_seen,
+                    ) {
+                        tracked = signature;
+                        if !fully_filtered {
+                            incoming = Some(Incoming {
+                                sender,
+                                text: text.clone(),
+                            });
+                        }
+                    } else {
+                        // `handleChatMessageError` still marks the invalid
+                        // signature as processed so it is acknowledged.
+                        tracked = signature;
+                    }
+                }
+            },
+        }
+
         let mut ack = None;
-        if let Some(signature) = signature {
-            // ChatListener → markMessageAsProcessed. (Signature validation
-            // against the sender's key is not done: valid is assumed.)
-            let shown = known_sender(&sender) && !fully_filtered;
+        if let Some(signature) = tracked {
+            // ChatListener → markMessageAsProcessed.
+            let shown = incoming.is_some();
             if self.tracker.add_pending(signature, shown) && self.tracker.offset > 64 {
                 ack = Some(self.tracker.take_offset());
             }
         }
-        Ok(Incoming { sender, text, ack })
+        Ok(ProcessedChat { incoming, ack })
+    }
+
+    /// `SignedMessageValidator.KeyBased.updateAndValidate`.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_signed(
+        &mut self,
+        session: &ChatSession,
+        sender: Uuid,
+        index: i32,
+        signature: Option<&Signature>,
+        text: &str,
+        timestamp: i64,
+        salt: i64,
+        last_seen: &[Signature],
+    ) -> bool {
+        let validator = self
+            .validators
+            .entry(sender)
+            .or_insert_with(|| SenderValidator::new(session));
+        if !validator.same_session(session) {
+            *validator = SenderValidator::new(session);
+        }
+        if !validator.chain_valid {
+            return false;
+        }
+        if validator.expires_at.saturating_add(PROFILE_KEY_GRACE_MS) < crate::clock::millis() {
+            validator.chain_valid = false;
+            return false;
+        }
+        let Some(signature) = signature else {
+            validator.chain_valid = false;
+            return false;
+        };
+        // The exact same message twice is allowed and does not advance the
+        // chain. A different message at the same index is not a descendant.
+        if validator.last_index == Some(index) {
+            if validator.last_signature == Some(*signature) {
+                return true;
+            }
+            validator.chain_valid = false;
+            return false;
+        }
+        if validator.last_index.is_some_and(|last| index <= last) {
+            validator.chain_valid = false;
+            return false;
+        }
+        let data = signed_bytes(
+            sender,
+            session.session_id,
+            index,
+            text,
+            timestamp,
+            salt,
+            last_seen,
+        );
+        if !verify_signature(&session.public_key_der, &data, signature) {
+            validator.chain_valid = false;
+            return false;
+        }
+        validator.last_index = Some(index);
+        validator.last_signature = Some(*signature);
+        true
     }
 
     /// `handleDeleteChat`.
@@ -380,6 +554,19 @@ impl Default for ChatState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `SignatureValidator.from(key, "SHA256withRSA")`.
+fn verify_signature(public_key_der: &[u8], data: &[u8], signature: &Signature) -> bool {
+    let Ok(key) = RsaPublicKey::from_public_key_der(public_key_der) else {
+        return false;
+    };
+    let Ok(signature) = RsaSignature::try_from(signature.as_slice()) else {
+        return false;
+    };
+    VerifyingKey::<Sha256>::new(key)
+        .verify(data, &signature)
+        .is_ok()
 }
 
 /// The bytes a chat signature covers: version 1, the link (sender, session,
@@ -536,45 +723,108 @@ mod tests {
         assert_eq!(c.read(&mut [100u8].as_slice()).unwrap(), None);
     }
 
-    fn player_chat(index: i32, sender: Uuid, signature: Option<Signature>, text: &str) -> Vec<u8> {
+    fn player_chat(
+        global_index: i32,
+        index: i32,
+        sender: Uuid,
+        signature: Option<Signature>,
+        text: &str,
+        timestamp: i64,
+        salt: i64,
+    ) -> Vec<u8> {
         let mut b = Vec::new();
-        VarInt(index).encode(&mut b);
+        VarInt(global_index).encode(&mut b);
         sender.encode(&mut b);
-        VarInt(0).encode(&mut b);
+        VarInt(index).encode(&mut b);
         signature.is_some().encode(&mut b);
         if let Some(s) = signature {
             b.extend_from_slice(&s);
         }
         text.encode(&mut b);
-        0i64.encode(&mut b);
-        0i64.encode(&mut b);
+        timestamp.encode(&mut b);
+        salt.encode(&mut b);
         VarInt(0).encode(&mut b); // last seen
         false.encode(&mut b); // unsigned content
         VarInt(0).encode(&mut b); // filter mask: pass through
         b
     }
 
+    fn test_session() -> (SigningKey<Sha256>, ChatSession) {
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let public = key.to_public_key();
+        let public_der = rsa::pkcs8::EncodePublicKey::to_public_key_der(&public)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        (
+            SigningKey::new(key),
+            ChatSession {
+                session_id: Uuid::from_u128(3),
+                expires_at: i64::MAX / 2,
+                public_key_der: public_der,
+            },
+        )
+    }
+
+    fn signed(
+        key: &SigningKey<Sha256>,
+        session: &ChatSession,
+        sender: Uuid,
+        index: i32,
+        text: &str,
+        timestamp: i64,
+        salt: i64,
+    ) -> Signature {
+        let data = signed_bytes(
+            sender,
+            session.session_id,
+            index,
+            text,
+            timestamp,
+            salt,
+            &[],
+        );
+        let bytes = key.sign(&data).to_bytes();
+        bytes.as_ref().try_into().unwrap()
+    }
+
+    fn info_with_session(session: &ChatSession) -> PlayerInfo {
+        PlayerInfo {
+            chat_session: Some(session.clone()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn incoming_chat_is_tracked_and_acknowledged() {
         let mut chat = ChatState::new();
         let sender = Uuid::from_u128(7);
+        let info = PlayerInfo::default();
         let got = chat
-            .player_chat(&player_chat(0, sender, None, "hi"), |_| true)
+            .player_chat(
+                &player_chat(0, 0, sender, None, "hi", 0, 0),
+                |_| Some(&info),
+                false,
+            )
             .unwrap();
         assert_eq!(
-            got,
-            Incoming {
+            got.incoming,
+            Some(Incoming {
                 sender,
-                text: "hi".into(),
-                ack: None
-            }
+                text: "hi".into()
+            })
         );
+        assert_eq!(got.ack, None);
         // Unsigned messages are not tracked.
         assert_eq!(chat.tracker.offset, 0);
 
         // The index must count up.
         assert!(matches!(
-            chat.player_chat(&player_chat(5, sender, None, "x"), |_| true),
+            chat.player_chat(
+                &player_chat(5, 5, sender, None, "x", 0, 0),
+                |_| Some(&info),
+                false
+            ),
             Err(ChatError::BadIndex {
                 expected: 1,
                 got: 5
@@ -582,15 +832,22 @@ mod tests {
         ));
 
         // 65 signed messages: the 65th pushes the offset past 64.
+        let (key, session) = test_session();
+        let info = info_with_session(&session);
         let mut chat = ChatState::new();
-        for i in 0..65u8 {
+        for i in 0..65i32 {
+            let timestamp = 1_000 + i as i64;
+            let salt = i as i64;
+            let signature = signed(&key, &session, sender, i, "m", timestamp, salt);
             let got = chat
                 .player_chat(
-                    &player_chat(i as i32, sender, Some(sig(i + 1)), "m"),
-                    |_| true,
+                    &player_chat(i, i, sender, Some(signature), "m", timestamp, salt),
+                    |_| Some(&info),
+                    false,
                 )
                 .unwrap();
             assert_eq!(got.ack, (i == 64).then_some(65), "message {i}");
+            assert_eq!(got.incoming.unwrap().text, "m");
         }
         // Our next message reports the last 20 and no further offset.
         let Outgoing::Chat(sb::Chat {
@@ -604,6 +861,133 @@ mod tests {
         assert!(signature.is_none(), "no chat session: unsigned");
         assert_eq!(last_seen.offset, 0);
         assert_eq!(last_seen.acknowledged, (1 << 20) - 1);
+    }
+
+    #[test]
+    fn sender_signatures_are_checked_and_broken_chains_stay_broken() {
+        let (key, session) = test_session();
+        let sender = Uuid::from_u128(7);
+        let info = info_with_session(&session);
+        let mut chat = ChatState::new();
+        let timestamp = 1_000;
+        let salt = 7;
+
+        let first = signed(&key, &session, sender, 0, "hello", timestamp, salt);
+        let got = chat
+            .player_chat(
+                &player_chat(0, 0, sender, Some(first), "hello", timestamp, salt),
+                |_| Some(&info),
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming.unwrap().text, "hello");
+
+        // The same signed message twice is accepted (the packet index
+        // still has to advance).
+        let got = chat
+            .player_chat(
+                &player_chat(1, 0, sender, Some(first), "hello", timestamp, salt),
+                |_| Some(&info),
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming.unwrap().text, "hello");
+
+        // A valid signature over different content is caught.
+        let second = signed(&key, &session, sender, 1, "good", timestamp, salt + 1);
+        let got = chat
+            .player_chat(
+                &player_chat(2, 1, sender, Some(second), "bad", timestamp, salt + 1),
+                |_| Some(&info),
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming, None);
+
+        // The chain is now broken for this session, even for a valid
+        // signature at the right index.
+        let third = signed(&key, &session, sender, 2, "next", timestamp, salt + 2);
+        let got = chat
+            .player_chat(
+                &player_chat(3, 2, sender, Some(third), "next", timestamp, salt + 2),
+                |_| Some(&info),
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming, None);
+
+        // A new chat session starts a fresh chain.
+        let new_session = ChatSession {
+            session_id: Uuid::from_u128(4),
+            ..session
+        };
+        let new_info = info_with_session(&new_session);
+        let fresh = signed(&key, &new_session, sender, 0, "fresh", timestamp, salt);
+        let got = chat
+            .player_chat(
+                &player_chat(4, 0, sender, Some(fresh), "fresh", timestamp, salt),
+                |_| Some(&new_info),
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming.unwrap().text, "fresh");
+    }
+
+    #[test]
+    fn missing_or_expired_profile_keys_follow_secure_chat_settings() {
+        let (key, mut session) = test_session();
+        let sender = Uuid::from_u128(7);
+        let timestamp = 1_000;
+        let salt = 7;
+        let signature = signed(&key, &session, sender, 0, "hi", timestamp, salt);
+        let body = player_chat(0, 0, sender, Some(signature), "hi", timestamp, salt);
+
+        let no_session = PlayerInfo::default();
+        let mut chat = ChatState::new();
+        assert_eq!(
+            chat.player_chat(&body, |_| Some(&no_session), true)
+                .unwrap()
+                .incoming,
+            None,
+            "a secure server rejects messages without a profile key"
+        );
+        let mut chat = ChatState::new();
+        assert_eq!(
+            chat.player_chat(&body, |_| Some(&no_session), false)
+                .unwrap()
+                .incoming
+                .unwrap()
+                .text,
+            "hi",
+            "an insecure server shows the content unsigned"
+        );
+
+        // Expiry has an eight-hour grace period.
+        session.expires_at = crate::clock::millis() - PROFILE_KEY_GRACE_MS - 1;
+        let expired = info_with_session(&session);
+        let mut chat = ChatState::new();
+        assert_eq!(
+            chat.player_chat(&body, |_| Some(&expired), false)
+                .unwrap()
+                .incoming,
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_senders_are_not_shown() {
+        let sender = Uuid::from_u128(7);
+        let mut chat = ChatState::new();
+        let got = chat
+            .player_chat(
+                &player_chat(0, 0, sender, Some(sig(1)), "hi", 0, 0),
+                |_| None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(got.incoming, None);
+        // The bad message still occupies a last-seen slot as unshown.
+        assert_eq!(chat.tracker.offset, 1);
     }
 
     #[test]

@@ -129,6 +129,9 @@ impl PlayState {
             carried_index: 0,
             game_mode: crate::interact::GameMode::new(),
         };
+        state
+            .entities
+            .set_painting_variants(painting_variant_sizes(session));
         state.inventory.creative = state.game_type == GameType::Creative;
         state.start_waiting_for_new_level();
         state
@@ -1037,6 +1040,91 @@ fn registry_len(session: &SessionData, name: &str) -> usize {
         .sum()
 }
 
+/// Width and height of each synced `minecraft:painting_variant`, in registry
+/// ID order. With a known pack accepted the server omits the entry data, so
+/// fall back to the dimensions shipped in vanilla's datapack.
+fn painting_variant_sizes(session: &SessionData) -> Vec<(i32, i32)> {
+    session
+        .registries
+        .iter()
+        .filter(|(registry, _)| registry.normalized() == "minecraft:painting_variant")
+        .flat_map(|(_, entries)| entries.iter())
+        .map(|entry| {
+            let synced = entry
+                .data
+                .as_ref()
+                .and_then(rapidbot_nbt::Tag::as_compound)
+                .and_then(|data| {
+                    Some((
+                        data.get("width").and_then(rapidbot_nbt::Tag::as_i64)? as i32,
+                        data.get("height").and_then(rapidbot_nbt::Tag::as_i64)? as i32,
+                    ))
+                });
+            let (width, height) =
+                synced.unwrap_or_else(|| vanilla_painting_size(&entry.id.normalized()));
+            (width.clamp(1, 16), height.clamp(1, 16))
+        })
+        .collect()
+}
+
+/// `PaintingVariant` sizes from `data/minecraft/painting_variant/*.json`.
+fn vanilla_painting_size(name: &str) -> (i32, i32) {
+    match name {
+        "minecraft:alban" => (1, 1),
+        "minecraft:aztec" => (1, 1),
+        "minecraft:aztec2" => (1, 1),
+        "minecraft:backyard" => (3, 4),
+        "minecraft:baroque" => (2, 2),
+        "minecraft:bomb" => (1, 1),
+        "minecraft:bouquet" => (3, 3),
+        "minecraft:burning_skull" => (4, 4),
+        "minecraft:bust" => (2, 2),
+        "minecraft:cavebird" => (3, 3),
+        "minecraft:changing" => (4, 2),
+        "minecraft:cotan" => (3, 3),
+        "minecraft:courbet" => (2, 1),
+        "minecraft:creebet" => (2, 1),
+        "minecraft:dennis" => (3, 3),
+        "minecraft:donkey_kong" => (4, 3),
+        "minecraft:earth" => (2, 2),
+        "minecraft:endboss" => (3, 3),
+        "minecraft:fern" => (3, 3),
+        "minecraft:fighters" => (4, 2),
+        "minecraft:finding" => (4, 2),
+        "minecraft:fire" => (2, 2),
+        "minecraft:graham" => (1, 2),
+        "minecraft:humble" => (2, 2),
+        "minecraft:kebab" => (1, 1),
+        "minecraft:lowmist" => (4, 2),
+        "minecraft:match" => (2, 2),
+        "minecraft:meditative" => (1, 1),
+        "minecraft:orb" => (4, 4),
+        "minecraft:owlemons" => (3, 3),
+        "minecraft:passage" => (4, 2),
+        "minecraft:pigscene" => (4, 4),
+        "minecraft:plant" => (1, 1),
+        "minecraft:pointer" => (4, 4),
+        "minecraft:pond" => (3, 4),
+        "minecraft:pool" => (2, 1),
+        "minecraft:prairie_ride" => (1, 2),
+        "minecraft:sea" => (2, 1),
+        "minecraft:skeleton" => (4, 3),
+        "minecraft:skull_and_roses" => (2, 2),
+        "minecraft:stage" => (2, 2),
+        "minecraft:sunflowers" => (3, 3),
+        "minecraft:sunset" => (2, 1),
+        "minecraft:tides" => (3, 3),
+        "minecraft:unpacked" => (4, 4),
+        "minecraft:void" => (2, 2),
+        "minecraft:wanderer" => (1, 2),
+        "minecraft:wasteland" => (1, 1),
+        "minecraft:water" => (2, 2),
+        "minecraft:wind" => (2, 2),
+        "minecraft:wither" => (2, 2),
+        _ => (1, 1),
+    }
+}
+
 /// `EnvironmentAttributes.FAST_LAVA` of a dimension type: from the synced
 /// attributes when the server sent the entry, else true for the Nether.
 fn fast_lava(session: &SessionData, id: i32) -> bool {
@@ -1106,6 +1194,36 @@ mod tests {
             portal_cooldown: 0,
             sea_level: 63,
         }
+    }
+
+    #[test]
+    fn painting_sizes_use_synced_data_or_vanilla_dimensions() {
+        let mut custom = rapidbot_nbt::Compound::default();
+        custom.insert("width", rapidbot_nbt::Tag::Int(4));
+        custom.insert("height", rapidbot_nbt::Tag::Int(2));
+        let entries = vec![
+            rapidbot_protocol::packets::configuration::RegistryEntry {
+                id: Identifier::from("minecraft:custom"),
+                data: Some(rapidbot_nbt::Tag::Compound(custom)),
+            },
+            // Known-pack entries have no data; use the vanilla table.
+            rapidbot_protocol::packets::configuration::RegistryEntry {
+                id: Identifier::from("minecraft:backyard"),
+                data: None,
+            },
+            rapidbot_protocol::packets::configuration::RegistryEntry {
+                id: Identifier::from("minecraft:out_of_range"),
+                data: Some(rapidbot_nbt::Tag::Compound(rapidbot_nbt::Compound(vec![
+                    ("width".into(), rapidbot_nbt::Tag::Int(99)),
+                    ("height".into(), rapidbot_nbt::Tag::Int(0)),
+                ]))),
+            },
+        ];
+        let mut session = SessionData::default();
+        session
+            .registries
+            .push((Identifier::from("minecraft:painting_variant"), entries));
+        assert_eq!(painting_variant_sizes(&session), [(4, 2), (3, 4), (16, 1)]);
     }
 
     fn play_state() -> PlayState {

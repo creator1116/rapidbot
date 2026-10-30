@@ -43,7 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let reason = rapidbot_client::run(ClientConfig::new(address, account)).await;
+    let mut config = ClientConfig::new(address, account);
+    if let Ok(proxy) = std::env::var("RAPIDBOT_PROXY") {
+        config.proxy = Some(proxy.parse()?);
+    }
+    let reason = rapidbot_client::run(config).await;
     tracing::warn!("connection ended: {reason}");
     Ok(())
 }

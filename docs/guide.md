@@ -200,6 +200,11 @@ which is gitignored).
 
 `ClientConfig` fields worth knowing:
 
+- `proxy`: `None` (default) or a SOCKS5/HTTP CONNECT endpoint. The join
+  example reads `RAPIDBOT_PROXY`, e.g. `socks5://user:pass@127.0.0.1:1080` or
+  `http://127.0.0.1:8080`; `Proxy::parse` accepts a bare `host:port` as HTTP.
+  The server address is still resolved (SRV included) locally, and the
+  handshake carries the same host as a direct connection.
 - `resource_packs`: `Decline` (default) or `Accept`. Accepted packs are
   really downloaded, with the request the Java client sends.
 - `human_seed`: seeds input-model randomness. One seed per account keeps

@@ -22,6 +22,7 @@ pub mod nav;
 mod net;
 mod packs;
 pub mod path;
+mod proxy;
 pub mod status;
 pub mod text;
 
@@ -40,6 +41,7 @@ pub use bot::{Bot, BotEvent};
 pub use controller::{Controller, Idle, TickContext};
 pub use game::{DisplaySettings, LocalPlayer};
 pub use mouse::MouseSettings;
+pub use proxy::{Proxy, ProxyAuth, ProxyError};
 pub use rapidbot_human as human;
 pub use rapidbot_physics::{Keys, math};
 pub use rapidbot_world as world;
@@ -112,6 +114,8 @@ pub struct ClientConfig {
     /// As a player would type it into the server list: `host[:port]`.
     pub address: String,
     pub account: Account,
+    /// Optional SOCKS5 or HTTP CONNECT proxy for the game connection.
+    pub proxy: Option<Proxy>,
     pub information: ClientInformation,
     pub resource_packs: ResourcePackPolicy,
     /// Human input timing, or direct instruction execution for tests and
@@ -144,6 +148,7 @@ impl ClientConfig {
         Self {
             address: address.into(),
             account,
+            proxy: None,
             information: ClientInformation::default(),
             resource_packs: ResourcePackPolicy::default(),
             input_mode: InputMode::default(),
@@ -164,6 +169,8 @@ pub enum ClientError {
     Resolve(#[from] address::ResolveError),
     #[error(transparent)]
     Connection(#[from] ConnectionError),
+    #[error(transparent)]
+    Proxy(#[from] ProxyError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("disconnected: {0}")]
@@ -238,7 +245,13 @@ async fn run_inner(
         }
         let resolved = address::resolve(&config.address).await?;
         info!(address = %resolved.socket, host = %resolved.handshake_host, "connecting");
-        let mut connection = Connection::connect(resolved.socket).await?;
+        let mut connection = match &config.proxy {
+            Some(proxy) => {
+                info!(?proxy, "connecting through proxy");
+                Connection::from_stream(proxy::connect(proxy, resolved.socket).await?)?
+            }
+            None => Connection::connect(resolved.socket).await?,
+        };
 
         // Vanilla sends the intention and then Hello, each flushed.
         connection

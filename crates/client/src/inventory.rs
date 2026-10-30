@@ -241,6 +241,29 @@ fn is_cartography_addition(stack: &ItemStack) -> bool {
         || stack.has("minecraft:map_id")
 }
 
+/// `ScrollWheelHandler.getNextScrollWheelSelection`: one wheel event moves
+/// the selection by one slot, wrapping.
+fn next_scroll_selection(wheel: f64, current: i32, limit: i32) -> i32 {
+    let step = wheel.signum() as i32;
+    let mut selected = (current - step).max(-1);
+    while selected < 0 {
+        selected += limit;
+    }
+    while selected >= limit {
+        selected -= limit;
+    }
+    selected
+}
+
+/// Applies `notches` wheel events to a hotbar slot. Positive means wheel up,
+/// which vanilla maps to the previous slot (towards 0).
+pub(crate) fn scroll_selection(current: u8, notches: i32) -> u8 {
+    let direction = notches.signum() as f64;
+    (0..notches.unsigned_abs()).fold(current as i32, |selected, _| {
+        next_scroll_selection(direction, selected, 9)
+    }) as u8
+}
+
 impl Inventory {
     /// A menu slot of the inventory screen; see [`slot`].
     pub fn get(&self, index: usize) -> Option<&ItemStack> {
@@ -1333,6 +1356,16 @@ mod tests {
         assert_eq!(inv.held().unwrap().name(), "minecraft:stone");
         inv.set_held_slot(&[9]).unwrap();
         assert_eq!(inv.selected, 2);
+    }
+
+    #[test]
+    fn scroll_wheel_moves_one_slot_per_notch_and_wraps() {
+        assert_eq!(scroll_selection(0, 1), 8);
+        assert_eq!(scroll_selection(8, -1), 0);
+        assert_eq!(scroll_selection(4, 2), 2);
+        assert_eq!(scroll_selection(0, -2), 2);
+        assert_eq!(scroll_selection(5, 10), 4);
+        assert_eq!(scroll_selection(5, 0), 5);
     }
 
     fn item(name: &str, count: i32) -> ItemStack {

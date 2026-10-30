@@ -54,6 +54,7 @@ pub struct TickContext<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Actions {
     pub select_slot: Option<u8>,
+    pub scroll: i32,
     pub attack: Option<bool>,
     pub click: bool,
     pub use_block: bool,
@@ -71,6 +72,15 @@ impl TickContext<'_> {
         if slot < 9 {
             self.actions.select_slot = Some(slot);
         }
+    }
+
+    /// Turns the mouse wheel by `notches` over the hotbar. Positive values
+    /// are wheel-up (towards slot 0), negative wheel-down; the selection
+    /// wraps. Unlike a number key this is immediate: vanilla applies scroll
+    /// events directly, without the hand moving to a key. Scrolling does
+    /// nothing while a screen or the chat box is open.
+    pub fn scroll_hotbar(&mut self, notches: i32) {
+        self.actions.scroll = self.actions.scroll.saturating_add(notches);
     }
 
     /// Presses or lets go of the attack button (left mouse). Held on a

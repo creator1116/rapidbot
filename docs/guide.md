@@ -85,6 +85,7 @@ keyboard, and click events; the vanilla simulation processes those events.
 | `ctx.stop_aiming()` | The hand rests |
 | `ctx.set_keys(Keys { forward: true, .. })` | Movement keys to hold; fingers follow within tens of milliseconds |
 | `ctx.select_slot(n)` | Presses hotbar key `n` |
+| `ctx.scroll_hotbar(notches)` | Turns the wheel: positive is up, wrapping the hotbar |
 | `ctx.hold_attack(bool)` | Holds or releases the left mouse button: digs the block under the crosshair |
 | `ctx.click_attack()` | One left click: attacks the entity under the crosshair |
 | `ctx.chat(line)` | Types a message or `/command` at typing speed |

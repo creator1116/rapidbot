@@ -25,7 +25,11 @@ pub mod pose {
     pub const SWIMMING: i32 = 3;
     pub const SPIN_ATTACK: i32 = 4;
     pub const CROUCHING: i32 = 5;
+    pub const LONG_JUMPING: i32 = 6;
     pub const DYING: i32 = 7;
+    pub const SITTING: i32 = 10;
+    pub const EMERGING: i32 = 13;
+    pub const DIGGING: i32 = 14;
 }
 
 /// Default radius used for [`crate::controller::TickContext::players`].
@@ -226,6 +230,24 @@ pub struct Entity {
     pub health: Option<f32>,
     /// The `scale` attribute.
     pub scale: f32,
+    /// `AgeableMob.DATA_BABY_ID` (also used by zombies and zoglins).
+    baby: bool,
+    /// `AbstractCubeMob.ID_SIZE`.
+    cube_mob_size: i32,
+    /// `Pufferfish.PUFF_STATE`.
+    puff_state: i32,
+    /// `Salmon.DATA_TYPE`: small, medium, or large.
+    salmon_size: i32,
+    /// `Phantom.ID_SIZE`.
+    phantom_size: i32,
+    /// `Sniffer.DATA_STATE`.
+    sniffer_state: i32,
+    /// `Shulker.DATA_ATTACH_FACE_ID`: a `Direction` ordinal (DOWN is 0).
+    shulker_attach_face: i32,
+    /// `Shulker.DATA_PEEK_ID`.
+    shulker_raw_peek: i8,
+    /// `Shulker.currentPeekAmount`, eased toward the raw value each tick.
+    shulker_peek: f32,
     /// `ArmorStand.DATA_CLIENT_FLAGS`.
     armor_stand_flags: u8,
     /// `AbstractArrow.IN_GROUND`.
@@ -302,6 +324,15 @@ impl Entity {
             pose: pose::STANDING,
             health: None,
             scale: 1.0,
+            baby: false,
+            cube_mob_size: 1,
+            puff_state: 0,
+            salmon_size: 1,
+            phantom_size: 0,
+            sniffer_state: 0,
+            shulker_attach_face: 0,
+            shulker_raw_peek: 0,
+            shulker_peek: 0.0,
             armor_stand_flags: 0,
             in_ground: false,
             interaction_width: 1.0,
@@ -320,8 +351,10 @@ impl Entity {
         self.info().living
     }
 
-    /// Width and height (`Entity.getDimensions(pose)`). Babies and mobs
-    /// whose size is entity data (slimes) come out at the type's size.
+    /// Width and height (`Entity.getDimensions(pose)`). Babies and the
+    /// entity-data sizes of cube mobs, pufferfish, salmon and phantoms come
+    /// from the values the server sends. The `scale` attribute applies last,
+    /// except while sleeping, where vanilla uses a fixed box.
     pub fn dimensions(&self) -> (f32, f32) {
         let info = self.info();
         if info.is("Interaction") {
@@ -332,13 +365,6 @@ impl Entity {
             return (size, size);
         }
         let (width, height, _) = Registry::get().entity_dimensions[self.type_id];
-        let scaled = |w: f32, h: f32| {
-            if self.scale != 1.0 {
-                (w * self.scale, h * self.scale)
-            } else {
-                (w, h)
-            }
-        };
         if !info.living {
             return (width, height);
         }
@@ -346,24 +372,157 @@ impl Entity {
         if self.pose == pose::SLEEPING {
             return (0.2, 0.2);
         }
-        if info.is("Avatar") {
+        let (width, height) = if info.is("Avatar") {
             // Avatar.POSES.
-            return match self.pose {
-                pose::FALL_FLYING | pose::SWIMMING | pose::SPIN_ATTACK => scaled(0.6, 0.6),
-                pose::CROUCHING => scaled(0.6, 1.5),
+            match self.pose {
+                pose::FALL_FLYING | pose::SWIMMING | pose::SPIN_ATTACK => (0.6, 0.6),
+                pose::CROUCHING => (0.6, 1.5),
                 pose::DYING => (0.2, 0.2),
-                _ => scaled(0.6, 1.8),
-            };
-        }
-        if info.is("ArmorStand") {
+                _ => (0.6, 1.8),
+            }
+        } else if info.is("ArmorStand") {
             if self.armor_stand_flags & 16 != 0 {
                 return (0.0, 0.0);
             }
             if self.armor_stand_flags & 1 != 0 {
-                return scaled(width * 0.5, height * 0.5);
+                (width * 0.5, height * 0.5)
+            } else {
+                (width, height)
             }
+        } else {
+            self.living_dimensions(info, width, height)
+        };
+        (width * self.scale, height * self.scale)
+    }
+
+    /// `LivingEntity.getDefaultDimensions`, including the overrides that
+    /// depend on pose or entity data.
+    fn living_dimensions(&self, info: &EntityKind, width: f32, height: f32) -> (f32, f32) {
+        // Camel.getDefaultDimensions.
+        if info.is("Camel") {
+            return if self.pose == pose::SITTING {
+                if self.baby {
+                    (0.95, 0.425)
+                } else {
+                    (width, height - 1.43)
+                }
+            } else if self.baby {
+                (0.95, 1.4)
+            } else {
+                (width, height)
+            };
         }
-        scaled(width, height)
+        // Goat.getDefaultDimensions.
+        if info.is("Goat") {
+            let dimensions = if self.baby {
+                (0.45, 0.65)
+            } else {
+                (width, height)
+            };
+            return if self.pose == pose::LONG_JUMPING {
+                (dimensions.0 * 0.7, dimensions.1 * 0.7)
+            } else {
+                dimensions
+            };
+        }
+        // Sniffer.getDefaultDimensions: digging lowers the box before the
+        // age scale is applied.
+        if info.is("Sniffer") && self.sniffer_state == 5 {
+            let age_scale = if self.baby { 0.5 } else { 1.0 };
+            return (width * age_scale, (height - 0.4) * age_scale);
+        }
+        // Pufferfish and salmon scale their normal box by the data value.
+        if info.is("Pufferfish") {
+            let scale = match self.puff_state {
+                0 => 0.5,
+                1 => 0.7,
+                _ => 1.0,
+            };
+            return (width * scale, height * scale);
+        }
+        if info.is("Salmon") {
+            let scale = match self.salmon_size {
+                0 => 0.5,
+                1 => 1.0,
+                _ => 1.5,
+            };
+            return (width * scale, height * scale);
+        }
+        // Phantom.getDefaultDimensions.
+        if info.is("Phantom") {
+            let scale = 1.0 + 0.15 * self.phantom_size as f32;
+            return (width * scale, height * scale);
+        }
+        // AbstractCubeMob ignores the age scale; its size is the data value.
+        if info.is("AbstractCubeMob") {
+            let size = self.cube_mob_size as f32;
+            return (width * size, height * size);
+        }
+        // Shulker.getDefaultDimensions opens upward when attached to a
+        // ceiling. Its actual bounding box is handled by makeBoundingBox.
+        if info.is("Shulker") {
+            return if self.shulker_attach_face == 0 && self.shulker_peek > 0.0 {
+                (width, height * (1.0 + self.shulker_peek))
+            } else {
+                (width, height)
+            };
+        }
+        if self.baby {
+            return self
+                .baby_dimensions(info, width, height)
+                .unwrap_or((width * 0.5, height * 0.5));
+        }
+        // Warden.getDefaultDimensions while digging or emerging.
+        if info.is("Warden") && (self.pose == pose::DIGGING || self.pose == pose::EMERGING) {
+            return (width, 1.0);
+        }
+        (width, height)
+    }
+
+    /// Baby boxes that are not simply the adult box times 0.5.
+    fn baby_dimensions(&self, info: &EntityKind, width: f32, height: f32) -> Option<(f32, f32)> {
+        let dimensions = if info.is("AbstractCow") {
+            (0.45, 0.7)
+        } else if info.is("Horse") || info.is("SkeletonHorse") || info.is("ZombieHorse") {
+            (width * 0.7, height * 0.7)
+        } else if info.is("Armadillo") {
+            (width * 0.6, height * 0.6)
+        } else if info.is("Axolotl") {
+            (0.375, 0.21)
+        } else if info.is("Chicken") {
+            (0.3, 0.4)
+        } else if info.is("Dolphin") {
+            (width * 0.65, height * 0.65)
+        } else if info.is("Fox") {
+            (width * 0.6, height * 0.6)
+        } else if info.is("Cat") || info.is("Ocelot") {
+            (0.3, 0.35)
+        } else if info.is("HappyGhast") {
+            (width * 0.2375, height * 0.2375)
+        } else if info.is("Pig") {
+            (0.45, 0.45)
+        } else if info.is("PolarBear") {
+            (0.7, 0.7)
+        } else if info.is("Rabbit") {
+            (0.24, 0.4)
+        } else if info.is("Sheep") {
+            (0.45, 0.65)
+        } else if info.is("Squid") {
+            (0.5, 0.5)
+        } else if info.is("Strider") {
+            (0.45, 0.85)
+        } else if info.is("Turtle") {
+            (width * 0.3, height * 0.3)
+        } else if info.is("Wolf") {
+            (0.3, 0.425)
+        } else if info.is("Villager") || info.is("Zombie") || info.is("Piglin") {
+            (0.49, 0.98)
+        } else if info.is("Hoglin") || info.is("Zoglin") {
+            (0.75, 0.85)
+        } else {
+            return None;
+        };
+        Some(dimensions)
     }
 
     /// The stack shown by an item frame, if any.
@@ -397,6 +556,9 @@ impl Entity {
                 [self.pos.x + x, self.pos.y + y, self.pos.z + z],
             );
         }
+        if self.info().is("Shulker") {
+            return self.shulker_box();
+        }
         let (width, height) = self.dimensions();
         let w = (width / 2.0) as f64;
         let h = height as f64;
@@ -404,6 +566,38 @@ impl Entity {
             [self.pos.x - w, self.pos.y, self.pos.z - w],
             [self.pos.x + w, self.pos.y + h, self.pos.z + w],
         )
+    }
+
+    /// `Shulker.makeBoundingBox`: a unit cube that grows toward the face
+    /// opposite its attachment as the lid opens.
+    fn shulker_box(&self) -> ([f64; 3], [f64; 3]) {
+        let size = self.scale as f64;
+        let progress = shulker_physical_peek(self.shulker_peek) as f64;
+        let direction = match self.shulker_attach_face {
+            // Opposite of DOWN, UP, NORTH, SOUTH, WEST, EAST.
+            0 => (0.0, 1.0, 0.0),
+            1 => (0.0, -1.0, 0.0),
+            2 => (0.0, 0.0, 1.0),
+            3 => (0.0, 0.0, -1.0),
+            4 => (1.0, 0.0, 0.0),
+            _ => (-1.0, 0.0, 0.0),
+        };
+        let half = size * 0.5;
+        let mut min = [self.pos.x - half, self.pos.y, self.pos.z - half];
+        let mut max = [self.pos.x + half, self.pos.y + size, self.pos.z + half];
+        let movement = [
+            direction.0 * progress * size,
+            direction.1 * progress * size,
+            direction.2 * progress * size,
+        ];
+        for (axis, movement) in movement.into_iter().enumerate() {
+            if movement < 0.0 {
+                min[axis] += movement;
+            } else {
+                max[axis] += movement;
+            }
+        }
+        (min, max)
     }
 
     fn redirectable(&self, tags: &Tags) -> bool {
@@ -600,6 +794,22 @@ impl Entity {
                 self.stepped.advance(interval);
             }
         }
+        if self.info().is("Shulker") {
+            self.update_shulker_peek();
+        }
+    }
+
+    /// `Shulker.updatePeekAmount`.
+    fn update_shulker_peek(&mut self) {
+        let target = self.shulker_raw_peek as f32 * 0.01;
+        if self.shulker_peek == target {
+            return;
+        }
+        if self.shulker_peek > target {
+            self.shulker_peek = (self.shulker_peek - 0.05).clamp(target, 1.0);
+        } else {
+            self.shulker_peek = (self.shulker_peek + 0.05).clamp(0.0, target);
+        }
     }
 }
 
@@ -731,6 +941,8 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
                 DataValue::Other
             }
             20 => DataValue::Pose(VarInt::decode(buf)?.0),
+            // Sniffer.State, armadillo/copper/weathering enums.
+            35..=38 => DataValue::Int(VarInt::decode(buf)?.0),
             40 => {
                 for _ in 0..4 {
                     f32::decode(buf)?;
@@ -760,6 +972,11 @@ fn apply_delta(base: f64, delta: i16) -> f64 {
     } else {
         (steps(base) + delta as i64) as f64 / 4096.0
     }
+}
+
+/// `Shulker.getPhysicalPeek`.
+fn shulker_physical_peek(amount: f32) -> f32 {
+    0.5 - math::sin(((0.5 + amount) * std::f32::consts::PI) as f64) * 0.5
 }
 
 /// `AABB.clip`: where the segment first enters the box.
@@ -982,6 +1199,15 @@ impl Entities {
                 pose: pose::STANDING,
                 health: None,
                 scale: 1.0,
+                baby: false,
+                cube_mob_size: 1,
+                puff_state: 0,
+                salmon_size: 1,
+                phantom_size: 0,
+                sniffer_state: 0,
+                shulker_attach_face: 0,
+                shulker_raw_peek: 0,
+                shulker_peek: 0.0,
                 armor_stand_flags: 0,
                 in_ground: false,
                 interaction_width: 1.0,
@@ -1166,6 +1392,35 @@ impl Entities {
                 (9, DataValue::Item(item)) if info.is("ItemFrame") => {
                     entity.framed_item = item;
                 }
+                (16, DataValue::Direction(face)) if info.is("Shulker") => {
+                    entity.shulker_attach_face = face;
+                }
+                (17, DataValue::Byte(peek)) if info.is("Shulker") => {
+                    entity.shulker_raw_peek = peek as i8;
+                }
+                (16, DataValue::Bool(baby))
+                    if info.is("AgeableMob") || info.is("Zombie") || info.is("Zoglin") =>
+                {
+                    entity.baby = baby;
+                }
+                (17, DataValue::Bool(baby)) if info.is("Piglin") => {
+                    entity.baby = baby;
+                }
+                (18, DataValue::Int(size)) if info.is("AbstractCubeMob") => {
+                    entity.cube_mob_size = size;
+                }
+                (17, DataValue::Int(state)) if info.is("Pufferfish") => {
+                    entity.puff_state = state;
+                }
+                (17, DataValue::Int(size)) if info.is("Salmon") => {
+                    entity.salmon_size = size;
+                }
+                (16, DataValue::Int(size)) if info.is("Phantom") => {
+                    entity.phantom_size = size;
+                }
+                (18, DataValue::Int(state)) if info.is("Sniffer") => {
+                    entity.sniffer_state = state;
+                }
                 _ => {}
             }
         }
@@ -1281,6 +1536,40 @@ mod tests {
             v.encode(&mut body);
         }
         e.move_entity(&body, false).unwrap();
+    }
+
+    fn set_bool(e: &mut Entities, id: i32, index: u8, value: bool) {
+        let data = [index, 8, u8::from(value), 0xff];
+        e.set_entity_data(id, &data).unwrap();
+    }
+
+    fn set_byte(e: &mut Entities, id: i32, index: u8, value: u8) {
+        let data = [index, 0, value, 0xff];
+        e.set_entity_data(id, &data).unwrap();
+    }
+
+    fn set_int(e: &mut Entities, id: i32, index: u8, value: i32) {
+        set_varint(e, id, index, 1, value);
+    }
+
+    fn set_varint(e: &mut Entities, id: i32, index: u8, serializer: i32, value: i32) {
+        let mut data = vec![index];
+        VarInt(serializer).encode(&mut data);
+        VarInt(value).encode(&mut data);
+        data.push(0xff);
+        e.set_entity_data(id, &data).unwrap();
+    }
+
+    fn set_pose(e: &mut Entities, id: i32, pose: i32) {
+        set_varint(e, id, 6, 20, pose);
+    }
+
+    fn assert_dims(e: &Entities, id: i32, expected: (f32, f32)) {
+        let actual = e.get(id).unwrap().dimensions();
+        assert!(
+            (actual.0 - expected.0).abs() < 1e-5 && (actual.1 - expected.1).abs() < 1e-5,
+            "entity {id}: got {actual:?}, expected {expected:?}"
+        );
     }
 
     #[test]
@@ -1401,6 +1690,132 @@ mod tests {
             seen.push(e.get(1).unwrap().pos.x);
         }
         assert_eq!(seen, [1.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn baby_entity_data_uses_vanilla_boxes() {
+        let mut e = Entities::default();
+
+        add(&mut e, 1, "minecraft:chicken", [0.0; 3]);
+        set_bool(&mut e, 1, 16, true);
+        assert_dims(&e, 1, (0.3, 0.4));
+
+        add(&mut e, 2, "minecraft:cow", [0.0; 3]);
+        set_bool(&mut e, 2, 16, true);
+        assert_dims(&e, 2, (0.45, 0.7));
+
+        add(&mut e, 3, "minecraft:horse", [0.0; 3]);
+        set_bool(&mut e, 3, 16, true);
+        assert_dims(&e, 3, (1.3964844 * 0.7, 1.6 * 0.7));
+
+        add(&mut e, 4, "minecraft:armadillo", [0.0; 3]);
+        set_bool(&mut e, 4, 16, true);
+        assert_dims(&e, 4, (0.7 * 0.6, 0.65 * 0.6));
+
+        add(&mut e, 5, "minecraft:zombie", [0.0; 3]);
+        set_bool(&mut e, 5, 16, true);
+        assert_dims(&e, 5, (0.49, 0.98));
+
+        add(&mut e, 6, "minecraft:piglin", [0.0; 3]);
+        set_bool(&mut e, 6, 17, true);
+        assert_dims(&e, 6, (0.49, 0.98));
+
+        add(&mut e, 7, "minecraft:zoglin", [0.0; 3]);
+        set_bool(&mut e, 7, 16, true);
+        assert_dims(&e, 7, (0.75, 0.85));
+
+        add(&mut e, 8, "minecraft:happy_ghast", [0.0; 3]);
+        set_bool(&mut e, 8, 16, true);
+        assert_dims(&e, 8, (0.95, 0.95));
+
+        add(&mut e, 9, "minecraft:turtle", [0.0; 3]);
+        set_bool(&mut e, 9, 16, true);
+        assert_dims(&e, 9, (1.2 * 0.3, 0.4 * 0.3));
+
+        // The scale attribute applies to the baby box, not instead of it.
+        e.set_scale(2, 2.0);
+        assert_dims(&e, 2, (0.9, 1.4));
+    }
+
+    #[test]
+    fn cube_mobs_fish_and_phantoms_use_entity_data_sizes() {
+        let mut e = Entities::default();
+
+        add(&mut e, 1, "minecraft:slime", [0.0; 3]);
+        assert_dims(&e, 1, (0.52, 0.52));
+        set_int(&mut e, 1, 18, 4);
+        assert_dims(&e, 1, (0.52 * 4.0, 0.52 * 4.0));
+
+        add(&mut e, 2, "minecraft:pufferfish", [0.0; 3]);
+        assert_dims(&e, 2, (0.7 * 0.5, 0.7 * 0.5));
+        set_int(&mut e, 2, 17, 2);
+        assert_dims(&e, 2, (0.7, 0.7));
+        set_int(&mut e, 2, 17, 1);
+        assert_dims(&e, 2, (0.7 * 0.7, 0.7 * 0.7));
+
+        add(&mut e, 3, "minecraft:salmon", [0.0; 3]);
+        set_int(&mut e, 3, 17, 0);
+        assert_dims(&e, 3, (0.7 * 0.5, 0.4 * 0.5));
+        set_int(&mut e, 3, 17, 2);
+        assert_dims(&e, 3, (0.7 * 1.5, 0.4 * 1.5));
+
+        add(&mut e, 4, "minecraft:phantom", [0.0; 3]);
+        set_int(&mut e, 4, 16, 2);
+        assert_dims(&e, 4, (0.9 * 1.3, 0.5 * 1.3));
+    }
+
+    #[test]
+    fn pose_and_state_change_living_boxes() {
+        let mut e = Entities::default();
+
+        add(&mut e, 1, "minecraft:camel", [0.0; 3]);
+        set_bool(&mut e, 1, 16, true);
+        assert_dims(&e, 1, (0.95, 1.4));
+        set_pose(&mut e, 1, pose::SITTING);
+        assert_dims(&e, 1, (0.95, 0.425));
+
+        add(&mut e, 2, "minecraft:goat", [0.0; 3]);
+        set_bool(&mut e, 2, 16, true);
+        assert_dims(&e, 2, (0.45, 0.65));
+        set_pose(&mut e, 2, pose::LONG_JUMPING);
+        assert_dims(&e, 2, (0.45 * 0.7, 0.65 * 0.7));
+
+        add(&mut e, 3, "minecraft:sniffer", [0.0; 3]);
+        set_varint(&mut e, 3, 18, 35, 5);
+        assert_dims(&e, 3, (1.9, 1.35));
+        set_bool(&mut e, 3, 16, true);
+        assert_dims(&e, 3, (1.9 * 0.5, (1.75 - 0.4) * 0.5));
+
+        add(&mut e, 4, "minecraft:warden", [0.0; 3]);
+        set_pose(&mut e, 4, pose::DIGGING);
+        assert_dims(&e, 4, (0.9, 1.0));
+        set_pose(&mut e, 4, pose::STANDING);
+        assert_dims(&e, 4, (0.9, 2.9));
+    }
+
+    #[test]
+    fn shulkers_open_toward_the_face_opposite_their_attachment() {
+        let mut e = Entities::default();
+
+        add(&mut e, 1, "minecraft:shulker", [0.0, 64.0, 0.0]);
+        add(&mut e, 2, "minecraft:shulker", [0.0, 64.0, 0.0]);
+        set_varint(&mut e, 1, 16, 12, 0); // attached to the floor
+        set_varint(&mut e, 2, 16, 12, 2); // attached to the north wall
+        set_byte(&mut e, 1, 17, 100);
+        set_byte(&mut e, 2, 17, 100);
+        for _ in 0..20 {
+            e.tick();
+        }
+
+        assert_dims(&e, 1, (1.0, 2.0));
+        let (min, max) = e.get(1).unwrap().bounding_box();
+        assert_eq!(min, [-0.5, 64.0, -0.5]);
+        assert_eq!(max, [0.5, 66.0, 0.5]);
+
+        assert_dims(&e, 2, (1.0, 1.0));
+        let (min, max) = e.get(2).unwrap().bounding_box();
+        assert_eq!(min, [-0.5, 64.0, -0.5]);
+        assert_eq!(max, [0.5, 65.0, 1.5]);
     }
 
     #[test]

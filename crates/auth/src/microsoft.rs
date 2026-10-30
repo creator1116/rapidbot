@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::{AuthError, CachedMsa, now_secs};
 
-const SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
+pub(crate) const SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
 
 /// What the user needs to sign in: open `verification_uri`, enter `user_code`.
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +81,35 @@ pub(crate) async fn device_code_login(
         debug!("waiting for device code sign-in");
     }
     Err(AuthError::DeviceCodeExpired)
+}
+
+pub(crate) async fn authorization_code(
+    http: &reqwest::Client,
+    client_id: &str,
+    token_url: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<CachedMsa, AuthError> {
+    let response = http
+        .post(token_url)
+        .form(&[
+            ("client_id", client_id),
+            ("scope", SCOPE),
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier),
+        ])
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(match error_response(response).await {
+            Ok(err) => error_to_auth(err),
+            Err(err) => err,
+        });
+    }
+    to_cached(response.json().await?, None)
 }
 
 pub(crate) async fn refresh(

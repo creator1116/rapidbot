@@ -16,7 +16,7 @@
 //! landing) and suffocation push-out (`moveTowardsClosestSpace`) are
 //! modelled as well.
 //!
-//! Not yet: scaffolding's context-dependent collision shape. Riding is
+//! Scaffolding's context-dependent collision shape is modelled too. Riding is
 //! tracked by the client, which mirrors the vehicle's server position.
 
 use rapidbot_world::collision::{
@@ -1443,7 +1443,8 @@ impl Player {
             1.0
         };
 
-        // handleRelativeFrictionAndCalculateMovement (climbing not yet).
+        // handleRelativeFrictionAndCalculateMovement: the relative move is
+        // capped by handleOnClimbable below, then moved.
         let speed = self.friction_influenced_speed(block_friction);
         self.move_relative(speed, input);
         // handleOnClimbable: ladders cap speed and stop a sneaking player

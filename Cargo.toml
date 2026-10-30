@@ -28,6 +28,7 @@ cfb8 = "0.8"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 hickory-resolver = "0.25"
 md-5 = "0.10"
+percent-encoding = "2"
 proc-macro2 = "1"
 quote = "1"
 rand = "0.8"

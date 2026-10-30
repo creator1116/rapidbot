@@ -2507,8 +2507,10 @@ dependencies = [
 name = "rapidbot-client"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hickory-resolver",
  "md-5",
+ "percent-encoding",
  "rand 0.8.8",
  "rapidbot-auth",
  "rapidbot-buf",

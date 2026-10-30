@@ -15,6 +15,7 @@ mod accounts;
 mod cache;
 mod microsoft;
 mod minecraft;
+mod realms;
 mod store;
 mod xbox;
 
@@ -27,6 +28,7 @@ pub use accounts::{AccountStatus, AccountStore, StoredAccount};
 pub use cache::{CachedMinecraft, CachedMsa, TokenCache};
 pub use microsoft::DeviceCode;
 pub use minecraft::{ChatKeys, JoinError, join_server};
+pub use realms::{Realm, RealmCompatibility, RealmJoin, RealmPlayer, RealmState, RealmsClient};
 pub use store::{
     EncryptedFileTokenStore, FileTokenStore, KeyProvider, KeyringKeyProvider, TokenStore,
 };
@@ -87,6 +89,8 @@ pub enum AuthError {
     Minecraft(String),
     #[error("this account does not own Minecraft: Java Edition")]
     NoProfile,
+    #[error("Realms: {0}")]
+    Realms(String),
 }
 
 /// A logged-in Minecraft account.

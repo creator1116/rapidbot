@@ -196,6 +196,18 @@ aliases, `rapidbot-auth status` shows their cached token state, and
 forgets one. `RAPIDBOT_ACCOUNTS` chooses the directory (default `accounts`,
 which is gitignored).
 
+Realms worlds use the same account:
+
+```sh
+cargo run -p rapidbot-auth -- realms list main
+cargo run -p rapidbot-auth -- realms join 123456 main
+```
+
+`realms join` prints the `host:port` that the normal join example takes;
+`--json` is available on `list` and `join`. `realms available` and
+`realms compatible` expose the two checks the vanilla Realms screen makes
+before showing the world list.
+
 ## Configuration
 
 `ClientConfig` fields worth knowing:

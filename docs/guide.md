@@ -185,6 +185,14 @@ cargo run -p rapidbot-auth -- login main
 cargo run --release -p rapidbot-client --example join -- play.example.net --microsoft main
 ```
 
+`login --browser` uses OAuth PKCE with a loopback callback instead of the
+device code; it prints the sign-in URL and waits for the browser. The bundled
+public client ID may only allow its registered redirect, so if Microsoft
+rejects the loopback callback, use the device-code `login` or set
+`RAPIDBOT_CLIENT_ID` to a client ID registered for native/loopback redirects.
+The browser flow has mock-HTTP coverage; it has not been exercised against
+Microsoft's live sign-in.
+
 `rapidbot-auth refresh main` renews all cached tokens from the stored refresh
 token without a device-code prompt; `refresh --all` does that for every alias.
 A background task can use `Authenticator::refresh_if_needed(skew)` instead:

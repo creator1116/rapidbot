@@ -12,6 +12,7 @@
 //! [`join_server`] succeeded before it sent the encryption request.
 
 mod accounts;
+mod browser;
 mod cache;
 mod microsoft;
 mod minecraft;
@@ -19,8 +20,10 @@ mod realms;
 mod store;
 mod xbox;
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 
+use tokio::net::TcpListener;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -44,6 +47,7 @@ pub mod titles {
 #[derive(Debug, Clone)]
 pub(crate) struct Endpoints {
     pub microsoft_device_code: String,
+    pub microsoft_authorize: String,
     pub microsoft_token: String,
     pub xbox_user_auth: String,
     pub xbox_xsts: String,
@@ -56,6 +60,7 @@ impl Default for Endpoints {
     fn default() -> Self {
         Self {
             microsoft_device_code: "https://login.live.com/oauth20_connect.srf".into(),
+            microsoft_authorize: "https://login.live.com/oauth20_authorize.srf".into(),
             microsoft_token: "https://login.live.com/oauth20_token.srf".into(),
             xbox_user_auth: "https://user.auth.xboxlive.com/user/authenticate".into(),
             xbox_xsts: "https://xsts.auth.xboxlive.com/xsts/authorize".into(),
@@ -185,6 +190,53 @@ impl Authenticator {
             }
         };
 
+        let chat_keys = self.chat_keys(&minecraft.access_token).await?;
+        Ok(MinecraftAccount {
+            name: minecraft.name,
+            id: minecraft.id,
+            access_token: minecraft.access_token,
+            chat_keys,
+        })
+    }
+
+    /// Browser sign-in with OAuth PKCE. `on_url` receives the authorization
+    /// URL; open it in any browser. The local callback is
+    /// `http://127.0.0.1:<random>/callback`.
+    ///
+    /// The default Live client ID is a public title client: if Microsoft does
+    /// not allow its loopback redirect, use [`login`](Self::login) (device
+    /// code) or set a client ID registered for native/loopback redirects with
+    /// [`with_client_id`](Self::with_client_id).
+    pub async fn login_browser(
+        &mut self,
+        on_url: impl Fn(&str),
+    ) -> Result<MinecraftAccount, AuthError> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let pkce = browser::Pkce::new();
+        let url = browser::authorize_url(
+            &self.endpoints.microsoft_authorize,
+            &self.client_id,
+            &redirect_uri,
+            &pkce,
+        );
+        on_url(&url);
+
+        let code = browser::wait_for_code(listener, &pkce.state).await?;
+        let msa = microsoft::authorization_code(
+            &self.http,
+            &self.client_id,
+            &self.endpoints.microsoft_token,
+            &code,
+            &redirect_uri,
+            &pkce.verifier,
+        )
+        .await?;
+        self.cache.msa = Some(msa.clone());
+        self.store.save(&self.cache)?;
+
+        let minecraft = self.minecraft_login(&msa.access_token).await?;
         let chat_keys = self.chat_keys(&minecraft.access_token).await?;
         Ok(MinecraftAccount {
             name: minecraft.name,
@@ -409,6 +461,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
     use uuid::Uuid;
 
@@ -515,6 +568,7 @@ mod tests {
         });
         let endpoints = Endpoints {
             microsoft_device_code: format!("{base}/microsoft/device"),
+            microsoft_authorize: format!("{base}/microsoft/authorize"),
             microsoft_token: format!("{base}/microsoft/token"),
             xbox_user_auth: format!("{base}/xbox/user"),
             xbox_xsts: format!("{base}/xbox/xsts"),
@@ -530,6 +584,69 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("tokens.json");
         (dir, path)
+    }
+
+    #[tokio::test]
+    async fn browser_login_uses_pkce_and_caches_tokens() {
+        let (endpoints, hits, server) = mock_auth_server().await;
+        let (dir, path) = temp_cache_path();
+        let mut auth =
+            Authenticator::with_endpoints(Box::new(FileTokenStore::new(&path)), endpoints).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let opener = tokio::spawn(async move {
+            let authorization_url = rx.recv().await.unwrap();
+            let url = url::Url::parse(&authorization_url).unwrap();
+            let params: std::collections::HashMap<_, _> = url
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            assert_eq!(params["response_type"], "code");
+            assert_eq!(params["code_challenge_method"], "S256");
+            assert_eq!(params["code_challenge"].len(), 43);
+
+            let redirect = url::Url::parse(&params["redirect_uri"]).unwrap();
+            let mut callback = redirect.clone();
+            callback.set_query(Some(&format!("code=test-code&state={}", params["state"])));
+            let mut socket =
+                TcpStream::connect((redirect.host_str().unwrap(), redirect.port().unwrap()))
+                    .await
+                    .unwrap();
+            let request = format!(
+                "GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                callback.path(),
+                callback.query().unwrap()
+            );
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        });
+
+        let account = auth
+            .login_browser(|url| tx.send(url.to_owned()).unwrap())
+            .await
+            .unwrap();
+        opener.await.unwrap();
+        assert_eq!(account.name, "Steve");
+        assert_eq!(account.access_token, "mc-access");
+        assert!(account.chat_keys.is_some());
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            [
+                "/microsoft/token",
+                "/xbox/user",
+                "/xbox/xsts",
+                "/minecraft/login",
+                "/minecraft/profile",
+                "/minecraft/certificates"
+            ]
+        );
+        let cache = TokenCache::load(&path).unwrap();
+        assert_eq!(cache.msa.unwrap().refresh_token, "new-refresh");
+
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

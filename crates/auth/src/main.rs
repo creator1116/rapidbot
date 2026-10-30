@@ -1,6 +1,6 @@
 //! `rapidbot-auth`: manage the accounts used by the bot.
 //!
-//!     rapidbot-auth login [alias]
+//!     rapidbot-auth login [--browser] [alias]
 //!     rapidbot-auth refresh [--all] [alias]
 //!     rapidbot-auth list
 //!     rapidbot-auth status [--json] [alias]
@@ -30,19 +30,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match command.as_str() {
         "login" => {
-            let alias = args.next().unwrap_or_else(|| "main".into());
+            let (flags, values) = split_args(args, &["--browser"])?;
+            if values.len() > 1 {
+                return Err("usage: rapidbot-auth login [--browser] [alias]".into());
+            }
+            let browser = flags.iter().any(|flag| flag == "--browser");
+            let alias = values.into_iter().next().unwrap_or_else(|| "main".into());
             let mut auth = store.authenticator(&alias)?;
             if let Ok(client_id) = std::env::var("RAPIDBOT_CLIENT_ID") {
                 auth = auth.with_client_id(client_id);
             }
-            let account = auth
-                .login(|code| {
+            let account = if browser {
+                auth.login_browser(|url| {
+                    println!("Open this URL in a browser to sign in:\n{url}");
+                })
+                .await?
+            } else {
+                auth.login(|code| {
                     println!(
                         "Sign in at {} with code {}",
                         code.verification_uri, code.user_code
                     );
                 })
-                .await?;
+                .await?
+            };
             store.remember(&alias, &account)?;
             println!("Logged in as {} ({}) as {alias}", account.name, account.id);
             println!(
@@ -281,7 +292,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         "help" | "-h" | "--help" => {
             println!(
-                "usage: rapidbot-auth <login [alias] | refresh [--all] [alias] | list | status [--json] [alias] | logout <alias> | realms <list|join|available|compatible> [args]>"
+                "usage: rapidbot-auth <login [--browser] [alias] | refresh [--all] [alias] | list | status [--json] [alias] | logout <alias> | realms <list|join|available|compatible> [args]>"
             );
             println!("account directory: {}", dir.display());
         }

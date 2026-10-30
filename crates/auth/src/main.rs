@@ -5,6 +5,10 @@
 //!     rapidbot-auth list
 //!     rapidbot-auth status [--json] [alias]
 //!     rapidbot-auth logout <alias>
+//!     rapidbot-auth realms list [--json] [alias]
+//!     rapidbot-auth realms join [--json] <id> [alias]
+//!     rapidbot-auth realms available [alias]
+//!     rapidbot-auth realms compatible [alias]
 //!
 //! The token cache is encrypted and its key is kept in the OS keyring. Set
 //! `RAPIDBOT_ACCOUNTS` to choose the directory (default `accounts`).
@@ -12,7 +16,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use rapidbot_auth::AccountStore;
+use rapidbot_auth::{AccountStore, MinecraftAccount, RealmsClient};
 use serde_json::json;
 
 #[tokio::main]
@@ -188,6 +192,84 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        "realms" => {
+            let subcommand = args.next().unwrap_or_else(|| "list".into());
+            match subcommand.as_str() {
+                "list" => {
+                    let (flags, values) = split_args(args, &["--json"])?;
+                    let json_output = flags.iter().any(|flag| flag == "--json");
+                    if values.len() > 1 {
+                        return Err("usage: rapidbot-auth realms list [--json] [alias]".into());
+                    }
+                    let alias = values.into_iter().next().unwrap_or_else(|| "main".into());
+                    let account = account_for(&store, &alias).await?;
+                    let realms = RealmsClient::new(&account).list().await?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&realms)?);
+                    } else if realms.is_empty() {
+                        println!("No Realms worlds for {alias}");
+                    } else {
+                        for realm in realms {
+                            println!(
+                                "{}: {} [{}]{}",
+                                realm.id,
+                                realm.name.as_deref().unwrap_or("(unnamed)"),
+                                realm.state,
+                                if realm.days_left == 0 {
+                                    String::new()
+                                } else {
+                                    format!(" — {} days left", realm.days_left)
+                                }
+                            );
+                            if !realm.description.is_empty() {
+                                println!("  {}", realm.description);
+                            }
+                        }
+                    }
+                }
+                "join" => {
+                    let (flags, values) = split_args(args, &["--json"])?;
+                    let json_output = flags.iter().any(|flag| flag == "--json");
+                    if values.is_empty() || values.len() > 2 {
+                        return Err("usage: rapidbot-auth realms join [--json] <id> [alias]".into());
+                    }
+                    let id: u64 = values[0]
+                        .parse()
+                        .map_err(|_| format!("invalid Realms world id {:?}", values[0]))?;
+                    let alias = values.get(1).cloned().unwrap_or_else(|| "main".into());
+                    let account = account_for(&store, &alias).await?;
+                    let join = RealmsClient::new(&account).join(id).await?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&join)?);
+                    } else if let Some(address) = join.address {
+                        println!("{address}");
+                        if let Some(url) = join.resource_pack_url {
+                            println!("resource pack: {url}");
+                        }
+                    } else {
+                        return Err(format!("world {id} did not return a join address").into());
+                    }
+                }
+                "available" => {
+                    let alias = one_alias(args, "realms available")?;
+                    let account = account_for(&store, &alias).await?;
+                    let available = RealmsClient::new(&account).available().await?;
+                    println!("{available}");
+                }
+                "compatible" => {
+                    let alias = one_alias(args, "realms compatible")?;
+                    let account = account_for(&store, &alias).await?;
+                    let compatibility = RealmsClient::new(&account).compatibility().await?;
+                    println!("{compatibility:?}");
+                }
+                other => {
+                    return Err(format!(
+                        "unknown realms command {other:?}; try `rapidbot-auth realms list`"
+                    )
+                    .into());
+                }
+            }
+        }
         "logout" => {
             let Some(alias) = args.next() else {
                 return Err("usage: rapidbot-auth logout <alias>".into());
@@ -199,7 +281,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         "help" | "-h" | "--help" => {
             println!(
-                "usage: rapidbot-auth <login [alias] | refresh [--all] [alias] | list | status [--json] [alias] | logout <alias>>"
+                "usage: rapidbot-auth <login [alias] | refresh [--all] [alias] | list | status [--json] [alias] | logout <alias> | realms <list|join|available|compatible> [args]>"
             );
             println!("account directory: {}", dir.display());
         }
@@ -225,4 +307,26 @@ fn split_args(
         }
     }
     Ok((flags, values))
+}
+
+fn one_alias(args: impl Iterator<Item = String>, command: &str) -> Result<String, Box<dyn Error>> {
+    let (flags, values) = split_args(args, &[])?;
+    debug_assert!(flags.is_empty());
+    if values.len() > 1 {
+        return Err(format!("usage: rapidbot-auth {command} [alias]").into());
+    }
+    Ok(values.into_iter().next().unwrap_or_else(|| "main".into()))
+}
+
+async fn account_for(
+    store: &AccountStore,
+    alias: &str,
+) -> Result<MinecraftAccount, Box<dyn Error>> {
+    let mut auth = store.authenticator(alias)?;
+    if let Ok(client_id) = std::env::var("RAPIDBOT_CLIENT_ID") {
+        auth = auth.with_client_id(client_id);
+    }
+    let account = auth.refresh_if_needed(300).await?;
+    store.remember(alias, &account)?;
+    Ok(account)
 }

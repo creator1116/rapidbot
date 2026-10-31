@@ -395,6 +395,11 @@ impl GameMode {
         if hit.miss {
             return;
         }
+        // MultiPlayerGameMode.useItemOn returns FAIL for a block outside the
+        // border: no prediction and no packet, and the click is consumed.
+        if !Self::within_border(h, hit.pos) {
+            return;
+        }
         let sequence = self.next_sequence();
         let clicked = h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2);
         if !h.player.spectator
@@ -433,6 +438,11 @@ impl GameMode {
         let Some(target) = h.entities.get(hit.id) else {
             return;
         };
+        // Minecraft.startUseItem refuses an entity whose block position is
+        // outside the border before trying either hand.
+        if !Self::entity_within_border(h, target) {
+            return;
+        }
         let location = LpVec3 {
             x: hit.location[0] - target.pos.x,
             y: hit.location[1] - target.pos.y,
@@ -773,6 +783,21 @@ impl GameMode {
             .is_air
     }
 
+    /// `WorldBorder.isWithinBounds(BlockPos)`: block coordinates, not the
+    /// block center.
+    fn within_border(h: &Hands<'_>, pos: BlockPos) -> bool {
+        h.player
+            .world_border
+            .is_within_bounds(pos.0 as f64, pos.2 as f64, 0.0)
+    }
+
+    /// `WorldBorder.isWithinBounds(entity.blockPosition())`.
+    fn entity_within_border(h: &Hands<'_>, entity: &Entity) -> bool {
+        h.player
+            .world_border
+            .is_within_bounds(entity.pos.x.floor(), entity.pos.z.floor(), 0.0)
+    }
+
     /// `Player.blockActionRestricted`: spectators cannot break anything, while
     /// adventure mode allows the held stack's `can_break` predicate to match.
     fn block_action_restricted(h: &Hands<'_>, pos: BlockPos) -> bool {
@@ -819,6 +844,11 @@ impl GameMode {
         direction: Direction,
     ) -> bool {
         if Self::block_action_restricted(h, pos) {
+            return false;
+        }
+        // MultiPlayerGameMode.startDestroyBlock refuses blocks outside the
+        // border before either creative or survival breaking starts.
+        if !Self::within_border(h, pos) {
             return false;
         }
         if h.player.abilities.instabuild {
@@ -900,7 +930,9 @@ impl GameMode {
             self.destroy_delay -= 1;
             return true;
         }
-        if h.player.abilities.instabuild {
+        // The creative instant-break path is the only part of
+        // continueDestroyBlock gated by the border.
+        if h.player.abilities.instabuild && Self::within_border(h, pos) {
             self.destroy_delay = 5;
             let sequence = self.next_sequence();
             self.destroy_block(h, pos);
@@ -1162,6 +1194,28 @@ mod tests {
             self.take_packets()
         }
 
+        /// One `continueDestroyBlock` call with the current hands.
+        fn tick_continue(
+            &mut self,
+            pos: BlockPos,
+            direction: Direction,
+        ) -> (bool, Vec<(i32, Vec<u8>)>) {
+            let continued = {
+                let mut hands = Hands {
+                    player: &mut self.player,
+                    world: &mut self.world,
+                    inventory: &self.inventory,
+                    entities: &self.entities,
+                    tags: &self.tags,
+                    net: &self.net,
+                    restricted: self.restricted,
+                    survival: false,
+                };
+                self.mode.continue_destroy_block(&mut hands, pos, direction)
+            };
+            (continued, self.take_packets())
+        }
+
         /// Puts a stack in an inventory-menu slot (36 is hotbar 0).
         fn set_item(&mut self, index: usize, name: &str) {
             self.set_item_with_component(index, name, None);
@@ -1365,6 +1419,38 @@ mod tests {
             PlayerActionKind::StartDestroyBlock
         );
         assert_eq!(action(&next[0].1).sequence, 3);
+    }
+
+    /// The creative instant-break branch of `continueDestroyBlock` checks the
+    /// border; once the border includes the block, the same call breaks it.
+    #[test]
+    fn world_border_blocks_creative_continue() {
+        let mut scene = Scene::new();
+        scene.player.abilities.instabuild = true;
+        scene.mode.destroy_delay = 0;
+        scene.player.world_border.set_center(0.0, 0.0);
+        scene.player.world_border.set_size(1.5);
+
+        let (continued, packets) = scene.tick_continue((1, 64, 0), Direction::Up);
+        assert!(!continued);
+        assert!(packets.is_empty());
+        assert_eq!(scene.mode.sequence, 0);
+        assert_eq!(scene.world.block_state(1, 64, 0), Some(scene.dirt));
+
+        scene.player.world_border.set_size(6.0);
+        let (continued, packets) = scene.tick_continue((1, 64, 0), Direction::Up);
+        assert!(continued);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [PlayerAction::ID]
+        );
+        let begin = action(&packets[0].1);
+        assert_eq!(
+            (begin.action, begin.sequence),
+            (PlayerActionKind::StartDestroyBlock, 1)
+        );
+        assert_eq!(scene.world.block_state(1, 64, 0), Some(AIR));
+        assert_eq!(scene.mode.destroy_delay, 5);
     }
 
     /// `blockActionRestricted`: adventure mode needs a matching `can_break`;
@@ -1698,6 +1784,27 @@ mod tests {
         assert_eq!(Interact::decode(&mut &packets[1].1[..]).unwrap().hand, 1);
     }
 
+    /// `Minecraft.startUseItem` refuses an entity whose block position is
+    /// outside the border, even when it is in interaction range.
+    #[test]
+    fn world_border_blocks_entity_use() {
+        let mut scene = Scene::new();
+        scene.player.x_rot = 0.0;
+        spawn(&mut scene, "minecraft:zombie", [2.5, 64.0, 0.5]);
+        scene.player.world_border.set_center(0.0, 0.0);
+        scene.player.world_border.set_size(3.0);
+
+        assert!(scene.tick_use(true, true).is_empty());
+
+        // The same entity is reachable once the border includes its block.
+        scene.player.world_border.set_size(6.0);
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [Interact::ID, Interact::ID]
+        );
+    }
+
     /// Item frames and interaction entities are picked with their real
     /// boxes, rather than being left out of entity picking.
     #[test]
@@ -1745,6 +1852,25 @@ mod tests {
             .mode
             .block_changed_ack(1, &mut scene.world, &mut scene.player);
         assert_eq!(scene.world.block_state(1, 65, 0), Some(AIR));
+    }
+
+    /// `useItemOn` and `startDestroyBlock` refuse a block outside the border
+    /// before predicting or sending anything. The attack click still swings.
+    #[test]
+    fn world_border_blocks_use_and_break() {
+        let mut scene = Scene::new();
+        scene.player.world_border.set_center(0.0, 0.0);
+        scene.player.world_border.set_size(1.5);
+
+        assert!(scene.tick_use(true, true).is_empty());
+        assert_eq!(scene.mode.sequence, 0);
+        assert_eq!(scene.world.block_state(1, 64, 0), Some(scene.dirt));
+
+        let packets = scene.tick(1, false);
+        assert_eq!(packets.iter().map(|p| p.0).collect::<Vec<_>>(), [Punch::ID]);
+        assert_eq!(scene.mode.sequence, 0);
+        assert_eq!(scene.world.block_state(1, 64, 0), Some(scene.dirt));
+        assert_eq!(scene.mode.breaking(), None);
     }
 
     /// A held use button repeats only after the four-tick right-click

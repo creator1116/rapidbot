@@ -585,7 +585,16 @@ impl ItemStack {
 
     /// `ItemStack.canBreakBlockInAdventureMode` for the block state.
     pub fn can_break_block_in_adventure_mode(&self, state: StateId, tags: &Tags) -> bool {
-        let Some(bytes) = self.component("minecraft:can_break") else {
+        self.adventure_predicate("minecraft:can_break", state, tags)
+    }
+
+    /// `ItemStack.canPlaceOnBlockInAdventureMode` for the clicked block state.
+    pub fn can_place_on_block_in_adventure_mode(&self, state: StateId, tags: &Tags) -> bool {
+        self.adventure_predicate("minecraft:can_place_on", state, tags)
+    }
+
+    fn adventure_predicate(&self, component: &str, state: StateId, tags: &Tags) -> bool {
+        let Some(bytes) = self.component(component) else {
             return false;
         };
         let mut buf = bytes;

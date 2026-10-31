@@ -293,8 +293,8 @@ pub(crate) struct Hands<'a> {
     pub entities: &'a Entities,
     pub tags: &'a Tags,
     pub net: &'a PacketSender,
-    /// `blockActionRestricted`: spectator, or adventure mode (items that
-    /// may break blocks in adventure mode are not considered).
+    /// `blockActionRestricted`: set in spectator and adventure mode. Adventure
+    /// items with a matching `can_break` predicate are handled separately.
     pub restricted: bool,
     /// `MultiPlayerGameMode.hasMissTime`: not creative.
     pub survival: bool,
@@ -770,9 +770,24 @@ impl GameMode {
             .is_air
     }
 
+    /// `Player.blockActionRestricted`: spectators cannot break anything, while
+    /// adventure mode allows the held stack's `can_break` predicate to match.
+    fn block_action_restricted(h: &Hands<'_>, pos: BlockPos) -> bool {
+        if !h.restricted {
+            return false;
+        }
+        if h.player.spectator {
+            return true;
+        }
+        let state = h.world.block_state_or_air(pos.0, pos.1, pos.2);
+        h.inventory
+            .held()
+            .is_none_or(|held| !held.can_break_block_in_adventure_mode(state, h.tags))
+    }
+
     /// `MultiPlayerGameMode.destroyBlock`: the client-side removal.
     fn destroy_block(&mut self, h: &mut Hands<'_>, pos: BlockPos) -> bool {
-        if h.restricted {
+        if Self::block_action_restricted(h, pos) {
             return false;
         }
         let held = h.inventory.held();
@@ -800,7 +815,7 @@ impl GameMode {
         pos: BlockPos,
         direction: Direction,
     ) -> bool {
-        if h.restricted {
+        if Self::block_action_restricted(h, pos) {
             return false;
         }
         if h.player.abilities.instabuild {
@@ -1054,6 +1069,8 @@ mod tests {
         sent: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
         mode: GameMode,
         dirt: StateId,
+        /// `Hands.restricted`: adventure or spectator.
+        restricted: bool,
     }
 
     fn state(name: &str) -> StateId {
@@ -1101,6 +1118,7 @@ mod tests {
                 sent,
                 mode: GameMode::new(),
                 dirt,
+                restricted: false,
             }
         }
 
@@ -1115,7 +1133,7 @@ mod tests {
                 entities: &self.entities,
                 tags: &self.tags,
                 net: &self.net,
-                restricted: false,
+                restricted: self.restricted,
                 survival: true,
             };
             self.mode
@@ -1134,7 +1152,7 @@ mod tests {
                 entities: &self.entities,
                 tags: &self.tags,
                 net: &self.net,
-                restricted: false,
+                restricted: self.restricted,
                 survival: true,
             };
             self.mode.use_button(&mut hands, &hit, down, clicked);
@@ -1143,15 +1161,51 @@ mod tests {
 
         /// Puts a stack in an inventory-menu slot (36 is hotbar 0).
         fn set_item(&mut self, index: usize, name: &str) {
-            let id = ItemData::get().item_id(name).unwrap();
+            self.set_item_with_component(index, name, None);
+        }
+
+        fn set_item_with_component(
+            &mut self,
+            index: usize,
+            name: &str,
+            component: Option<(&str, &[u8])>,
+        ) {
+            let data = ItemData::get();
+            let id = data.item_id(name).unwrap();
             let mut body = Vec::new();
             body.extend(rapidbot_buf::to_bytes(&VarInt(0)));
             body.extend(rapidbot_buf::to_bytes(&VarInt(0)));
             body.extend((index as i16).to_be_bytes());
             body.extend(rapidbot_buf::to_bytes(&VarInt(1)));
             body.extend(rapidbot_buf::to_bytes(&VarInt(id as i32)));
-            body.extend([0, 0]);
+            match component {
+                Some((component, value)) => {
+                    body.extend(rapidbot_buf::to_bytes(&VarInt(1)));
+                    body.extend(rapidbot_buf::to_bytes(&VarInt(0)));
+                    body.extend(rapidbot_buf::to_bytes(&VarInt(
+                        data.component_id(component).unwrap() as i32,
+                    )));
+                    body.extend_from_slice(value);
+                }
+                None => body.extend([0, 0]),
+            }
             self.inventory.set_slot(&body).unwrap();
+        }
+
+        /// A stick that may break only the given block in adventure mode.
+        fn set_can_break_item(&mut self, index: usize, state: StateId) {
+            let block = Registry::get().state(state).block;
+            let mut value = Vec::new();
+            rapidbot_buf::write_var_int(&mut value, 1);
+            value.push(1);
+            rapidbot_buf::write_var_int(&mut value, 2);
+            rapidbot_buf::write_var_int(&mut value, block as i32);
+            value.extend([0, 0, 0, 0]);
+            self.set_item_with_component(
+                index,
+                "minecraft:stick",
+                Some(("minecraft:can_break", &value)),
+            );
         }
 
         fn take_packets(&mut self) -> Vec<(i32, Vec<u8>)> {
@@ -1292,6 +1346,36 @@ mod tests {
             PlayerActionKind::StartDestroyBlock
         );
         assert_eq!(action(&next[0].1).sequence, 3);
+    }
+
+    /// `blockActionRestricted`: adventure mode needs a matching `can_break`;
+    /// a spectator never breaks, even with one.
+    #[test]
+    fn adventure_mode_requires_a_matching_can_break() {
+        let mut scene = Scene::new();
+        scene.restricted = true;
+        let packets = scene.tick(1, true);
+        assert!(!packets.iter().any(|p| p.0 == PlayerAction::ID));
+        assert_eq!(scene.mode.breaking(), None);
+
+        // The stack may break stone, but the crosshair is on dirt.
+        scene.set_can_break_item(36, state("minecraft:stone"));
+        let packets = scene.tick(1, true);
+        assert!(!packets.iter().any(|p| p.0 == PlayerAction::ID));
+        assert_eq!(scene.mode.breaking(), None);
+
+        scene.set_can_break_item(36, scene.dirt);
+        let packets = scene.tick(1, true);
+        assert!(packets.iter().any(|p| p.0 == PlayerAction::ID));
+        assert!(scene.mode.breaking().is_some());
+
+        let mut spectator = Scene::new();
+        spectator.restricted = true;
+        spectator.player.spectator = true;
+        spectator.set_can_break_item(36, spectator.dirt);
+        let packets = spectator.tick(1, true);
+        assert!(!packets.iter().any(|p| p.0 == PlayerAction::ID));
+        assert_eq!(spectator.mode.breaking(), None);
     }
 
     /// A spear never sends `attack` or `punch`; a click sends `STAB` with

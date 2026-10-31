@@ -566,6 +566,129 @@ impl Entity {
             .is_some_and(|stack| stack.name() == "minecraft:filled_map")
     }
 
+    /// `Entity.getEyeHeight`. The registry stores the standing adult eye
+    /// height; scale it with the box for babies and entity-data sizes, and
+    /// use the values vanilla sets for sleeping and player poses.
+    fn eye_height(&self) -> f32 {
+        let info = self.info();
+        if info.living && self.pose == pose::SLEEPING {
+            return 0.2;
+        }
+        if info.is("Avatar") {
+            let eye = match self.pose {
+                pose::FALL_FLYING | pose::SWIMMING | pose::SPIN_ATTACK => 0.4,
+                pose::CROUCHING => 1.27,
+                pose::DYING => return 1.62,
+                _ => 1.62,
+            };
+            return eye * self.scale;
+        }
+        let (_, base_height, base_eye) = Registry::get().entity_dimensions[self.type_id];
+        if !info.living || base_height <= 0.0 {
+            return base_eye;
+        }
+        if info.is("ArmorStand") {
+            if self.armor_stand_flags & 16 != 0 {
+                return 0.0;
+            }
+            if self.armor_stand_flags & 1 != 0 {
+                return 0.9875 * self.scale;
+            }
+        }
+        if info.is("Camel") {
+            let eye = match (self.baby, self.pose == pose::SITTING) {
+                (true, true) => 0.41,
+                (true, false) => 1.38,
+                (false, true) => 0.845,
+                (false, false) => 2.275,
+            };
+            return eye * self.scale;
+        }
+        if info.is("Sniffer") && self.sniffer_state == 5 {
+            return 0.81 * if self.baby { 0.5 } else { 1.0 } * self.scale;
+        }
+        let baby_eye = if self.baby {
+            if info.is("Armadillo") {
+                Some(0.21875)
+            } else if info.is("Axolotl") {
+                Some(0.09375)
+            } else if info.is("Cat") || info.is("Ocelot") {
+                Some(0.34375)
+            } else if info.is("Chicken") {
+                Some(0.28125)
+            } else if info.is("Cow") || info.is("MushroomCow") {
+                Some(0.69)
+            } else if info.is("AbstractCow") {
+                Some(0.665)
+            } else if info.is("Dolphin") {
+                Some(0.09375)
+            } else if info.is("Drowned") {
+                Some(0.775)
+            } else if info.is("Fox") {
+                Some(0.34375)
+            } else if info.is("Goat") {
+                Some(0.59375)
+            } else if info.is("HappyGhast") {
+                Some(0.46875)
+            } else if info.is("Hoglin") || info.is("Zoglin") {
+                Some(0.625)
+            } else if info.is("Husk") {
+                Some(0.825)
+            } else if info.is("Pig") {
+                Some(0.40625)
+            } else if info.is("Piglin") {
+                Some(0.78)
+            } else if info.is("PolarBear") {
+                Some(0.34375)
+            } else if info.is("Rabbit") {
+                Some(0.39)
+            } else if info.is("Sheep") {
+                Some(0.65625)
+            } else if info.is("Squid") {
+                Some(0.37)
+            } else if info.is("Strider") {
+                Some(0.4375)
+            } else if info.is("Villager") {
+                Some(0.63)
+            } else if info.is("Wolf") {
+                Some(0.34375)
+            } else if info.is("ZombieVillager") {
+                Some(0.67)
+            } else if info.is("ZombifiedPiglin") {
+                Some(0.78)
+            } else if info.is("Zombie") {
+                Some(0.775)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(eye) = baby_eye {
+            let eye = if info.is("Goat") && self.pose == pose::LONG_JUMPING {
+                eye * 0.7
+            } else {
+                eye
+            };
+            return eye * self.scale;
+        }
+        let (_, height) = self.dimensions();
+        base_eye * height / base_height
+    }
+
+    /// `EntityAnchorArgument.Anchor.apply` for this entity: feet or eyes.
+    pub fn anchor_position(&self, anchor: i32) -> Vec3 {
+        if anchor == 1 {
+            Vec3::new(
+                self.pos.x,
+                self.pos.y + self.eye_height() as f64,
+                self.pos.z,
+            )
+        } else {
+            self.pos
+        }
+    }
+
     /// `EntityDimensions.makeBoundingBox`: min and max corners. Hanging
     /// entities are attached to a block and thin along its wall
     /// (`ItemFrame.createBoundingBox`, `Painting.calculateBoundingBox`).
@@ -2016,6 +2139,37 @@ mod tests {
         assert_eq!((min[0], max[1]), (-(0.3f32 as f64), 64.0 + 1.5));
         e.set_scale(7, 2.0);
         assert_eq!(e.get(7).unwrap().dimensions(), (1.2, 3.0));
+    }
+
+    #[test]
+    fn entity_anchors_use_pose_and_scale_eye_heights() {
+        let mut e = Entities::default();
+        add(&mut e, 1, "minecraft:zombie", [2.0, 64.0, -1.0]);
+        let zombie = e.get(1).unwrap();
+        assert_eq!(zombie.anchor_position(0), Vec3::new(2.0, 64.0, -1.0));
+        assert!((zombie.anchor_position(1).y - (64.0 + 1.74)).abs() < 1e-6);
+
+        // Baby zombies have their own dimensions and eye height.
+        set_bool(&mut e, 1, 16, true);
+        assert!((e.get(1).unwrap().anchor_position(1).y - (64.0 + 0.775)).abs() < 1e-6);
+
+        // Cows and mooshrooms override AbstractCow's baby eye height.
+        add(&mut e, 2, "minecraft:cow", [0.0, 64.0, 0.0]);
+        add(&mut e, 3, "minecraft:mooshroom", [0.0, 64.0, 0.0]);
+        set_bool(&mut e, 2, 16, true);
+        set_bool(&mut e, 3, 16, true);
+        assert!((e.get(2).unwrap().anchor_position(1).y - (64.0 + 0.69)).abs() < 1e-6);
+        assert!((e.get(3).unwrap().anchor_position(1).y - (64.0 + 0.69)).abs() < 1e-6);
+
+        add(&mut e, 7, "minecraft:player", [0.0, 64.0, 0.0]);
+        set_pose(&mut e, 7, pose::CROUCHING);
+        assert!((e.get(7).unwrap().anchor_position(1).y - (64.0 + 1.27)).abs() < 1e-6);
+        e.set_scale(7, 2.0);
+        assert!((e.get(7).unwrap().anchor_position(1).y - (64.0 + 2.54)).abs() < 1e-6);
+
+        // Sleeping dimensions and eye height are fixed.
+        set_pose(&mut e, 7, pose::SLEEPING);
+        assert!((e.get(7).unwrap().anchor_position(1).y - (64.0 + 0.2)).abs() < 1e-6);
     }
 
     #[test]

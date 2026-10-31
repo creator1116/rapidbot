@@ -398,6 +398,18 @@ impl PlayState {
     }
 }
 
+/// `ClientboundPlayerLookAtPacket.getPosition`: an entity target wins over
+/// the packet coordinates, but only while that entity is still tracked.
+fn look_target(entities: &crate::entities::Entities, look: &cb::PlayerLookAt) -> Vec3 {
+    look.entity
+        .and_then(|(id, anchor)| {
+            entities
+                .get(id)
+                .map(|entity| entity.anchor_position(anchor))
+        })
+        .unwrap_or_else(|| Vec3::new(look.x, look.y, look.z))
+}
+
 impl Game {
     pub(super) fn handle_play(&mut self, packet: RawPacket) -> Result<(), ClientError> {
         match packet.id {
@@ -740,8 +752,8 @@ impl Game {
             cb::PlayerLookAt::ID => {
                 let look = packet.decode::<cb::PlayerLookAt>()?;
                 let play = play_mut(&mut self.play)?;
-                let p = &mut play.player.physics;
-                p.look_at(look.from_anchor == 1, Vec3::new(look.x, look.y, look.z));
+                let target = look_target(&play.entities, &look);
+                play.player.physics.look_at(look.from_anchor == 1, target);
             }
             cb::SetHeldSlot::ID => {
                 packet.decode::<cb::SetHeldSlot>()?;
@@ -1283,6 +1295,41 @@ mod tests {
         assert_eq!(play.world.height, DimensionHeight::NETHER);
         assert_eq!(play.world.chunk_count(), 0);
         assert!(play.entities.get(42).is_none());
+    }
+
+    #[test]
+    fn player_look_at_prefers_a_tracked_entity_anchor() {
+        let mut entities = crate::entities::Entities::default();
+        entities.insert_for_test(crate::entities::Entity::test_entity(
+            42,
+            "minecraft:zombie",
+            Vec3::new(4.0, 64.0, 1.0),
+        ));
+        let look = |entity| cb::PlayerLookAt {
+            from_anchor: 1,
+            x: -1.0,
+            y: -2.0,
+            z: -3.0,
+            entity,
+        };
+
+        let eyes = look_target(&entities, &look(Some((42, 1))));
+        assert_eq!((eyes.x, eyes.z), (4.0, 1.0));
+        assert!((eyes.y - (64.0 + 1.74)).abs() < 1e-6);
+
+        let feet = look_target(&entities, &look(Some((42, 0))));
+        assert_eq!(feet, Vec3::new(4.0, 64.0, 1.0));
+
+        // A removed entity falls back to the packet's coordinates, as
+        // vanilla's getPosition does.
+        assert_eq!(
+            look_target(&entities, &look(Some((99, 1)))),
+            Vec3::new(-1.0, -2.0, -3.0)
+        );
+        assert_eq!(
+            look_target(&entities, &look(None)),
+            Vec3::new(-1.0, -2.0, -3.0)
+        );
     }
 
     #[test]

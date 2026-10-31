@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 
 use rapidbot_buf::{Decode, DecodeError, read_var_int, take};
 
+use crate::tags::Tags;
+use crate::{Registry, StateId};
+
 /// Wire layout of a value.
 enum Shape {
     VarInt,
@@ -580,6 +583,18 @@ impl ItemStack {
             .map(|(_, value)| value.as_slice())
     }
 
+    /// `ItemStack.canBreakBlockInAdventureMode` for the block state.
+    pub fn can_break_block_in_adventure_mode(&self, state: StateId, tags: &Tags) -> bool {
+        let Some(bytes) = self.component("minecraft:can_break") else {
+            return false;
+        };
+        let mut buf = bytes;
+        let Ok(predicate) = AdventureModePredicate::decode(&mut buf, ItemData::get()) else {
+            return false;
+        };
+        buf.is_empty() && predicate.test(state, tags)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.component(name).is_some()
     }
@@ -697,12 +712,171 @@ impl BlockSet {
             .map(BlockSet::Ids)
     }
 
-    pub fn contains(&self, block: u32, tags: &crate::tags::Tags) -> bool {
+    pub fn contains(&self, block: u32, tags: &Tags) -> bool {
         match self {
             BlockSet::Tag(tag) => tags.block_is(tag, block),
             BlockSet::Ids(ids) => ids.contains(&block),
         }
     }
+}
+
+/// `AdventureModePredicate`: the `can_break`/`can_place_on` component.
+struct AdventureModePredicate {
+    predicates: Vec<BlockPredicate>,
+}
+
+impl AdventureModePredicate {
+    fn decode(buf: &mut &[u8], data: &ItemData) -> Result<Self, DecodeError> {
+        let predicates = (0..count(buf)?)
+            .map(|_| BlockPredicate::decode(buf, data))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { predicates })
+    }
+
+    /// `AdventureModePredicate.test` for the `BlockInWorld` that
+    /// `Player.blockActionRestricted` builds. Components are ignored by that
+    /// overload. NBT needs block entity data, which the world does not keep;
+    /// treat such predicates as non-matching rather than predicting a break
+    /// the server may reject.
+    fn test(&self, state: StateId, tags: &Tags) -> bool {
+        let registry = Registry::get();
+        self.predicates
+            .iter()
+            .any(|predicate| predicate.matches(state, tags, registry))
+    }
+}
+
+/// `BlockPredicate`.
+struct BlockPredicate {
+    blocks: Option<BlockSet>,
+    properties: Vec<PropertyMatcher>,
+    nbt: bool,
+}
+
+impl BlockPredicate {
+    fn decode(buf: &mut &[u8], data: &ItemData) -> Result<Self, DecodeError> {
+        let blocks = if bool::decode(buf)? {
+            Some(BlockSet::decode(buf)?)
+        } else {
+            None
+        };
+        let properties = if bool::decode(buf)? {
+            (0..count(buf)?)
+                .map(|_| PropertyMatcher::decode(buf))
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+        let nbt = if bool::decode(buf)? {
+            rapidbot_nbt::read_network(buf)?;
+            true
+        } else {
+            false
+        };
+        // DataComponentMatchers: exact components, then partial predicates.
+        // Both are irrelevant to BlockPredicate.matches(BlockInWorld), but
+        // they still have to be consumed.
+        for _ in 0..count(buf)? {
+            data.typed(buf)?;
+        }
+        for _ in 0..count(buf)? {
+            bool::decode(buf)?;
+            read_var_int(buf)?;
+            rapidbot_nbt::read_network(buf)?;
+        }
+        Ok(Self {
+            blocks,
+            properties,
+            nbt,
+        })
+    }
+
+    fn matches(&self, state: StateId, tags: &Tags, registry: &Registry) -> bool {
+        if self.nbt {
+            return false;
+        }
+        let info = registry.state(state);
+        if self
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.contains(info.block, tags))
+        {
+            return false;
+        }
+        self.properties
+            .iter()
+            .all(|property| property.matches(state, registry))
+    }
+}
+
+/// `StatePropertiesPredicate.PropertyMatcher`.
+struct PropertyMatcher {
+    name: String,
+    value: ValueMatcher,
+}
+
+impl PropertyMatcher {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let name = String::decode(buf)?;
+        let value = if bool::decode(buf)? {
+            ValueMatcher::Exact(String::decode(buf)?)
+        } else {
+            let min = if bool::decode(buf)? {
+                Some(String::decode(buf)?)
+            } else {
+                None
+            };
+            let max = if bool::decode(buf)? {
+                Some(String::decode(buf)?)
+            } else {
+                None
+            };
+            ValueMatcher::Ranged { min, max }
+        };
+        Ok(Self { name, value })
+    }
+
+    fn matches(&self, state: StateId, registry: &Registry) -> bool {
+        let Some(actual) = registry.property(state, &self.name) else {
+            return false;
+        };
+        match &self.value {
+            ValueMatcher::Exact(expected) => {
+                compare_values(actual, expected).is_some_and(|o| o.is_eq())
+            }
+            ValueMatcher::Ranged { min, max } => {
+                min.as_ref()
+                    .is_none_or(|min| compare_values(actual, min).is_some_and(|o| !o.is_lt()))
+                    && max
+                        .as_ref()
+                        .is_none_or(|max| compare_values(actual, max).is_some_and(|o| !o.is_gt()))
+            }
+        }
+    }
+}
+
+enum ValueMatcher {
+    Exact(String),
+    Ranged {
+        min: Option<String>,
+        max: Option<String>,
+    },
+}
+
+/// Compare a state's serialized property value with a predicate value the way
+/// `StatePropertiesPredicate` does: parse numbers and booleans, otherwise only
+/// an exact string matches.
+fn compare_values(actual: &str, expected: &str) -> Option<std::cmp::Ordering> {
+    if actual == expected {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    if let (Ok(actual), Ok(expected)) = (actual.parse::<i64>(), expected.parse::<i64>()) {
+        return Some(actual.cmp(&expected));
+    }
+    if let (Ok(actual), Ok(expected)) = (actual.parse::<bool>(), expected.parse::<bool>()) {
+        return Some(actual.cmp(&expected));
+    }
+    None
 }
 
 /// `Tool.Rule`.
@@ -933,6 +1107,127 @@ mod tests {
                 speed_multiplier: 0.2,
             }
         );
+    }
+
+    #[test]
+    fn can_break_matches_block_ids() {
+        let registry = Registry::get();
+        let dirt = registry.block_by_name("minecraft:dirt").unwrap();
+        let stone = registry.block_by_name("minecraft:stone").unwrap();
+        let state = |block| {
+            (0..registry.states.len() as StateId)
+                .find(|state| registry.state(*state).block == block)
+                .unwrap()
+        };
+
+        let mut bytes = Vec::new();
+        rapidbot_buf::write_var_int(&mut bytes, 1);
+        bytes.push(1);
+        rapidbot_buf::write_var_int(&mut bytes, 2);
+        rapidbot_buf::write_var_int(&mut bytes, dirt.id as i32);
+        bytes.extend([0, 0, 0, 0]);
+        let mut buf = bytes.as_slice();
+        let predicate = AdventureModePredicate::decode(&mut buf, ItemData::get()).unwrap();
+        assert!(buf.is_empty());
+        assert!(predicate.test(state(dirt.id), &Tags::default()));
+        assert!(!predicate.test(state(stone.id), &Tags::default()));
+    }
+
+    #[test]
+    fn can_break_matches_state_properties_but_not_nbt() {
+        let registry = Registry::get();
+        let log = registry.block_by_name("minecraft:oak_log").unwrap();
+        let state = |axis| {
+            (0..registry.states.len() as StateId)
+                .find(|state| {
+                    registry.state(*state).block == log.id
+                        && registry.property(*state, "axis") == Some(axis)
+                })
+                .unwrap()
+        };
+
+        let mut bytes = Vec::new();
+        rapidbot_buf::write_var_int(&mut bytes, 1);
+        bytes.push(0);
+        bytes.push(1);
+        rapidbot_buf::write_var_int(&mut bytes, 1);
+        "axis".to_string().encode(&mut bytes);
+        bytes.push(1);
+        "y".to_string().encode(&mut bytes);
+        bytes.push(0);
+        rapidbot_buf::write_var_int(&mut bytes, 0);
+        rapidbot_buf::write_var_int(&mut bytes, 0);
+        let mut buf = bytes.as_slice();
+        let predicate = AdventureModePredicate::decode(&mut buf, ItemData::get()).unwrap();
+        assert!(buf.is_empty());
+        assert!(predicate.test(state("y"), &Tags::default()));
+        assert!(!predicate.test(state("x"), &Tags::default()));
+
+        // NBT predicates need block entity data the client does not keep.
+        let bytes = [1, 0, 0, 1, 0, 0, 0];
+        let mut buf = bytes.as_slice();
+        let predicate = AdventureModePredicate::decode(&mut buf, ItemData::get()).unwrap();
+        assert!(buf.is_empty());
+        assert!(!predicate.test(state("y"), &Tags::default()));
+    }
+
+    #[test]
+    fn can_break_decodes_the_vanilla_vector() {
+        let line = include_str!("../tests/data/item_vectors.txt")
+            .lines()
+            .find(|line| line.contains("'minecraft:can_break'"))
+            .unwrap();
+        let (_, hex) = line.split_once('\t').unwrap();
+        let bytes = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let stack = ItemStack::decode(&mut bytes.as_slice()).unwrap().unwrap();
+        let mut can_break = stack.component("minecraft:can_break").unwrap();
+        let predicate = AdventureModePredicate::decode(&mut can_break, ItemData::get()).unwrap();
+        assert!(can_break.is_empty());
+        // The vector also carries an NBT predicate, which fails closed.
+        let registry = Registry::get();
+        let state = (0..registry.states.len() as StateId)
+            .find(|state| {
+                registry.state(*state).block
+                    == registry.block_by_name("minecraft:oak_log").unwrap().id
+            })
+            .unwrap();
+        assert!(!predicate.test(state, &Tags::default()));
+    }
+
+    #[test]
+    fn can_break_matches_property_ranges() {
+        let registry = Registry::get();
+        let fire = registry.block_by_name("minecraft:fire").unwrap();
+        let state = |age| {
+            (0..registry.states.len() as StateId)
+                .find(|state| {
+                    registry.state(*state).block == fire.id
+                        && registry.property(*state, "age") == Some(age)
+                })
+                .unwrap()
+        };
+
+        let mut bytes = Vec::new();
+        rapidbot_buf::write_var_int(&mut bytes, 1);
+        bytes.push(0);
+        bytes.push(1);
+        rapidbot_buf::write_var_int(&mut bytes, 1);
+        "age".to_string().encode(&mut bytes);
+        bytes.push(0);
+        bytes.push(1);
+        "1".to_string().encode(&mut bytes);
+        bytes.push(1);
+        "3".to_string().encode(&mut bytes);
+        bytes.push(0);
+        rapidbot_buf::write_var_int(&mut bytes, 0);
+        rapidbot_buf::write_var_int(&mut bytes, 0);
+        let mut buf = bytes.as_slice();
+        let predicate = AdventureModePredicate::decode(&mut buf, ItemData::get()).unwrap();
+        assert!(buf.is_empty());
+        assert!(predicate.test(state("2"), &Tags::default()));
+        assert!(!predicate.test(state("4"), &Tags::default()));
     }
 
     #[test]

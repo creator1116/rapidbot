@@ -396,7 +396,10 @@ impl GameMode {
             return;
         }
         let sequence = self.next_sequence();
-        if let Some(item) = h.inventory.held()
+        let clicked = h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2);
+        if !h.player.spectator
+            && let Some(item) = h.inventory.held()
+            && (!h.restricted || item.can_place_on_block_in_adventure_mode(clicked, h.tags))
             && let Some(state) = placed_state(item)
             && let Some(pos) = placement_pos(h, hit)
         {
@@ -1208,6 +1211,22 @@ mod tests {
             );
         }
 
+        /// A log that may be placed on only the given block in adventure mode.
+        fn set_can_place_item(&mut self, index: usize, state: StateId) {
+            let block = Registry::get().state(state).block;
+            let mut value = Vec::new();
+            rapidbot_buf::write_var_int(&mut value, 1);
+            value.push(1);
+            rapidbot_buf::write_var_int(&mut value, 2);
+            rapidbot_buf::write_var_int(&mut value, block as i32);
+            value.extend([0, 0, 0, 0]);
+            self.set_item_with_component(
+                index,
+                "minecraft:oak_log",
+                Some(("minecraft:can_place_on", &value)),
+            );
+        }
+
         fn take_packets(&mut self) -> Vec<(i32, Vec<u8>)> {
             let mut packets = Vec::new();
             while let Ok(frame) = self.sent.try_recv() {
@@ -1376,6 +1395,44 @@ mod tests {
         let packets = spectator.tick(1, true);
         assert!(!packets.iter().any(|p| p.0 == PlayerAction::ID));
         assert_eq!(spectator.mode.breaking(), None);
+    }
+
+    /// `ItemStack.useOn`: adventure mode predicts a placement only when the
+    /// clicked block matches the held stack's `can_place_on`.
+    #[test]
+    fn adventure_mode_requires_a_matching_can_place_on() {
+        let mut plain = Scene::new();
+        plain.restricted = true;
+        plain.set_item(36, "minecraft:oak_log");
+        let packets = plain.tick_use(true, true);
+        assert!(packets.iter().any(|p| p.0 == UseItemOn::ID));
+        assert_eq!(plain.world.block_state(1, 65, 0), Some(AIR));
+
+        let mut mismatch = Scene::new();
+        mismatch.restricted = true;
+        mismatch.set_can_place_item(36, state("minecraft:stone"));
+        let packets = mismatch.tick_use(true, true);
+        assert!(packets.iter().any(|p| p.0 == UseItemOn::ID));
+        assert_eq!(mismatch.world.block_state(1, 65, 0), Some(AIR));
+
+        let mut match_ = Scene::new();
+        match_.restricted = true;
+        match_.set_can_place_item(36, match_.dirt);
+        let packets = match_.tick_use(true, true);
+        assert!(packets.iter().any(|p| p.0 == UseItemOn::ID));
+        assert_eq!(
+            match_.world.block_state(1, 65, 0),
+            Some(state("minecraft:oak_log"))
+        );
+
+        // A spectator sends nothing and predicts nothing, even with one.
+        let mut spectator = Scene::new();
+        spectator.restricted = true;
+        spectator.player.spectator = true;
+        spectator.set_can_place_item(36, spectator.dirt);
+        let packets = spectator.tick_use(true, true);
+        assert!(packets.is_empty());
+        assert_eq!(spectator.world.block_state(1, 65, 0), Some(AIR));
     }
 
     /// A spear never sends `attack` or `punch`; a click sends `STAB` with

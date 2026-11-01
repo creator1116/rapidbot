@@ -1,6 +1,9 @@
 //! Chunk columns: `LevelChunkSection` block states as `PalettedContainer`s.
 
+use std::collections::HashMap;
+
 use rapidbot_buf::{Decode, DecodeError, VarInt, take};
+use rapidbot_nbt::{Compound, OptionalCompound};
 
 use crate::registry::{AIR, StateId};
 
@@ -186,9 +189,20 @@ impl Section {
     }
 }
 
+/// A block entity as the client sees it: the registry ID of its type and the
+/// update tag the server sent. Chunk packets may omit the tag when the block
+/// entity has nothing to send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEntity {
+    pub type_id: i32,
+    pub tag: Option<Compound>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub sections: Vec<Section>,
+    /// Block entities by chunk-relative `(x, y, z)`.
+    pub block_entities: HashMap<(u8, i32, u8), BlockEntity>,
 }
 
 impl Chunk {
@@ -200,6 +214,7 @@ impl Chunk {
                     states: Container::Single(AIR),
                 })
                 .collect(),
+            block_entities: HashMap::new(),
         }
     }
 
@@ -221,7 +236,10 @@ impl Chunk {
             skip_biomes(&mut buf, biome_bits)?;
             sections.push(Section { states });
         }
-        Ok(Chunk { sections })
+        Ok(Chunk {
+            sections,
+            block_entities: HashMap::new(),
+        })
     }
 
     /// Parses the whole chunk payload of `ClientboundLevelChunkWithLightPacket`
@@ -243,7 +261,26 @@ impl Chunk {
             take(&mut buf, len * 8)?;
         }
         let data = rapidbot_buf::ByteArray::decode(&mut buf)?;
-        Self::read_sections(&data.0, state_count, biome_count)
+        let mut chunk = Self::read_sections(&data.0, state_count, biome_count)?;
+
+        let count = VarInt::decode(&mut buf)?.0;
+        let count = usize::try_from(count).map_err(|_| DecodeError::NegativeLength(count))?;
+        // Each entry is at least a byte, a short, a VarInt and an End tag.
+        if count > buf.len() / 5 {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        for _ in 0..count {
+            let packed_xz = i8::decode(&mut buf)?;
+            let y = i16::decode(&mut buf)?;
+            let type_id = VarInt::decode(&mut buf)?.0;
+            let tag = OptionalCompound::decode(&mut buf)?.0;
+            let x = ((packed_xz >> 4) & 15) as u8;
+            let z = (packed_xz & 15) as u8;
+            chunk
+                .block_entities
+                .insert((x, i32::from(y), z), BlockEntity { type_id, tag });
+        }
+        Ok(chunk)
     }
 }
 
@@ -320,11 +357,51 @@ mod tests {
 
         let mut empty = rapidbot_buf::to_bytes(&VarInt(0));
         empty.extend(rapidbot_buf::to_bytes(&rapidbot_buf::ByteArray::default()));
+        empty.extend(rapidbot_buf::to_bytes(&VarInt(0)));
         assert!(
             Chunk::read_packet(&empty, 1, 1)
                 .unwrap()
                 .sections
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_packet_loads_block_entities() {
+        let mut compound = Compound::default();
+        compound.insert("id", rapidbot_nbt::Tag::String("minecraft:chest".into()));
+        compound.insert("Lock", rapidbot_nbt::Tag::String("secret".into()));
+
+        let mut buf = rapidbot_buf::to_bytes(&VarInt(0)); // heightmaps
+        buf.extend(rapidbot_buf::to_bytes(&rapidbot_buf::ByteArray::default()));
+        buf.extend(rapidbot_buf::to_bytes(&VarInt(2)));
+
+        // Chunk-relative x=3, z=7, y=64 with a tag.
+        buf.push(0x37);
+        buf.extend_from_slice(&64i16.to_be_bytes());
+        VarInt(5).encode(&mut buf);
+        compound.encode(&mut buf);
+
+        // x=15, z=0, y=-12 without a tag.
+        buf.push(0xF0);
+        buf.extend_from_slice(&(-12i16).to_be_bytes());
+        VarInt(9).encode(&mut buf);
+        buf.push(rapidbot_nbt::id::END);
+
+        let chunk = Chunk::read_packet(&buf, 1, 1).unwrap();
+        assert_eq!(
+            chunk.block_entities.get(&(3, 64, 7)),
+            Some(&BlockEntity {
+                type_id: 5,
+                tag: Some(compound),
+            })
+        );
+        assert_eq!(
+            chunk.block_entities.get(&(15, -12, 0)),
+            Some(&BlockEntity {
+                type_id: 9,
+                tag: None,
+            })
         );
     }
 

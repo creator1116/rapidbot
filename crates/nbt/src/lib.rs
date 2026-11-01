@@ -67,6 +67,71 @@ impl Compound {
     }
 }
 
+fn write_compound_payload(compound: &Compound, buf: &mut Vec<u8>) {
+    for (k, v) in &compound.0 {
+        buf.push(v.id());
+        write_string(buf, k);
+        v.write_payload(buf);
+    }
+    buf.push(id::END);
+}
+
+fn read_compound(buf: &mut &[u8], allow_end: bool) -> Result<Option<Compound>, DecodeError> {
+    let ty = u8::decode(buf)?;
+    if ty == id::END {
+        return if allow_end {
+            Ok(None)
+        } else {
+            Err(DecodeError::Custom(
+                "expected compound tag, got end tag".into(),
+            ))
+        };
+    }
+    if ty != id::COMPOUND {
+        return Err(DecodeError::Custom(format!(
+            "expected compound tag, got type {ty}"
+        )));
+    }
+    match Tag::read_payload(ty, buf, 0)? {
+        Tag::Compound(compound) => Ok(Some(compound)),
+        _ => unreachable!("compound tag type produced a non-compound tag"),
+    }
+}
+
+/// A non-null compound network tag (`ByteBufCodecs.COMPOUND_TAG`).
+impl Encode for Compound {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(id::COMPOUND);
+        write_compound_payload(self, buf);
+    }
+}
+
+impl Decode for Compound {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        read_compound(buf, false)?
+            .ok_or_else(|| DecodeError::Custom("expected compound tag, got end tag".into()))
+    }
+}
+
+/// A nullable compound network tag (`ByteBufCodecs.OPTIONAL_COMPOUND_TAG`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OptionalCompound(pub Option<Compound>);
+
+impl Encode for OptionalCompound {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        match &self.0 {
+            Some(compound) => compound.encode(buf),
+            None => buf.push(id::END),
+        }
+    }
+}
+
+impl Decode for OptionalCompound {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        read_compound(buf, true).map(Self)
+    }
+}
+
 impl Tag {
     pub fn id(&self) -> u8 {
         match self {
@@ -142,14 +207,7 @@ impl Tag {
                     item.write_payload(buf);
                 }
             }
-            Tag::Compound(c) => {
-                for (k, v) in &c.0 {
-                    buf.push(v.id());
-                    write_string(buf, k);
-                    v.write_payload(buf);
-                }
-                buf.push(id::END);
-            }
+            Tag::Compound(c) => write_compound_payload(c, buf),
             Tag::IntArray(v) => {
                 (v.len() as i32).encode(buf);
                 v.iter().for_each(|x| x.encode(buf));
@@ -330,5 +388,28 @@ mod tests {
         }
         bytes.extend_from_slice(&[id::END, 0, 0, 0, 0]);
         assert!(read_network(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn compound_codecs_reject_other_root_types() {
+        let mut compound = Compound::default();
+        compound.insert("id", Tag::String("minecraft:chest".into()));
+        let bytes = rapidbot_buf::to_bytes(&compound);
+        assert_eq!(
+            Compound::decode(&mut bytes.as_slice()),
+            Ok(compound.clone())
+        );
+        assert_eq!(
+            OptionalCompound::decode(&mut bytes.as_slice()),
+            Ok(OptionalCompound(Some(compound)))
+        );
+
+        let string = rapidbot_buf::to_bytes(&Tag::String("hi".into()));
+        assert!(Compound::decode(&mut string.as_slice()).is_err());
+        assert!(OptionalCompound::decode(&mut string.as_slice()).is_err());
+        assert_eq!(
+            OptionalCompound::decode(&mut [id::END].as_slice()),
+            Ok(OptionalCompound(None))
+        );
     }
 }

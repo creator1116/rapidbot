@@ -1,8 +1,8 @@
 //! Server resource packs, as far as the server can tell: the prompt, the
 //! HTTP download, and the status packets in vanilla's order (`ACCEPTED`,
 //! `DOWNLOADED`, `SUCCESSFULLY_LOADED`). The selected pack files are kept for
-//! lookups and their `en_us` language map is applied to rendered chat
-//! components; textures, models and sounds are not interpreted.
+//! lookups and their `en_us` language map overrides the built-in strings when
+//! rendering chat components; textures, models and sounds are not interpreted.
 //!
 //! The download is real because servers can see it: some check their web
 //! server's log for the request before letting a player through. The

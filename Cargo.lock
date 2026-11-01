@@ -2511,6 +2511,7 @@ name = "rapidbot-client"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "hickory-resolver",
  "md-5",
  "percent-encoding",

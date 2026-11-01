@@ -85,7 +85,8 @@ shape of `description`, and the top-level `features` and `overlays` sections.
 It then keeps `assets/` and `data/` from the root and from the overlays whose
 format ranges contain the client resource format (`97.1`); later overlays and
 later packs override earlier ones. `assets/minecraft/lang/en_us.json` is
-merged in that order and used when rendering system chat and title components.
+merged in that order and overrides the built-in `en_us` map embedded from the
+client jar; both are used when rendering system chat and title components.
 It does not compile selector or NBT paths, inspect every object/click/hover
 payload, or interpret textures, models and sounds, so a pack that only fails
 vanilla's real resource reload can still be reported as loaded. Download
@@ -102,6 +103,9 @@ Facts about the game are extracted, not typed in:
   states, shapes, attributes, entity types, and the `Mth` tables.
 - `tools/extract_items.py` → `crates/world/data/items.json.gz`: item
   components.
+- `tools/extract_lang.py` → `crates/client/data/en_us.json.gz`: the built-in
+  language strings used for chat, titles and disconnect messages.
 
-The extractors compile small Java programs (`tools/extractor/`) against the
-vanilla server jar and run them, so the data comes from the game's own code.
+The block and item extractors compile small Java programs (`tools/extractor/`)
+against the vanilla server jar and run them, so the data comes from the game's
+own code; the language file is copied from the extracted client assets.

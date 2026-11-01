@@ -1,23 +1,42 @@
 //! Plain-text rendering of chat components, for logs and error messages.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::sync::OnceLock;
 
 use rapidbot_nbt::Tag;
 use serde_json::Value;
 
-/// A component sent as NBT (configuration and play).
-pub fn nbt_to_plain(tag: &Tag) -> String {
-    nbt_to_plain_translated(tag, &HashMap::new())
+static DEFAULT_TRANSLATIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// The client jar's built-in `en_us` language map.
+fn default_translations() -> &'static HashMap<String, String> {
+    DEFAULT_TRANSLATIONS.get_or_init(|| {
+        let gz: &[u8] = include_bytes!("../data/en_us.json.gz");
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(gz)
+            .read_to_string(&mut json)
+            .expect("embedded en_us language data");
+        serde_json::from_str(&json).expect("embedded en_us language data")
+    })
 }
 
-/// NBT like `nbt_to_plain`, with the active resource pack's language map.
-pub fn nbt_to_plain_translated(tag: &Tag, translations: &HashMap<String, String>) -> String {
+/// A component sent as NBT (configuration and play).
+pub fn nbt_to_plain(tag: &Tag) -> String {
     let mut out = String::new();
-    nbt_append(tag, &mut out, translations);
+    nbt_append(tag, &mut out, None);
     out
 }
 
-fn nbt_append(tag: &Tag, out: &mut String, translations: &HashMap<String, String>) {
+/// NBT like `nbt_to_plain`, with the active resource pack's language map
+/// overriding the built-in `en_us` strings.
+pub fn nbt_to_plain_translated(tag: &Tag, translations: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    nbt_append(tag, &mut out, Some(translations));
+    out
+}
+
+fn nbt_append(tag: &Tag, out: &mut String, translations: Option<&HashMap<String, String>>) {
     match tag {
         Tag::String(s) => out.push_str(s),
         Tag::List(items) => items.iter().for_each(|t| nbt_append(t, out, translations)),
@@ -54,22 +73,30 @@ fn nbt_append(tag: &Tag, out: &mut String, translations: &HashMap<String, String
 
 /// A component sent as JSON (login disconnect).
 pub fn json_to_plain(json: &str) -> String {
-    json_to_plain_translated(json, &HashMap::new())
-}
-
-/// JSON like `json_to_plain`, with the active resource pack's language map.
-pub fn json_to_plain_translated(json: &str, translations: &HashMap<String, String>) -> String {
     match serde_json::from_str::<Value>(json) {
         Ok(v) => {
             let mut out = String::new();
-            json_append(&v, &mut out, translations);
+            json_append(&v, &mut out, None);
             out
         }
         Err(_) => json.to_owned(),
     }
 }
 
-fn json_append(v: &Value, out: &mut String, translations: &HashMap<String, String>) {
+/// JSON like `json_to_plain`, with the active resource pack's language map
+/// overriding the built-in `en_us` strings.
+pub fn json_to_plain_translated(json: &str, translations: &HashMap<String, String>) -> String {
+    match serde_json::from_str::<Value>(json) {
+        Ok(v) => {
+            let mut out = String::new();
+            json_append(&v, &mut out, Some(translations));
+            out
+        }
+        Err(_) => json.to_owned(),
+    }
+}
+
+fn json_append(v: &Value, out: &mut String, translations: Option<&HashMap<String, String>>) {
     match v {
         Value::String(s) => out.push_str(s),
         Value::Array(items) => items.iter().for_each(|t| json_append(t, out, translations)),
@@ -100,16 +127,20 @@ fn json_append(v: &Value, out: &mut String, translations: &HashMap<String, Strin
     }
 }
 
-/// Use the pack's text when it has one, substituting Java's `%s`/`%d` and
-/// `%n$s` placeholders. An unknown key keeps the old `key[arg, ...]` form so
-/// logs still show what the server sent.
+/// Use the pack's text when it has one, otherwise the built-in `en_us`
+/// string, substituting Java's `%s`/`%d` and `%n$s` placeholders. An unknown
+/// key keeps the old `key[arg, ...]` form so logs still show what the server
+/// sent.
 fn append_translation(
     key: &str,
     args: &[String],
     out: &mut String,
-    translations: &HashMap<String, String>,
+    translations: Option<&HashMap<String, String>>,
 ) {
-    let Some(text) = translations.get(key) else {
+    let text = translations
+        .and_then(|translations| translations.get(key))
+        .or_else(|| default_translations().get(key));
+    let Some(text) = text else {
         out.push_str(key);
         if !args.is_empty() {
             out.push('[');
@@ -241,5 +272,31 @@ mod tests {
             json_to_plain_translated(r#"{"text":"plain","extra":["!"]}"#, &map),
             "plain!"
         );
+    }
+
+    /// The client jar's built-in `en_us` map is the fallback when no pack
+    /// overrides a key, which is how vanilla renders ordinary server chat.
+    #[test]
+    fn built_in_en_us_renders_vanilla_chat() {
+        let joined = translatable(
+            "multiplayer.player.joined",
+            vec![Tag::String("Steve".into())],
+        );
+        assert_eq!(nbt_to_plain(&joined), "Steve joined the game");
+        assert_eq!(
+            nbt_to_plain(&translatable(
+                "death.attack.drown",
+                vec![Tag::String("Alex".into())]
+            )),
+            "Alex drowned"
+        );
+        assert_eq!(
+            json_to_plain(r#"{"translate":"multiplayer.player.joined","with":["Steve"]}"#),
+            "Steve joined the game"
+        );
+
+        // A resource pack's language file wins over the built-in string.
+        let map = translations(&[("multiplayer.player.joined", "%s arrived")]);
+        assert_eq!(nbt_to_plain_translated(&joined, &map), "Steve arrived");
     }
 }

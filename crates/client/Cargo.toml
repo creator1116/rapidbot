@@ -14,6 +14,7 @@ rapidbot-physics.workspace = true
 rapidbot-protocol.workspace = true
 rapidbot-world.workspace = true
 base64.workspace = true
+flate2.workspace = true
 hickory-resolver.workspace = true
 md-5.workspace = true
 percent-encoding.workspace = true

@@ -77,6 +77,13 @@ cargo run --release -p rapidbot-client --example fly -- localhost:25565 Walker  
 ## What to look for
 
 - The server keeps the bot connected and does not move it back.
+- A vanilla server may log `Player <name> standing on air - force-sending
+  blocks below` when the bot lands. The server checks
+  `verticalCollisionBelow` before applying the landing move, so a client
+  that reports `onGround` on the landing tick can trigger it. The log is
+  throttled to once every 200 ticks. Treat it as a problem only if the bot
+  is also moved back, the blocks below actually change, or the message
+  appears while walking without jumps or falls.
 - The validator reports no movement discrepancies. Run with nothing heavy
   alongside: a busy machine makes ticks irregular, which can produce timer
   alerts unrelated to movement calculations.

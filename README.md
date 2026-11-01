@@ -15,7 +15,7 @@ Targets **Minecraft 26.3** (protocol 777).
 | `rapidbot-buf-derive` | `#[derive(Encode, Decode)]` |
 | `rapidbot-nbt` | Network NBT with Java's modified UTF-8 |
 | `rapidbot-protocol` | Framing, compression, encryption, packet IDs, packets, async connection |
-| `rapidbot-world` | Block data extracted from the jar, chunk storage, vanilla-exact block collision |
+| `rapidbot-world` | Block data extracted from the jar, chunk and block entity NBT storage, vanilla-exact block collision |
 | `rapidbot-physics` | Player movement ported from vanilla: input, travel, collision, step-up, ground state |
 | `rapidbot-human` | Input models: mouse strokes, response delays, fatigue |
 | `rapidbot-auth` | Microsoft login (device code), Xbox/XSTS, Minecraft token and profile, chat keys, session join |

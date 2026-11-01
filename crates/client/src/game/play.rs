@@ -520,6 +520,23 @@ impl Game {
                 )?;
                 play.world.insert_chunk(packet.x, packet.z, chunk);
             }
+            cb::BlockEntityData::ID => {
+                let data = packet.decode::<cb::BlockEntityData>()?;
+                let (x, y, z) = rapidbot_world::unpack_block_pos(data.pos);
+                let play = play_mut(&mut self.play)?;
+                if !play
+                    .world
+                    .apply_block_entity_data(x, y, z, data.type_id, data.tag)
+                {
+                    debug!(
+                        x,
+                        y,
+                        z,
+                        type_id = data.type_id,
+                        "ignored block entity data for an unloaded or different entity"
+                    );
+                }
+            }
             cb::ForgetLevelChunk::ID => {
                 let forget = packet.decode::<cb::ForgetLevelChunk>()?;
                 play_mut(&mut self.play)?

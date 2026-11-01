@@ -366,6 +366,17 @@ pub mod clientbound {
     pub struct StartConfiguration;
     packet!(StartConfiguration, play, clientbound, START_CONFIGURATION);
 
+    /// `ClientboundBlockEntityDataPacket`: packed `BlockPos`, the block
+    /// entity type's registry ID, and its update tag.
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    pub struct BlockEntityData {
+        pub pos: i64,
+        #[var]
+        pub type_id: i32,
+        pub tag: rapidbot_nbt::Compound,
+    }
+    packet!(BlockEntityData, play, clientbound, BLOCK_ENTITY_DATA);
+
     /// `ClientboundBlockUpdatePacket`: packed `BlockPos` and a block state ID.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
     pub struct BlockUpdate {
@@ -1247,6 +1258,26 @@ pub mod serverbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_entity_data_is_pos_type_then_compound() {
+        let mut tag = rapidbot_nbt::Compound::default();
+        tag.insert("id", rapidbot_nbt::Tag::String("minecraft:chest".into()));
+        let packet = clientbound::BlockEntityData {
+            pos: 0x0000_0040_0000_0002,
+            type_id: 42,
+            tag,
+        };
+        let bytes = rapidbot_buf::to_bytes(&packet);
+        let mut body = bytes.as_slice();
+        assert_eq!(i64::decode(&mut body).unwrap(), packet.pos);
+        assert_eq!(rapidbot_buf::VarInt::decode(&mut body).unwrap().0, 42);
+        assert_eq!(body.first(), Some(&rapidbot_nbt::id::COMPOUND));
+        assert_eq!(
+            clientbound::BlockEntityData::decode(&mut bytes.as_slice()),
+            Ok(packet)
+        );
+    }
 
     #[test]
     fn optional_game_type_validates_full_varint() {

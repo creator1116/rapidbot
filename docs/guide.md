@@ -61,7 +61,7 @@ keyboard and mouse. It gets a `TickContext`.
 | Field | Meaning |
 |---|---|
 | `ctx.player` | Position, velocity, rotation, on-ground, sprinting, pose |
-| `ctx.world` | Loaded chunks: `block_state_or_air(x, y, z)` |
+| `ctx.world` | Loaded chunks: `block_state_or_air(x, y, z)` and `block_entity(x, y, z)` |
 | `ctx.entities` | Other entities where the client draws them, with size, pose and health |
 | `ctx.players` | Other players within 32 blocks, nearest first |
 | `ctx.inventory` | Items carried and worn, the selected slot, any open container |
@@ -72,7 +72,9 @@ keyboard and mouse. It gets a `TickContext`.
 | `ctx.chat_open` | True while a chat line is being typed |
 
 `ctx.player.abilities.flying` is true when the player is in creative flight
-mode.
+mode. `ctx.world.block_entity(x, y, z)` returns the block entity's type
+registry ID and the NBT update tag the server sent; the tag is `None` when
+the entity has nothing to send.
 
 ## What a controller can do
 

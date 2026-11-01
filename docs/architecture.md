@@ -13,7 +13,7 @@ everything else is an implementation layer.
 | `rapidbot-protocol` | Framing, compression, encryption, generated packet IDs (`ids.rs`), packets per connection state |
 | `rapidbot-buf`, `rapidbot-buf-derive` | Wire types, `Encode`/`Decode`, `#[derive]` (`#[var]` marks VarInt fields) |
 | `rapidbot-nbt` | Network NBT with Java's modified UTF-8 |
-| `rapidbot-world` | Block and item data extracted from the game, chunks, tags, collision shapes, item stacks and components, block ray cast |
+| `rapidbot-world` | Block and item data extracted from the game, chunks and block entity NBT, tags, collision shapes, item stacks and components, block ray cast |
 | `rapidbot-physics` | Player movement ported from vanilla, attributes, `Mth`/`Vec3` |
 | `rapidbot-human` | Input models: mouse strokes, response delays, key timing, typing, fatigue; seeded per account |
 | `rapidbot-auth` | Microsoft device code and silent token renewal → Xbox → XSTS → Minecraft token, encrypted per-alias token cache, chat keys, session join; `refresh_if_needed` for background renewal |

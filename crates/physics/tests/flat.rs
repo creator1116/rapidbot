@@ -1,5 +1,6 @@
 //! Movement on flat ground against well-known vanilla values.
 
+use rapidbot_physics::attributes;
 use rapidbot_physics::math::Vec3;
 use rapidbot_physics::{Keys, Player};
 use rapidbot_world::chunk::Chunk;
@@ -218,6 +219,39 @@ fn steps_up_a_slab_but_not_a_full_block() {
     // 8 - 0.30000001192092896, not 7.7.
     assert_eq!(p.pos.z, 8.0 - (0.3f32 as f64));
     assert!(p.horizontal_collision);
+}
+
+/// `LivingEntity.getEntityBounciness` reads the BOUNCINESS attribute, so a
+/// player with bounciness bounces higher on a slime block.
+#[test]
+fn bounciness_attribute_changes_the_bounce() {
+    let world = flat_world("minecraft:red_bed");
+    let tags = Tags::default();
+
+    let rebound = |bounciness: f64| {
+        let mut p = player_at(0.5, 70.0, 0.5);
+        p.apply_attribute_snapshot(attributes::BOUNCINESS, bounciness, &[]);
+        for _ in 0..200 {
+            p.tick(&world, &tags);
+            if p.on_ground {
+                break;
+            }
+        }
+        assert!(p.on_ground, "the player never landed");
+        let mut peak = p.pos.y;
+        for _ in 0..60 {
+            p.tick(&world, &tags);
+            peak = peak.max(p.pos.y);
+        }
+        peak
+    };
+
+    let plain = rebound(0.0);
+    let bouncy = rebound(1.0);
+    assert!(
+        bouncy > plain + 0.5,
+        "bouncy rebound {bouncy} vs plain {plain}"
+    );
 }
 
 #[test]

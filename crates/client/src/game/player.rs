@@ -112,6 +112,7 @@ impl LocalPlayer {
             p.attributes.clear_modifiers();
             p.sprinting = false;
         }
+        p.refresh_dimensions();
         new
     }
 
@@ -219,11 +220,10 @@ impl LocalPlayer {
             passengers,
             authoritative: self.vehicle.is_some_and(|v| v.authoritative),
         });
-        self.physics.set_pos(entity.pos.plus(offset));
+        self.physics.set_riding_pos(entity.pos.plus(offset));
         // Player.tick: `if (isSpectator() || isPassenger()) setOnGround(false)`.
         // Collision flags are not touched: vanilla does not move the passenger
         // while riding, so the last values remain until dismount.
-        self.physics.on_ground = false;
     }
 
     /// Apply `ClientboundMoveVehiclePacket` to the authoritative vehicle.
@@ -273,6 +273,11 @@ impl LocalPlayer {
     /// `ClientPacketListener.setValuesFromPositionPacket` (not interpolated)
     /// using `PositionMoveRotation.calculateAbsolute`.
     pub fn apply_teleport(&mut self, change: &PositionMoveRotation, relatives: i32) {
+        // ClientPacketListener.handleMovePlayer acknowledges the packet but
+        // does not apply it to a passenger.
+        if self.is_riding() {
+            return;
+        }
         let p = &mut self.physics;
         let has = |flag: i32| relatives & flag != 0;
         let offset_x = if has(relative::X) { p.pos.x } else { 0.0 };
@@ -484,6 +489,19 @@ mod tests {
     }
 
     #[test]
+    fn a_passenger_acknowledges_but_does_not_apply_player_teleports() {
+        let mut p = LocalPlayer::new(7);
+        p.physics.set_pos(Vec3::new(1.0, 65.0, 2.0));
+        let boat = Entity::test_entity(42, "minecraft:oak_boat", Vec3::new(1.0, 64.0, 2.0));
+        assert!(p.set_passengers(&boat, &[7], true));
+
+        p.apply_teleport(&change(100.0, 80.0, 100.0, 90.0, 30.0), 0);
+
+        assert_eq!(p.physics.pos, Vec3::new(1.0, 65.0, 2.0));
+        assert_eq!((p.physics.y_rot, p.physics.x_rot), (0.0, 0.0));
+    }
+
+    #[test]
     fn riding_sends_rot_and_vehicle() {
         let mut p = LocalPlayer::new(7);
         let mut boat = Entity::test_entity(42, "minecraft:oak_boat", Vec3::new(10.0, 64.0, 10.0));
@@ -494,6 +512,8 @@ mod tests {
         entities.insert_for_test(boat.clone());
 
         p.physics.y_rot = 100.0;
+        p.physics.on_ground = true;
+        p.physics.main_supporting_block = Some((10, 63, 10));
         assert!(p.set_passengers(&boat, &[7], true));
         assert_eq!(p.physics.y_rot, 30.0, "a new boat rider takes its yaw");
         p.sync_vehicle(&entities);
@@ -502,17 +522,26 @@ mod tests {
             !p.physics.on_ground,
             "Player.tick clears onGround when riding"
         );
+        assert_eq!(p.physics.main_supporting_block, None);
+        p.physics.held_keys.forward = true;
+        p.physics.tick_riding_input();
 
         let (net, mut rx) = PacketSender::for_test();
         p.send_changes(&net);
         let sent = packets(&mut rx);
         assert_eq!(
             sent.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [sb::MovePlayerRot::ID, sb::MoveVehicle::ID]
+            [
+                sb::PlayerInput::ID,
+                sb::MovePlayerRot::ID,
+                sb::MoveVehicle::ID
+            ]
         );
-        let rot = sb::MovePlayerRot::from_body(&sent[0].1).unwrap();
+        let input = sb::PlayerInput::from_body(&sent[0].1).unwrap();
+        assert!(input.input.forward);
+        let rot = sb::MovePlayerRot::from_body(&sent[1].1).unwrap();
         assert_eq!((rot.y_rot, rot.x_rot), (30.0, 0.0));
-        let vehicle = sb::MoveVehicle::from_body(&sent[1].1).unwrap();
+        let vehicle = sb::MoveVehicle::from_body(&sent[2].1).unwrap();
         assert_eq!(
             (
                 vehicle.moving_to.position.x,

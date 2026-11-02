@@ -720,7 +720,11 @@ impl Game {
             }
 
             // level.tickEntities() → LocalPlayer.tick()
-            if !play.player.is_riding() {
+            if play.player.is_riding() {
+                // LocalPlayer.aiStep still advances KeyboardInput while the
+                // vehicle position itself remains server-driven.
+                play.player.physics.tick_riding_input();
+            } else {
                 play.player.physics.entity_colliders =
                     play.entities.collision_boxes(play.player.physics.pos.y);
                 play.player.physics.tick(&play.world, &play.tags);
@@ -738,7 +742,11 @@ impl Game {
                 play.player.physics.apply_firework_boost();
             }
         }
-        // level.tick(), particles, ...
+        // ClientLevel.tick: the border advances after entity ticks, so this
+        // tick's movement used the pre-update extent. This also runs while
+        // the player is dead or riding.
+        play.player.physics.world_border.tick();
+        // The rest of level.tick(), particles, ...
         self.net
             .send(&rapidbot_protocol::packets::play::serverbound::ClientTickEnd);
         tracing::trace!(target: "rapidbot_client::tick", "tick");

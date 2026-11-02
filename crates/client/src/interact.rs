@@ -21,6 +21,7 @@ use rapidbot_world::{AIR, Registry, StateId, World, pack_block_pos};
 use crate::entities::{Entities, Entity, EntityHit};
 use crate::inventory::Inventory;
 use crate::net::PacketSender;
+use crate::placement;
 
 type BlockPos = (i32, i32, i32);
 
@@ -300,48 +301,6 @@ pub(crate) struct Hands<'a> {
     pub survival: bool,
 }
 
-/// The first block state of the block an item would place. Approximate:
-/// this uses the registry's first state, which is the default state for
-/// block items with no properties.
-fn placed_state(item: &ItemStack) -> Option<StateId> {
-    let registry = Registry::get();
-    let block = registry.block_by_name(item.name())?;
-    (0..registry.state_count() as StateId).find(|state| registry.state(*state).block == block.id)
-}
-
-/// Whether a block can be replaced by a placement (`BlockPlaceContext`).
-fn replaceable(state: StateId) -> bool {
-    let registry = Registry::get();
-    let info = registry.state(state);
-    info.is_air
-        || !info.fluid.is_empty()
-        || registry.collision_shape(state).is_none()
-        || matches!(
-            registry.block_of(state).name.as_str(),
-            "minecraft:snow"
-                | "minecraft:moss_carpet"
-                | "minecraft:short_grass"
-                | "minecraft:tall_grass"
-        )
-}
-
-/// Where `BlockItem.useOn` would put a block: the clicked block itself when
-/// it can be replaced, otherwise the adjacent block on the clicked face.
-fn placement_pos(h: &Hands<'_>, hit: &BlockHit) -> Option<BlockPos> {
-    if hit.miss {
-        return None;
-    }
-    let clicked = h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2);
-    let pos = if hit.inside || replaceable(clicked) {
-        hit.pos
-    } else {
-        let (dx, dy, dz) = hit.direction.normal();
-        (hit.pos.0 + dx, hit.pos.1 + dy, hit.pos.2 + dz)
-    };
-    let state = h.world.block_state_or_air(pos.0, pos.1, pos.2);
-    replaceable(state).then_some(pos)
-}
-
 struct ServerVerified {
     sequence: i32,
     state: StateId,
@@ -405,16 +364,17 @@ impl GameMode {
         if !h.player.spectator
             && let Some(item) = h.inventory.held()
             && (!h.restricted || item.can_place_on_block_in_adventure_mode(clicked, h.tags))
-            && let Some(state) = placed_state(item)
-            && let Some(pos) = placement_pos(h, hit)
+            && let Some(changes) = placement::predict(
+                h.world,
+                h.player,
+                item,
+                hit,
+                h.tags,
+                h.player.key_presses.shift,
+            )
         {
-            let obstructed = Registry::get().collision_shape(state).is_some_and(|shape| {
-                shape
-                    .at(pos.0, pos.1, pos.2)
-                    .intersects_box(&h.player.bounding_box())
-            });
-            if !obstructed {
-                self.predict_block(h, pos, state);
+            for change in changes {
+                self.predict_block(h, change.pos, change.state);
             }
         }
         let (x, y, z) = hit.pos;
@@ -1116,6 +1076,10 @@ mod tests {
             .unwrap()
     }
 
+    fn default_state(name: &str) -> StateId {
+        Registry::get().block_by_name(name).unwrap().default_state
+    }
+
     impl Scene {
         /// A stone floor at y = 63 with a dirt block at (1, 64, 0); the
         /// player stands at the origin looking down at the dirt.
@@ -1508,7 +1472,7 @@ mod tests {
         assert!(packets.iter().any(|p| p.0 == UseItemOn::ID));
         assert_eq!(
             match_.world.block_state(1, 65, 0),
-            Some(state("minecraft:oak_log"))
+            Some(default_state("minecraft:oak_log"))
         );
 
         // A spectator sends nothing and predicts nothing, even with one.

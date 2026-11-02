@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::raycast::Direction;
 use crate::shape::Shape;
 
 /// A block state ID (`Block.BLOCK_STATE_REGISTRY`), as sent on the wire.
@@ -24,6 +25,8 @@ pub struct BlockInfo {
     /// `Block.getBounceRestitution` (slime blocks bounce at 1.0).
     pub bounce: f32,
     pub dynamic_shape: bool,
+    /// `Block.defaultBlockState()`: not the first state for most blocks.
+    pub default_state: StateId,
 }
 
 #[derive(Debug, Clone)]
@@ -38,9 +41,12 @@ pub struct StateInfo {
     pub fluid_falling: bool,
     /// `name=value,...` as in vanilla's reports.
     pub properties: String,
-    /// Bits 0-3: `isFaceSturdy` for north, east, south, west. Bit 4: ice.
-    /// Bit 5: full-cube collision shape.
-    pub face_flags: u8,
+    /// Bits 0-3: `isFaceSturdy` (FULL) for north, east, south, west. Bit 4:
+    /// ice. Bit 5: full-cube collision shape. Bit 6: requires a correct
+    /// tool. Bit 7-8: `isFaceSturdy` up/down. Bit 9: `isSolid`. Bits 10-13:
+    /// `SupportType.CENTER` for north, east, south, west. Bit 14-15: center
+    /// support up/down.
+    pub face_flags: u16,
     /// Index of the outline shape (`getShape`), which the crosshair
     /// raycast uses; 0 is empty.
     pub outline: u16,
@@ -48,6 +54,9 @@ pub struct StateInfo {
     pub hardness: f32,
     /// Index of `getInteractionShape`, empty (0) for nearly every block.
     pub interaction: u16,
+    /// `BlockState.canBeReplaced()`: the no-context flag used by
+    /// `BlockBehaviour.canBeReplaced(BlockState, BlockPlaceContext)`.
+    pub replaceable: bool,
 }
 
 /// An entry of the (built-in, unsynced) `minecraft:attribute` registry.
@@ -136,6 +145,14 @@ pub struct Registry {
     pub command_argument_types: Vec<String>,
     /// `minecraft:item` names by registry ID.
     pub items: Vec<String>,
+    /// `minecraft:block` registry ID placed by each item, or -1 when the
+    /// item is not a `BlockItem`.
+    pub item_blocks: Vec<i32>,
+    /// The wall variant of a `StandingAndWallBlockItem`, or -1.
+    pub item_wall_blocks: Vec<i32>,
+    /// `StandingAndWallBlockItem.attachmentDirection` as a `Direction`
+    /// ordinal when `item_wall_blocks` is not -1.
+    pub item_wall_directions: Vec<i8>,
     pub shapes: Vec<Shape>,
     pub blocks: Vec<BlockInfo>,
     pub states: Vec<StateInfo>,
@@ -182,6 +199,7 @@ impl Registry {
                 jump_factor: b.jump_factor,
                 bounce: b.bounce,
                 dynamic_shape: b.dynamic_shape,
+                default_state: b.default_state,
             })
             .collect();
         blocks.sort_by_key(|b| b.id);
@@ -202,6 +220,7 @@ impl Registry {
                     outline,
                     hardness,
                     interaction,
+                    replaceable,
                 )| StateInfo {
                     block,
                     shape,
@@ -215,6 +234,7 @@ impl Registry {
                     outline,
                     hardness,
                     interaction,
+                    replaceable: replaceable != 0,
                 },
             )
             .collect();
@@ -233,6 +253,9 @@ impl Registry {
             mob_effects: raw.mob_effects,
             command_argument_types: raw.command_argument_types,
             items: raw.items,
+            item_blocks: raw.item_blocks,
+            item_wall_blocks: raw.item_wall_blocks,
+            item_wall_directions: raw.item_wall_directions,
             shapes,
             blocks,
             states,
@@ -281,6 +304,65 @@ impl Registry {
         self.blocks.iter().find(|b| b.name == name)
     }
 
+    /// The block an item places (`BlockItem.getBlock`), or `None` for items
+    /// that do not place a block. Item and block names are not always equal
+    /// (`minecraft:redstone` places `minecraft:redstone_wire`).
+    pub fn block_for_item(&self, item: u32) -> Option<&BlockInfo> {
+        let block = *self.item_blocks.get(item as usize)?;
+        if block < 0 {
+            return None;
+        }
+        self.blocks.get(block as usize)
+    }
+
+    /// The wall variant placed by a `StandingAndWallBlockItem` (torches,
+    /// signs, banners, skulls, coral fans, hanging signs).
+    pub fn wall_block_for_item(&self, item: u32) -> Option<&BlockInfo> {
+        let block = *self.item_wall_blocks.get(item as usize)?;
+        if block < 0 {
+            return None;
+        }
+        self.blocks.get(block as usize)
+    }
+
+    /// `StandingAndWallBlockItem.attachmentDirection`: the direction in
+    /// which the standing variant is attached (`DOWN` for torches and
+    /// signs, `UP` for hanging signs).
+    pub fn wall_attachment_direction(&self, item: u32) -> Option<Direction> {
+        self.item_wall_directions
+            .get(item as usize)
+            .and_then(|d| Direction::from_ordinal(*d as i32))
+    }
+
+    /// `BlockState.setValue`, but tolerant like
+    /// `BlockItemStateProperties.apply`: unknown properties and invalid
+    /// values leave the state unchanged.
+    ///
+    /// Properties are applied in order, so later values win for duplicate
+    /// keys.
+    pub fn state_with_properties(&self, state: StateId, properties: &[(&str, &str)]) -> StateId {
+        properties.iter().fold(state, |state, (key, value)| {
+            self.state_with_property(state, key, value)
+        })
+    }
+
+    fn state_with_property(&self, state: StateId, key: &str, value: &str) -> StateId {
+        let Some(current) = self.property(state, key) else {
+            return state;
+        };
+        if current == value {
+            return state;
+        }
+        let block = self.state(state).block;
+        let start = self.states.partition_point(|s| s.block < block);
+        let end = self.states.partition_point(|s| s.block <= block);
+        let base = self.states[state as usize].properties.as_str();
+        self.states[start..end]
+            .iter()
+            .position(|candidate| same_properties_except(&candidate.properties, base, key, value))
+            .map_or(state, |i| (start + i) as StateId)
+    }
+
     /// Attribute name for a registry ID from `update_attributes`.
     pub fn attribute(&self, id: u32) -> Option<&AttributeInfo> {
         self.attributes.get(id as usize).filter(|a| a.id == id)
@@ -301,7 +383,39 @@ impl Registry {
     }
 }
 
-type RawState = (u32, u16, u8, u8, String, u8, u8, String, u8, u16, f32, u16);
+fn property_in<'a>(properties: &'a str, key: &str) -> Option<&'a str> {
+    properties
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// Whether `candidate` changes `key` to `value` and keeps every other
+/// property of `base`.
+fn same_properties_except(candidate: &str, base: &str, key: &str, value: &str) -> bool {
+    property_in(candidate, key) == Some(value)
+        && base
+            .split(',')
+            .filter_map(|kv| kv.split_once('='))
+            .all(|(k, v)| k == key || property_in(candidate, k) == Some(v))
+}
+
+type RawState = (
+    u32,
+    u16,
+    u8,
+    u8,
+    String,
+    u8,
+    u8,
+    String,
+    u16,
+    u16,
+    f32,
+    u16,
+    u8,
+);
 
 #[derive(Deserialize)]
 struct RawData {
@@ -311,6 +425,9 @@ struct RawData {
     mob_effects: Vec<String>,
     command_argument_types: Vec<String>,
     items: Vec<String>,
+    item_blocks: Vec<i32>,
+    item_wall_blocks: Vec<i32>,
+    item_wall_directions: Vec<i8>,
     shapes: Vec<Option<RawShape>>,
     blocks: Vec<RawBlock>,
     entity_dimensions: Vec<(f32, f32, f32)>,
@@ -336,6 +453,7 @@ struct RawBlock {
     jump_factor: f32,
     bounce: f32,
     dynamic_shape: bool,
+    default_state: StateId,
 }
 
 #[cfg(test)]
@@ -356,5 +474,54 @@ mod tests {
             r.collision_shape(1).unwrap().is_block,
             "stone is a full cube"
         );
+        assert_eq!(r.item_blocks.len(), r.items.len());
+    }
+
+    #[test]
+    fn default_states_are_not_always_the_first_state() {
+        let r = Registry::get();
+        let log = r.block_by_name("minecraft:oak_log").unwrap();
+        assert_eq!(r.property(log.default_state, "axis"), Some("y"));
+        let first = (0..r.state_count() as StateId)
+            .find(|id| r.state(*id).block == log.id)
+            .unwrap();
+        assert_ne!(first, log.default_state);
+    }
+
+    #[test]
+    fn item_block_mapping_is_not_name_based() {
+        let r = Registry::get();
+        let redstone = r
+            .items
+            .iter()
+            .position(|name| name == "minecraft:redstone")
+            .unwrap() as u32;
+        assert_eq!(
+            r.block_for_item(redstone).unwrap().name,
+            "minecraft:redstone_wire"
+        );
+        let stick = r
+            .items
+            .iter()
+            .position(|name| name == "minecraft:stick")
+            .unwrap() as u32;
+        assert!(r.block_for_item(stick).is_none());
+    }
+
+    #[test]
+    fn state_properties_apply_tolerantly() {
+        let r = Registry::get();
+        let slab = r.block_by_name("minecraft:oak_slab").unwrap();
+        let top = r.state_with_properties(
+            slab.default_state,
+            &[
+                ("type", "top"),
+                ("missing", "value"),
+                ("waterlogged", "nope"),
+            ],
+        );
+        assert_eq!(r.property(top, "type"), Some("top"));
+        assert_eq!(r.property(top, "waterlogged"), Some("false"));
+        assert_eq!(r.state(top).block, slab.id);
     }
 }

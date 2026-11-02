@@ -103,7 +103,8 @@ public class Extract {
                 .append(faceFlags(state)).append(',')
                 .append(outlineIndex).append(',')
                 .append(Float.toString(state.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO))).append(',')
-                .append(interactionIndex)
+                .append(interactionIndex).append(',')
+                .append(state.canBeReplaced() ? 1 : 0)
                 .append("]");
         }
 
@@ -117,6 +118,7 @@ public class Extract {
                 .append(",\"jump_factor\":").append(Float.toString(block.getJumpFactor()))
                 .append(",\"bounce\":").append(Float.toString(block.getBounceRestitution()))
                 .append(",\"dynamic_shape\":").append(block.hasDynamicShape())
+                .append(",\"default_state\":").append(Block.getId(block.defaultBlockState()))
                 .append("}");
         }
 
@@ -182,6 +184,39 @@ public class Extract {
             // packet; items by ID in item stacks.
             w.write("\"command_argument_types\":" + names(BuiltInRegistries.COMMAND_ARGUMENT_TYPE) + ",\n");
             w.write("\"items\":" + names(BuiltInRegistries.ITEM) + ",\n");
+            // A block item places exactly one block: -1 means not a BlockItem.
+            // Item and block names usually match, but not always (redstone,
+            // seeds, ...), so this mapping cannot be derived from names.
+            StringBuilder itemBlocks = new StringBuilder("[");
+            StringBuilder itemWallBlocks = new StringBuilder("[");
+            StringBuilder itemWallDirections = new StringBuilder("[");
+            Field wallBlockField = net.minecraft.world.item.StandingAndWallBlockItem.class.getDeclaredField("wallBlock");
+            wallBlockField.setAccessible(true);
+            Field attachmentDirectionField = net.minecraft.world.item.StandingAndWallBlockItem.class.getDeclaredField("attachmentDirection");
+            attachmentDirectionField.setAccessible(true);
+            for (int i = 0; i < BuiltInRegistries.ITEM.size(); i++) {
+                net.minecraft.world.item.Item item = BuiltInRegistries.ITEM.byId(i);
+                if (i > 0) {
+                    itemBlocks.append(',');
+                    itemWallBlocks.append(',');
+                    itemWallDirections.append(',');
+                }
+                itemBlocks.append(item instanceof net.minecraft.world.item.BlockItem blockItem
+                    ? BuiltInRegistries.BLOCK.getId(blockItem.getBlock())
+                    : -1);
+                if (item instanceof net.minecraft.world.item.StandingAndWallBlockItem standingAndWall) {
+                    Block wallBlock = (Block) wallBlockField.get(standingAndWall);
+                    Direction attachmentDirection = (Direction) attachmentDirectionField.get(standingAndWall);
+                    itemWallBlocks.append(BuiltInRegistries.BLOCK.getId(wallBlock));
+                    itemWallDirections.append(attachmentDirection.get3DDataValue());
+                } else {
+                    itemWallBlocks.append(-1);
+                    itemWallDirections.append(-1);
+                }
+            }
+            w.write("\"item_blocks\":" + itemBlocks + "],\n");
+            w.write("\"item_wall_blocks\":" + itemWallBlocks + "],\n");
+            w.write("\"item_wall_directions\":" + itemWallDirections + "],\n");
             w.write("\"shapes\":[\n" + String.join(",\n", shapes) + "],\n");
             w.write("\"blocks\":[\n" + blocks + "],\n");
             w.write("\"states\":[\n" + states + "]}\n");
@@ -241,17 +276,26 @@ public class Extract {
     /**
      * Bits 0-3: isFaceSturdy for north, east, south, west (fluid flow uses
      * it). Bit 4: the block is an IceBlock. Bit 5: full-cube collision.
-     * Bit 6: requiresCorrectToolForDrops.
+     * Bit 6: requiresCorrectToolForDrops. Bit 7: sturdy up. Bit 8: sturdy
+     * down (placement support checks). Bit 9: isSolid. Bits 10-13:
+     * SupportType.CENTER for north, east, south, west. Bit 14-15: center
+     * support up/down.
      */
     private static int faceFlags(BlockState state) {
         int flags = 0;
         Direction[] horizontal = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
         for (int i = 0; i < 4; i++) {
             if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, horizontal[i])) flags |= 1 << i;
+            if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, horizontal[i], net.minecraft.world.level.block.SupportType.CENTER)) flags |= 1 << (10 + i);
         }
         if (state.getBlock() instanceof net.minecraft.world.level.block.IceBlock) flags |= 16;
         if (state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) flags |= 32;
         if (state.requiresCorrectToolForDrops()) flags |= 64;
+        if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.UP)) flags |= 128;
+        if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.DOWN)) flags |= 256;
+        if (state.isSolid()) flags |= 512;
+        if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.UP, net.minecraft.world.level.block.SupportType.CENTER)) flags |= 1 << 14;
+        if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.DOWN, net.minecraft.world.level.block.SupportType.CENTER)) flags |= 1 << 15;
         return flags;
     }
 

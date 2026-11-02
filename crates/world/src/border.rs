@@ -207,6 +207,13 @@ impl WorldBorder {
         )
     }
 
+    /// Whether the infinite collision shape outside the block-aligned border
+    /// overlaps `bbox` (`Shapes.joinIsNotEmpty`, `BooleanOp.AND`).
+    pub fn collision_shape_intersects(&self, bbox: &Aabb) -> bool {
+        let (west, north, east, south) = self.collision_bounds();
+        bbox.min_x < west || bbox.max_x > east || bbox.min_z < north || bbox.max_z > south
+    }
+
     /// Collide `moving` along `axis` with the part of the world outside the
     /// border. This is the axis step of `Shapes.collide` against
     /// `Shapes.join(INFINITY, box, ONLY_FIRST)`.
@@ -288,6 +295,14 @@ mod tests {
         assert_eq!(border.min_x(), -29_999_984.0);
         assert_eq!(border.max_x(), 29_999_984.0);
         assert_eq!(border.warning_time(), 15);
+    }
+
+    #[test]
+    fn collision_shape_is_everything_outside_the_block_aligned_bounds() {
+        let mut border = WorldBorder::default();
+        border.set_size(10.0);
+        assert!(!border.collision_shape_intersects(&Aabb::new(-5.0, 0.0, -5.0, 5.0, 2.0, 5.0)));
+        assert!(border.collision_shape_intersects(&Aabb::new(4.8, 0.0, -0.3, 5.1, 2.0, 0.3)));
     }
 
     #[test]

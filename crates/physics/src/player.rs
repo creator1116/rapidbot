@@ -69,9 +69,12 @@ impl Pose {
     }
 }
 
-/// `EntityDimensions.makeBoundingBox`: half width computed in float.
-fn make_bounding_box(pose: Pose, pos: Vec3) -> Aabb {
+/// `EntityDimensions.scale` then `makeBoundingBox`: dimensions and half width
+/// are computed in float.
+fn make_bounding_box(pose: Pose, pos: Vec3, scale: f32) -> Aabb {
     let (width, height) = pose.dimensions();
+    let width = width * scale;
+    let height = height * scale;
     let w = (width / 2.0) as f64;
     let h = height as f64;
     Aabb::new(pos.x - w, pos.y, pos.z - w, pos.x + w, pos.y + h, pos.z + w)
@@ -218,6 +221,10 @@ pub struct Player {
     /// `stuckSpeedMultiplier`: set by a cobweb (or the like) this tick,
     /// applied to the next move.
     stuck_speed_multiplier: Vec3,
+    /// `isInPowderSnow` and `wasInPowderSnow`. The latter enables vanilla's
+    /// leather-boots climb-out movement on the following tick.
+    is_in_powder_snow: bool,
+    was_in_powder_snow: bool,
     /// `movementThisTick`: from, to and the requested delta of each move.
     movements: Vec<(Vec3, Vec3, Option<Vec3>)>,
     /// `oldPosition()`: where this tick started.
@@ -243,7 +250,7 @@ impl Player {
             delta_movement: Vec3::ZERO,
             y_rot: -180.0,
             x_rot: 0.0,
-            bb: make_bounding_box(Pose::Standing, pos),
+            bb: make_bounding_box(Pose::Standing, pos, 1.0),
             on_ground: false,
             horizontal_collision: false,
             vertical_collision: false,
@@ -288,6 +295,8 @@ impl Player {
             abilities_changed: false,
             first_tick: true,
             stuck_speed_multiplier: Vec3::ZERO,
+            is_in_powder_snow: false,
+            was_in_powder_snow: false,
             movements: Vec::new(),
             old_pos: Vec3::ZERO,
             fast_lava: false,
@@ -303,15 +312,50 @@ impl Player {
     /// `Entity.setPos`: moves and rebuilds the bounding box.
     pub fn set_pos(&mut self, pos: Vec3) {
         self.pos = pos;
-        self.bb = make_bounding_box(self.pose, pos);
+        self.refresh_dimensions();
+    }
+
+    /// Position a passenger from its server-driven vehicle without running
+    /// vehicle physics. `Player.tick` clears ground support while mounted.
+    pub fn set_riding_pos(&mut self, pos: Vec3) {
+        self.set_pos(pos);
+        self.on_ground = false;
+        self.on_ground_no_blocks = false;
+        self.main_supporting_block = None;
     }
 
     pub fn eye_position(&self) -> Vec3 {
         Vec3::new(
             self.pos.x,
-            self.pos.y + self.pose.eye_height() as f64,
+            self.pos.y + self.eye_height() as f64,
             self.pos.z,
         )
+    }
+
+    fn scale(&self) -> f32 {
+        self.attributes.value(attributes::SCALE) as f32
+    }
+
+    fn eye_height(&self) -> f32 {
+        self.pose.eye_height() * self.scale()
+    }
+
+    /// `LivingEntity.onAttributeUpdated(SCALE)` → `refreshDimensions`.
+    pub fn apply_attribute_snapshot(
+        &mut self,
+        name: &str,
+        base: f64,
+        modifiers: &[(String, f64, Operation)],
+    ) {
+        self.attributes.apply_snapshot(name, base, modifiers);
+        if name == attributes::SCALE {
+            self.refresh_dimensions();
+        }
+    }
+
+    /// Rebuild the current pose's box after an attribute or respawn update.
+    pub fn refresh_dimensions(&mut self) {
+        self.bb = make_bounding_box(self.pose, self.pos, self.scale());
     }
 
     /// `Entity.turn(xo, yo)`: what `MouseHandler.turnPlayer` calls with the
@@ -383,7 +427,7 @@ impl Player {
     /// the end of the next tick.
     pub fn apply_synced_pose(&mut self, pose: Pose) {
         self.pose = pose;
-        self.bb = make_bounding_box(pose, self.pos);
+        self.refresh_dimensions();
     }
 
     /// Our own `DATA_LIVING_ENTITY_FLAGS` arriving from the server
@@ -478,6 +522,8 @@ impl Player {
 
     /// `Entity.baseTick`: fluid state for this tick, currents, swimming.
     fn base_tick(&mut self, ctx: &Ctx<'_>) {
+        self.was_in_powder_snow = self.is_in_powder_snow;
+        self.is_in_powder_snow = false;
         self.was_eye_in_water = self.eye_in_water;
         self.update_fluid_interaction(ctx);
         // Player.updateSwimming → Entity.updateSwimming
@@ -523,7 +569,7 @@ impl Player {
         if loaded {
             let entity_y = self.bb.min_y;
             let (eye_x, eye_z) = (math::floor(self.pos.x), math::floor(self.pos.z));
-            let eye_y = self.pos.y + self.pose.eye_height() as f64;
+            let eye_y = self.pos.y + self.eye_height() as f64;
             for x in x0..=x1 {
                 for y in y0..=y1 {
                     for z in z0..=z1 {
@@ -568,18 +614,21 @@ impl Player {
             self.fall_distance = 0.0;
         }
         self.in_water = in_water;
-        if in_water {
-            self.apply_current(currents[0], 0.014);
-        }
-        if self.lava_height > 0.0 {
-            self.apply_current(
-                currents[1],
-                if self.fast_lava {
-                    0.007
-                } else {
-                    0.0023333333333333335
-                },
-            );
+        // Player.isPushedByFluid is false while creative flight is active.
+        if !self.abilities.flying {
+            if in_water {
+                self.apply_current(currents[0], 0.014);
+            }
+            if self.lava_height > 0.0 {
+                self.apply_current(
+                    currents[1],
+                    if self.fast_lava {
+                        0.007
+                    } else {
+                        0.0023333333333333335
+                    },
+                );
+            }
         }
     }
 
@@ -632,15 +681,10 @@ impl Player {
     /// `LocalPlayer.tick` → `Player.tick` → `LivingEntity.tick`, movement
     /// parts, for a player whose client has loaded.
     pub fn tick(&mut self, world: &World, tags: &Tags) {
-        self.world_border.tick();
         let ctx = Ctx {
             world,
             registry: Registry::get(),
             tags,
-            entity_bottom: self.pos.y,
-            descending: self.held_keys.shift,
-            fall_distance: self.fall_distance,
-            can_walk_on_powder_snow: self.has_leather_boots,
             world_border: self.world_border,
             entity_colliders: self.entity_colliders.clone(),
         };
@@ -662,6 +706,13 @@ impl Player {
             self.set_pos(Vec3::new(nx, self.pos.y, nz));
         }
         self.update_player_pose(&ctx);
+    }
+
+    /// The input part of `LocalPlayer.aiStep` that still runs for a
+    /// passenger. Vehicle movement remains server-driven.
+    pub fn tick_riding_input(&mut self) {
+        self.crouching = false;
+        self.tick_input();
     }
 
     /// `LocalPlayer.suffocatesAt`: a suffocating full block overlapping the
@@ -754,19 +805,7 @@ impl Player {
             && (self.is_shift_key_down() || !self.can_fit(ctx, Pose::Standing));
 
         // KeyboardInput.tick
-        self.key_presses = self.held_keys;
-        let impulse = |pos: bool, neg: bool| {
-            if pos == neg {
-                0.0
-            } else if pos {
-                1.0
-            } else {
-                -1.0f32
-            }
-        };
-        let forward = impulse(self.key_presses.forward, self.key_presses.backward);
-        let left = impulse(self.key_presses.left, self.key_presses.right);
-        self.move_vector = vec2_normalized(left, forward);
+        self.tick_input();
 
         // A spectator has noPhysics; otherwise walk out of blocks that
         // suffocate the player.
@@ -877,6 +916,22 @@ impl Player {
         }
     }
 
+    fn tick_input(&mut self) {
+        self.key_presses = self.held_keys;
+        let impulse = |pos: bool, neg: bool| {
+            if pos == neg {
+                0.0
+            } else if pos {
+                1.0
+            } else {
+                -1.0f32
+            }
+        };
+        let forward = impulse(self.key_presses.forward, self.key_presses.backward);
+        let left = impulse(self.key_presses.left, self.key_presses.right);
+        self.move_vector = vec2_normalized(left, forward);
+    }
+
     /// `LocalPlayer.isSprintingPossible`.
     fn is_sprinting_possible(&self, allowed_in_shallow_water: bool) -> bool {
         // !isMobilityRestricted() (blindness) && hasEnoughFood && ...
@@ -960,7 +1015,7 @@ impl Player {
             };
             let in_water_with_height = self.in_water && fluid_height > 0.0;
             // getFluidJumpThreshold
-            let threshold = if (self.pose.eye_height() as f64) < 0.4 {
+            let threshold = if (self.eye_height() as f64) < 0.4 {
                 0.0
             } else {
                 0.4
@@ -989,12 +1044,22 @@ impl Player {
             self.no_jump_delay = 0;
         }
 
+        // LivingEntity.updateFallFlying → Entity.checkFallDistanceAccumulation.
+        if self.fall_flying {
+            self.check_fall_distance_accumulation();
+        }
         let input = Vec3::new(self.xxa as f64, 0.0, self.zza as f64);
         if self.effects.slow_falling || self.effects.levitation.is_some() {
             self.fall_distance = 0.0;
         }
         self.travel(ctx, input);
         self.apply_effects_from_blocks(ctx);
+    }
+
+    fn check_fall_distance_accumulation(&mut self) {
+        if self.delta_movement.y > -0.5 && self.fall_distance > 1.0 {
+            self.fall_distance = 1.0;
+        }
     }
 
     /// `Entity.applyEffectsFromBlocks`: the block stood on, then every
@@ -1073,7 +1138,8 @@ impl Player {
         visited: &mut Vec<(i32, i32, i32)>,
     ) {
         let shrink = 1.0e-5f32 as f64;
-        let at_target = make_bounding_box(self.pose, to).deflate(shrink, shrink, shrink);
+        let at_target =
+            make_bounding_box(self.pose, to, self.scale()).deflate(shrink, shrink, shrink);
         let travel = to.plus(from.scale(-1.0));
         let moved_far = travel.length_sqr() > 0.9999900000002526 * 0.9999900000002526;
         let hull = if travel.length_sqr() < (1.0e-5f32 as f64) * (1.0e-5f32 as f64) {
@@ -1144,6 +1210,9 @@ impl Player {
             }
             // PowderSnowBlock: only once the feet are in it.
             "minecraft:powder_snow" => {
+                // InsideBlockEffectType.FREEZE, applied for every player that
+                // intersects the block (freezing damage itself is server-side).
+                self.is_in_powder_snow = true;
                 if ctx.block_at(self.block_position()).name == "minecraft:powder_snow" {
                     self.make_stuck_in_block(Vec3::new(0.9f32 as f64, 1.5, 0.9f32 as f64));
                 }
@@ -1151,7 +1220,7 @@ impl Player {
             // HoneyBlock: sliding down its side.
             "minecraft:honey_block" => {
                 let old_delta_y = self.delta_movement.y / 0.98f32 as f64 + 0.08;
-                let overlap = 0.4375 + (0.6f32 / 2.0f32) as f64;
+                let overlap = 0.4375 + (self.bb.get_xsize() as f32 / 2.0f32) as f64;
                 let dx = (pos.0 as f64 + 0.5 - self.pos.x).abs();
                 let dz = (pos.2 as f64 + 0.5 - self.pos.z).abs();
                 let sliding = !self.on_ground
@@ -1333,7 +1402,7 @@ impl Player {
             self.move_relative(0.02, input);
             self.move_self(ctx, self.delta_movement);
             // isInShallowFluid(LAVA)
-            let threshold = if (self.pose.eye_height() as f64) < 0.4 {
+            let threshold = if (self.eye_height() as f64) < 0.4 {
                 0.0
             } else {
                 0.4
@@ -1357,7 +1426,7 @@ impl Player {
             let moved = self
                 .bb
                 .move_by(m.x, m.y + 0.6f32 as f64 - self.pos.y + old_y, m.z);
-            if ctx.no_collision(&moved) && !fluid::contains_any_liquid(ctx.world, &moved) {
+            if self.no_collision(ctx, &moved) && !fluid::contains_any_liquid(ctx.world, &moved) {
                 self.delta_movement = Vec3::new(m.x, 0.3f32 as f64, m.z);
             }
         }
@@ -1472,7 +1541,9 @@ impl Player {
         }
         self.move_self(ctx, self.delta_movement);
         let mut movement = self.delta_movement;
-        if (self.horizontal_collision || self.jumping) && self.on_climbable(ctx) {
+        if (self.horizontal_collision || self.jumping)
+            && (self.on_climbable(ctx) || self.was_in_powder_snow && self.has_leather_boots)
+        {
             movement = Vec3::new(movement.x, 0.2, movement.z);
         }
 
@@ -1558,6 +1629,35 @@ impl Player {
             movement.z * cos + movement.x * sin,
         );
         self.delta_movement = self.delta_movement.plus(delta);
+    }
+
+    fn entity_collision_context(&self) -> EntityCollisionContext {
+        EntityCollisionContext {
+            entity_bottom: Some(self.pos.y),
+            descending: self.is_shift_key_down(),
+            fall_distance: self.fall_distance,
+            can_walk_on_powder_snow: self.has_leather_boots,
+        }
+    }
+
+    fn colliders(&self, ctx: &Ctx<'_>, bbox: &Aabb) -> Vec<PlacedShape<'static>> {
+        block_collisions_with(
+            ctx.world,
+            ctx.registry,
+            bbox,
+            self.entity_collision_context(),
+        )
+    }
+
+    /// `CollisionGetter.noCollision(entity, bbox)`: blocks, entities and the
+    /// world border, using the entity's state at the time of the query.
+    fn no_collision(&self, ctx: &Ctx<'_>, bbox: &Aabb) -> bool {
+        self.colliders(ctx, bbox).is_empty()
+            && !ctx.entity_colliders.iter().any(|b| b.intersects_aabb(bbox))
+            && !(ctx
+                .world_border
+                .is_inside_close_to_border(self.pos.x, self.pos.z, bbox)
+                && ctx.world_border.collision_shape_intersects(bbox))
     }
 
     /// `Entity.move(MoverType.SELF, delta)` via `LocalPlayer.move`.
@@ -1660,8 +1760,13 @@ impl Player {
         z_collision: bool,
         movement: Vec3,
     ) {
-        // Players have no entity bounciness; sneaking suppresses bounce.
-        let mut restitution = 0.0f64;
+        // `LivingEntity.getEntityBounciness` reads the BOUNCINESS attribute;
+        // sneaking suppresses the bounce (`isSuppressingBounce`).
+        let mut restitution = if self.is_shift_key_down() {
+            0.0
+        } else {
+            self.attributes.value(attributes::BOUNCINESS)
+        };
         let current = self.delta_movement;
         let mut after = current;
         if x_collision {
@@ -1781,7 +1886,7 @@ impl Player {
             b.min_y,
             b.max_z - 1.0e-7 + dz,
         );
-        ctx.no_collision(&area)
+        self.no_collision(ctx, &area)
     }
 
     fn max_up_step(&self) -> f32 {
@@ -1798,7 +1903,7 @@ impl Player {
             let expanded = aabb.expand_towards(movement.x, movement.y, movement.z);
             let search = expanded.expand_towards(0.0, max_up_step as f64, 0.0);
             let boxes = ctx.entity_boxes(&search);
-            let colliders = ctx.colliders(&expanded);
+            let colliders = self.colliders(ctx, &expanded);
             let border = ctx
                 .world_border
                 .is_inside_close_to_border(self.pos.x, self.pos.z, &expanded)
@@ -1823,7 +1928,7 @@ impl Player {
             if !on_ground_after_collision {
                 step_up = step_up.expand_towards(0.0, -1.0e-5f32 as f64, 0.0);
             }
-            let colliders = ctx.colliders(&step_up);
+            let colliders = self.colliders(ctx, &step_up);
             let boxes = ctx.entity_boxes(&step_up);
             let step_height_to_skip = movement_step.y as f32;
             for candidate in collect_candidate_step_up_heights(
@@ -1833,12 +1938,16 @@ impl Player {
                 max_up_step,
                 step_height_to_skip,
             ) {
+                let border = ctx
+                    .world_border
+                    .is_inside_close_to_border(self.pos.x, self.pos.z, &step_up)
+                    .then_some(&ctx.world_border);
                 let step = collide_with_shapes(
                     Vec3::new(movement.x, candidate as f64, movement.z),
                     &grounded,
                     &colliders,
                     &boxes,
-                    None,
+                    border,
                 );
                 if step.horizontal_distance_sqr() > movement_step.horizontal_distance_sqr() {
                     let distance_to_ground = aabb.min_y - grounded.min_y;
@@ -1878,12 +1987,11 @@ impl Player {
                 b.min_y,
                 b.max_z,
             );
-            let mut supporting = ctx.find_supporting_block(self.pos, &test_area);
+            let mut supporting = self.find_supporting_block(ctx, &test_area);
             if supporting.is_some() || self.on_ground_no_blocks {
                 self.main_supporting_block = supporting;
             } else if let Some(m) = movement {
-                supporting =
-                    ctx.find_supporting_block(self.pos, &test_area.move_by(-m.x, 0.0, -m.z));
+                supporting = self.find_supporting_block(ctx, &test_area.move_by(-m.x, 0.0, -m.z));
                 self.main_supporting_block = supporting;
             }
             self.on_ground_no_blocks = supporting.is_none();
@@ -1930,6 +2038,32 @@ impl Player {
         self.on_pos(ctx, 0.500001)
     }
 
+    /// `CollisionGetter.findSupportingBlock`: the nearest colliding block
+    /// (by distance to its centre), ties broken by `BlockPos.compareTo`.
+    fn find_supporting_block(&self, ctx: &Ctx<'_>, bbox: &Aabb) -> Option<(i32, i32, i32)> {
+        let mut main: Option<(i32, i32, i32)> = None;
+        let mut main_distance = f64::MAX;
+        for shape in self.colliders(ctx, bbox) {
+            let pos = (
+                shape.offset[0] as i32,
+                shape.offset[1] as i32,
+                shape.offset[2] as i32,
+            );
+            let dx = pos.0 as f64 + 0.5 - self.pos.x;
+            let dy = pos.1 as f64 + 0.5 - self.pos.y;
+            let dz = pos.2 as f64 + 0.5 - self.pos.z;
+            let distance = dx * dx + dy * dy + dz * dz;
+            if distance < main_distance
+                || distance == main_distance
+                    && main.is_none_or(|m| compare_block_pos(m, pos).is_lt())
+            {
+                main = Some(pos);
+                main_distance = distance;
+            }
+        }
+        main
+    }
+
     fn block_position(&self) -> (i32, i32, i32) {
         (
             math::floor(self.pos.x),
@@ -1971,7 +2105,10 @@ impl Player {
 
     /// `Player.canPlayerFitWithinBlocksAndEntitiesWhen`.
     fn can_fit(&self, ctx: &Ctx<'_>, pose: Pose) -> bool {
-        ctx.no_collision(&make_bounding_box(pose, self.pos).deflate(1.0e-7, 1.0e-7, 1.0e-7))
+        self.no_collision(
+            ctx,
+            &make_bounding_box(pose, self.pos, self.scale()).deflate(1.0e-7, 1.0e-7, 1.0e-7),
+        )
     }
 
     /// `Player.updatePlayerPose`.
@@ -1999,7 +2136,7 @@ impl Player {
         if pose != self.pose {
             self.pose = pose;
             // refreshDimensions → reapplyPosition
-            self.bb = make_bounding_box(pose, self.pos);
+            self.refresh_dimensions();
         }
     }
 }
@@ -2015,37 +2152,11 @@ pub struct Ctx<'a> {
     pub world: &'a World,
     pub registry: &'static Registry,
     pub tags: &'a Tags,
-    entity_bottom: f64,
-    descending: bool,
-    fall_distance: f64,
-    can_walk_on_powder_snow: bool,
     world_border: WorldBorder,
     entity_colliders: Vec<Aabb>,
 }
 
 impl Ctx<'_> {
-    fn colliders(&self, bbox: &Aabb) -> Vec<PlacedShape<'static>> {
-        block_collisions_with(
-            self.world,
-            self.registry,
-            bbox,
-            EntityCollisionContext {
-                entity_bottom: Some(self.entity_bottom),
-                descending: self.descending,
-                fall_distance: self.fall_distance,
-                can_walk_on_powder_snow: self.can_walk_on_powder_snow,
-            },
-        )
-    }
-
-    fn no_collision(&self, bbox: &Aabb) -> bool {
-        self.colliders(bbox).is_empty()
-            && !self
-                .entity_colliders
-                .iter()
-                .any(|b| b.intersects_aabb(bbox))
-    }
-
     fn entity_boxes(&self, bbox: &Aabb) -> Vec<Aabb> {
         self.entity_colliders
             .iter()
@@ -2057,32 +2168,6 @@ impl Ctx<'_> {
     fn block_at(&self, pos: (i32, i32, i32)) -> &'static rapidbot_world::registry::BlockInfo {
         self.registry
             .block_of(self.world.block_state_or_air(pos.0, pos.1, pos.2))
-    }
-
-    /// `CollisionGetter.findSupportingBlock`: the nearest colliding block
-    /// (by distance to its centre), ties broken by `BlockPos.compareTo`.
-    fn find_supporting_block(&self, entity_pos: Vec3, bbox: &Aabb) -> Option<(i32, i32, i32)> {
-        let mut main: Option<(i32, i32, i32)> = None;
-        let mut main_distance = f64::MAX;
-        for shape in self.colliders(bbox) {
-            let pos = (
-                shape.offset[0] as i32,
-                shape.offset[1] as i32,
-                shape.offset[2] as i32,
-            );
-            let dx = pos.0 as f64 + 0.5 - entity_pos.x;
-            let dy = pos.1 as f64 + 0.5 - entity_pos.y;
-            let dz = pos.2 as f64 + 0.5 - entity_pos.z;
-            let distance = dx * dx + dy * dy + dz * dz;
-            if distance < main_distance
-                || distance == main_distance
-                    && main.is_none_or(|m| compare_block_pos(m, pos).is_lt())
-            {
-                main = Some(pos);
-                main_distance = distance;
-            }
-        }
-        main
     }
 }
 
@@ -2288,5 +2373,46 @@ mod tests {
         assert!((movement.x - 0.1).abs() < 1e-9);
         assert!((movement.y - 0.2).abs() < 1e-9);
         assert!((movement.z - 1.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gliding_caps_accumulated_fall_distance_when_not_falling_fast() {
+        let mut player = Player::new();
+        player.fall_distance = 6.0;
+        player.delta_movement.y = -0.4;
+        player.check_fall_distance_accumulation();
+        assert_eq!(player.fall_distance, 1.0);
+
+        player.fall_distance = 6.0;
+        player.delta_movement.y = -0.5;
+        player.check_fall_distance_accumulation();
+        assert_eq!(player.fall_distance, 6.0);
+    }
+
+    #[test]
+    fn passenger_input_advances_without_moving_the_player() {
+        let mut player = Player::new();
+        player.set_pos(Vec3::new(2.0, 70.0, 3.0));
+        player.held_keys = Keys {
+            forward: true,
+            jump: true,
+            ..Keys::default()
+        };
+        player.tick_riding_input();
+        assert!(player.key_presses.forward);
+        assert!(player.key_presses.jump);
+        assert_eq!(player.pos, Vec3::new(2.0, 70.0, 3.0));
+    }
+
+    #[test]
+    fn scale_attribute_resizes_the_box_and_eye_height() {
+        let mut player = Player::new();
+        player.set_pos(Vec3::new(2.0, 70.0, 3.0));
+        player.apply_attribute_snapshot(attributes::SCALE, 2.0, &[]);
+
+        let bb = player.bounding_box();
+        assert!((bb.get_xsize() - 1.2f32 as f64).abs() < 1e-12);
+        assert!((bb.max_y - bb.min_y - 3.6f32 as f64).abs() < 1e-12);
+        assert!((player.eye_position().y - (70.0 + 3.24f32 as f64)).abs() < 1e-12);
     }
 }

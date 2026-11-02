@@ -1,7 +1,7 @@
 //! Movement against entity colliders, the world border and scaffolding.
 
 use rapidbot_physics::math::Vec3;
-use rapidbot_physics::{Keys, Player};
+use rapidbot_physics::{Keys, Player, Pose};
 use rapidbot_world::chunk::Chunk;
 use rapidbot_world::tags::Tags;
 use rapidbot_world::{Aabb, DimensionHeight, Registry, World};
@@ -26,6 +26,16 @@ fn flat_world() -> World {
                     world.set_block_state(cx * 16 + x, 63, cz * 16 + z, stone);
                 }
             }
+        }
+    }
+    world
+}
+
+fn empty_world() -> World {
+    let mut world = World::new(DimensionHeight::OVERWORLD);
+    for cx in -1..=1 {
+        for cz in -1..=1 {
+            world.insert_chunk(cx, cz, Chunk::empty(24));
         }
     }
     world
@@ -88,4 +98,56 @@ fn scaffolding_is_solid_from_above() {
     }
     assert!(player.on_ground);
     assert!((player.pos.y - 65.0).abs() < 1.0e-6, "y = {}", player.pos.y);
+}
+
+#[test]
+fn collision_context_uses_fall_distance_after_effects_reset_it() {
+    let mut world = empty_world();
+    world.set_block_state(0, 63, 0, state("minecraft:powder_snow", ""));
+    let tags = Tags::default();
+    let mut player = player_at(0.5, 64.0, 0.5);
+    player.delta_movement.y = -0.2;
+    player.fall_distance = 3.0;
+    player.effects.slow_falling = true;
+
+    player.tick(&world, &tags);
+
+    // Slow falling reset fallDistance before collision lookup. Powder snow
+    // therefore has no 0.9-block falling shape and the player passes through.
+    assert!(player.pos.y < 63.9, "y = {}", player.pos.y);
+}
+
+#[test]
+fn leather_boots_climb_out_of_powder_snow_on_jump() {
+    let mut world = empty_world();
+    world.set_block_state(0, 64, 0, state("minecraft:powder_snow", ""));
+    let tags = Tags::default();
+    let mut player = player_at(0.5, 64.2, 0.5);
+    player.has_leather_boots = true;
+
+    // The first inside-block pass sets isInPowderSnow for the following tick.
+    player.tick(&world, &tags);
+    player.held_keys.jump = true;
+    player.tick(&world, &tags);
+
+    assert!(
+        player.delta_movement.y > 0.11,
+        "vy = {}",
+        player.delta_movement.y
+    );
+}
+
+#[test]
+fn world_border_participates_in_pose_collision_checks() {
+    let world = flat_world();
+    let tags = Tags::default();
+    let mut player = player_at(4.8, 64.0, 0.5);
+    player.apply_synced_pose(Pose::Crouching);
+    player.world_border.set_size(10.0);
+
+    player.tick(&world, &tags);
+
+    // The player was teleported partly into the border collision shape. As in
+    // CollisionGetter.noCollision, no pose is considered to fit there.
+    assert_eq!(player.pose, Pose::Crouching);
 }

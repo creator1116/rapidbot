@@ -621,7 +621,7 @@ impl Game {
                                 ))
                             })
                             .collect();
-                        play.player.physics.attributes.apply_snapshot(
+                        play.player.physics.apply_attribute_snapshot(
                             &info.name,
                             snapshot.base,
                             &modifiers,

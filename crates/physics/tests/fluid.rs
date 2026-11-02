@@ -185,6 +185,23 @@ fn current_pushes_the_player() {
 }
 
 #[test]
+fn creative_flight_is_not_pushed_by_currents() {
+    let mut world = flat_world();
+    for x in 0..8 {
+        world.set_block_state(x, 64, 0, state("minecraft:water", &format!("level={x}")));
+    }
+    let tags = Tags::default();
+    let mut p = player_at(3.5, 64.2, 0.5);
+    p.abilities.flying = true;
+    p.abilities.may_fly = true;
+
+    p.tick(&world, &tags);
+
+    assert_eq!(p.pos.x, 3.5);
+    assert_eq!(p.delta_movement.x, 0.0);
+}
+
+#[test]
 fn lava_is_thick() {
     let world = pool("minecraft:lava", 70);
     let tags = Tags::default();

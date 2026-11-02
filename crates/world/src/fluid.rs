@@ -30,7 +30,7 @@ impl Fluid {
 
 /// North, east, south, west: `Direction.Plane.HORIZONTAL` order, with the
 /// bit each has in `StateInfo::face_flags`.
-const HORIZONTAL: [(i32, i32, u8); 4] = [(0, -1, 1), (1, 0, 2), (0, 1, 4), (-1, 0, 8)];
+const HORIZONTAL: [(i32, i32, u16); 4] = [(0, -1, 1), (1, 0, 2), (0, 1, 4), (-1, 0, 8)];
 
 /// The fluid at a block (`BlockState.getFluidState`), `None` if empty or
 /// the chunk is not loaded.
@@ -84,7 +84,7 @@ fn normalize(v: [f64; 3]) -> [f64; 3] {
 }
 
 /// `FlowingFluid.isSolidFace`.
-fn is_solid_face(world: &World, kind: FluidKind, x: i32, y: i32, z: i32, face_bit: u8) -> bool {
+fn is_solid_face(world: &World, kind: FluidKind, x: i32, y: i32, z: i32, face_bit: u16) -> bool {
     if fluid_at(world, x, y, z).is_some_and(|f| f.kind == kind) {
         return false;
     }

@@ -91,6 +91,51 @@ impl Shape {
         self.is_full(x, y, z)
     }
 
+    /// `Block.isFaceFull(shape, direction)`: the shape's face slice is the
+    /// full unit square. Slices are always a full cell thick, so only the
+    /// two perpendicular axes need to be checked.
+    pub fn is_face_full(&self, axis: Axis, positive: bool) -> bool {
+        let a = axis.index();
+        let (b, c) = axis.cycle();
+        let a_size = self.size(axis);
+        if a_size == 0 {
+            return false;
+        }
+        let layer = if positive { a_size - 1 } else { 0 };
+        let a_coords = &self.coords[a];
+        if self.first_full[a] == usize::MAX
+            || (positive
+                && (self.last_full[a] != a_size - 1
+                    || (a_coords[a_size] - 1.0).abs() > f64::EPSILON))
+            || (!positive && (self.first_full[a] != 0 || a_coords[0].abs() > f64::EPSILON))
+        {
+            return false;
+        }
+        for axis in [b, c] {
+            let size = self.size(axis);
+            let coords = &self.coords[axis.index()];
+            if self.first_full[axis.index()] != 0
+                || self.last_full[axis.index()] != size - 1
+                || coords[0].abs() > f64::EPSILON
+                || (coords[size] - 1.0).abs() > f64::EPSILON
+            {
+                return false;
+            }
+        }
+        for bi in 0..self.size(b) {
+            for ci in 0..self.size(c) {
+                let mut xyz = [0usize; 3];
+                xyz[a] = layer;
+                xyz[b.index()] = bi;
+                xyz[c.index()] = ci;
+                if !self.is_full(xyz[0], xyz[1], xyz[2]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Whether a point, relative to the block's corner, is in a filled
     /// cell (`findIndex` on each axis, then `isFullWide`).
     pub(crate) fn contains_point(&self, p: [f64; 3]) -> bool {

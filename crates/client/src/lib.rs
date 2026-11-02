@@ -22,6 +22,7 @@ pub mod nav;
 mod net;
 mod packs;
 pub mod path;
+mod placement;
 mod proxy;
 pub mod status;
 pub mod text;

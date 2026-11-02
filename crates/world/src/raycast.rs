@@ -31,6 +31,10 @@ impl Direction {
         Direction::East,
     ];
 
+    pub fn from_ordinal(value: i32) -> Option<Direction> {
+        Direction::VALUES.get(usize::try_from(value).ok()?).copied()
+    }
+
     pub fn normal(self) -> (i32, i32, i32) {
         match self {
             Direction::Down => (0, -1, 0),
@@ -50,6 +54,40 @@ impl Direction {
             Direction::South => Direction::North,
             Direction::West => Direction::East,
             Direction::East => Direction::West,
+        }
+    }
+
+    pub fn axis(self) -> Axis {
+        match self {
+            Direction::Down | Direction::Up => Axis::Y,
+            Direction::North | Direction::South => Axis::Z,
+            Direction::West | Direction::East => Axis::X,
+        }
+    }
+
+    pub fn is_horizontal(self) -> bool {
+        self.axis() != Axis::Y
+    }
+
+    /// `Direction.getClockWise` (horizontal directions only).
+    pub fn clockwise(self) -> Direction {
+        match self {
+            Direction::North => Direction::East,
+            Direction::East => Direction::South,
+            Direction::South => Direction::West,
+            Direction::West => Direction::North,
+            _ => self,
+        }
+    }
+
+    /// `Direction.getCounterClockWise` (horizontal directions only).
+    pub fn counter_clockwise(self) -> Direction {
+        match self {
+            Direction::North => Direction::West,
+            Direction::West => Direction::South,
+            Direction::South => Direction::East,
+            Direction::East => Direction::North,
+            _ => self,
         }
     }
 

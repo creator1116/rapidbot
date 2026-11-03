@@ -8,6 +8,7 @@
 import java.io.FileWriter;
 import java.io.Writer;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -21,6 +22,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.material.FluidState;
@@ -119,6 +121,7 @@ public class Extract {
                 .append(",\"bounce\":").append(Float.toString(block.getBounceRestitution()))
                 .append(",\"dynamic_shape\":").append(block.hasDynamicShape())
                 .append(",\"default_state\":").append(Block.getId(block.defaultBlockState()))
+                .append(",\"interactive\":").append(hasCustomUse(block))
                 .append("}");
         }
 
@@ -297,6 +300,22 @@ public class Extract {
         if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.UP, net.minecraft.world.level.block.SupportType.CENTER)) flags |= 1 << 14;
         if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.DOWN, net.minecraft.world.level.block.SupportType.CENTER)) flags |= 1 << 15;
         return flags;
+    }
+
+    /**
+     * Whether the block class declares its own right-click behavior
+     * (`useItemOn` or `useWithoutItem`). Blocks without an override return
+     * `TRY_WITH_EMPTY_HAND`/`PASS`, so a click falls through to the held
+     * item's `use` action; blocks with an override can consume the click.
+     */
+    private static boolean hasCustomUse(Block block) {
+        for (Class<?> c = block.getClass(); c != null && c != BlockBehaviour.class; c = c.getSuperclass()) {
+            for (Method m : c.getDeclaredMethods()) {
+                String name = m.getName();
+                if (name.equals("useItemOn") || name.equals("useWithoutItem")) return true;
+            }
+        }
+        return false;
     }
 
     /** Registry entry names in ID order. */

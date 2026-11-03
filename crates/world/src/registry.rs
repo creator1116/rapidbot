@@ -27,6 +27,10 @@ pub struct BlockInfo {
     pub dynamic_shape: bool,
     /// `Block.defaultBlockState()`: not the first state for most blocks.
     pub default_state: StateId,
+    /// The block declares its own `useItemOn`/`useWithoutItem`, so a
+    /// right-click on it can consume the action before the held item is
+    /// used (`Minecraft.startUseItem`).
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +204,7 @@ impl Registry {
                 bounce: b.bounce,
                 dynamic_shape: b.dynamic_shape,
                 default_state: b.default_state,
+                interactive: b.interactive,
             })
             .collect();
         blocks.sort_by_key(|b| b.id);
@@ -454,6 +459,7 @@ struct RawBlock {
     bounce: f32,
     dynamic_shape: bool,
     default_state: StateId,
+    interactive: bool,
 }
 
 #[cfg(test)]
@@ -475,6 +481,22 @@ mod tests {
             "stone is a full cube"
         );
         assert_eq!(r.item_blocks.len(), r.items.len());
+    }
+
+    /// `hasCustomUse`: blocks that declare `useItemOn`/`useWithoutItem`
+    /// consume a right-click before the held item is used.
+    #[test]
+    fn interactive_blocks_are_flagged() {
+        let r = Registry::get();
+        assert!(
+            r.block_by_name("minecraft:crafting_table")
+                .unwrap()
+                .interactive
+        );
+        assert!(r.block_by_name("minecraft:oak_door").unwrap().interactive);
+        assert!(r.block_by_name("minecraft:chest").unwrap().interactive);
+        assert!(!r.block_by_name("minecraft:stone").unwrap().interactive);
+        assert!(!r.block_by_name("minecraft:oak_log").unwrap().interactive);
     }
 
     #[test]

@@ -221,6 +221,22 @@ pub fn destroy_progress(
     destroy_speed(player, held, info.block, tags) / info.hardness / modifier as f32
 }
 
+/// `GameMasterBlock`: command, structure, jigsaw and test blocks. Vanilla
+/// refuses the client-side break unless `canUseGameMasterBlocks`; the bot
+/// does not track the command permission, so creative stands in for it.
+fn is_game_master_block(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:command_block"
+            | "minecraft:chain_command_block"
+            | "minecraft:repeating_command_block"
+            | "minecraft:structure_block"
+            | "minecraft:jigsaw"
+            | "minecraft:test_block"
+            | "minecraft:test_instance_block"
+    )
+}
+
 /// `FluidState.createLegacyBlock`: what is left where a block was.
 fn fluid_block(state: StateId) -> StateId {
     let registry = Registry::get();
@@ -307,6 +323,19 @@ struct ServerVerified {
     player_pos: Vec3,
 }
 
+/// What `MultiPlayerGameMode.performUseItemOn` did locally, which decides
+/// whether `Minecraft.startUseItem` falls through to the held item or the
+/// other hand.
+#[derive(PartialEq, Eq)]
+enum UseOn {
+    /// A block placement was predicted, so the click is consumed.
+    Predicted,
+    /// `InteractionResult.FAIL`: the block is outside the border.
+    Failed,
+    /// Nothing local consumed the click.
+    Pass,
+}
+
 /// `MultiPlayerGameMode` plus the attack half of `Minecraft`.
 #[derive(Default)]
 pub(crate) struct GameMode {
@@ -346,23 +375,34 @@ impl GameMode {
         }
     }
 
-    /// `MultiPlayerGameMode.useItemOn` for the main hand. Every call takes
-    /// the next prediction sequence; a block item also predicts the block
-    /// it would place, so the server's update for that position is held
-    /// until the acknowledgement.
+    /// `MultiPlayerGameMode.useItemOn` for the main hand.
     pub(crate) fn use_item_on(&mut self, h: &mut Hands<'_>, hit: &BlockHit) {
+        self.use_on_hand(h, hit, 0);
+    }
+
+    /// `MultiPlayerGameMode.useItemOn` for one hand. Every call takes the
+    /// next prediction sequence; a block item also predicts the block it
+    /// would place, so the server's update for that position is held until
+    /// the acknowledgement.
+    fn use_on_hand(&mut self, h: &mut Hands<'_>, hit: &BlockHit, hand: i32) -> UseOn {
         if hit.miss {
-            return;
+            return UseOn::Pass;
         }
         // MultiPlayerGameMode.useItemOn returns FAIL for a block outside the
         // border: no prediction and no packet, and the click is consumed.
         if !Self::within_border(h, hit.pos) {
-            return;
+            return UseOn::Failed;
         }
         let sequence = self.next_sequence();
         let clicked = h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2);
+        let item = if hand == 0 {
+            h.inventory.held().cloned()
+        } else {
+            h.inventory.offhand().cloned()
+        };
+        let mut predicted = false;
         if !h.player.spectator
-            && let Some(item) = h.inventory.held()
+            && let Some(item) = &item
             && (!h.restricted || item.can_place_on_block_in_adventure_mode(clicked, h.tags))
             && let Some(changes) = placement::predict(
                 h.world,
@@ -376,10 +416,11 @@ impl GameMode {
             for change in changes {
                 self.predict_block(h, change.pos, change.state);
             }
+            predicted = true;
         }
         let (x, y, z) = hit.pos;
         h.net.send(&UseItemOn {
-            hand: 0,
+            hand,
             pos: pack_block_pos(x, y, z),
             direction: hit.direction as i32,
             cursor_x: (hit.location[0] - x as f64) as f32,
@@ -389,6 +430,11 @@ impl GameMode {
             world_border: false,
             sequence,
         });
+        if predicted {
+            UseOn::Predicted
+        } else {
+            UseOn::Pass
+        }
     }
 
     /// `MultiPlayerGameMode.interact`: send `Interact` for the main hand,
@@ -411,9 +457,9 @@ impl GameMode {
         let secondary = h.player.key_presses.shift;
         for hand in 0..2 {
             let stack = if hand == 0 {
-                h.inventory.held()
+                h.inventory.held().cloned()
             } else {
-                h.inventory.offhand()
+                h.inventory.offhand().cloned()
             };
             // Vanilla sends the main hand even with an empty hand; the off
             // hand follows only if the first interaction is not consumed.
@@ -423,13 +469,23 @@ impl GameMode {
                 location,
                 using_secondary_action: secondary,
             });
-            if Self::likely_entity_interact(stack, target) {
+            if Self::likely_entity_interact(stack.as_ref(), target) {
                 // The local interaction is predicted to succeed and swing,
                 // except for `interaction` entities, which consume without
-                // an animation.
-                if !target.info().is("Interaction") {
+                // an animation, and spectators, whose interaction never
+                // returns success.
+                if !target.info().is("Interaction") && !h.player.spectator {
                     h.net.send(&Punch);
                 }
+                break;
+            }
+            // `Minecraft.startUseItem`: an item that starts a use gets its
+            // `UseItem` after the entity interaction did not consume.
+            if !h.player.spectator
+                && let Some(stack) = &stack
+                && Self::likely_uses_item(stack)
+            {
+                self.send_use_item(h, hand);
                 break;
             }
         }
@@ -469,9 +525,6 @@ impl GameMode {
     /// hand, then the off hand. On a block it sends `UseItemOn` instead, and
     /// on an entity it sends `Interact`.
     pub fn use_button(&mut self, h: &mut Hands<'_>, pick: &Pick, down: bool, clicked: bool) {
-        if h.player.spectator {
-            return;
-        }
         // handleKeybinds: letting go while using releases the item.
         if h.player.using_item && !down {
             Self::send_action(
@@ -497,11 +550,14 @@ impl GameMode {
             return;
         }
         if !pick.block.miss {
-            self.use_item_on(h, &pick.block);
+            self.use_on_block(h, &pick.block);
             return;
         }
-        let y_rot = h.player.y_rot;
-        let x_rot = h.player.x_rot;
+        // `MultiPlayerGameMode.useItem` returns PASS for spectators without
+        // sending anything.
+        if h.player.spectator {
+            return;
+        }
         for hand in 0..2 {
             let stack = if hand == 0 {
                 h.inventory.held()
@@ -513,16 +569,68 @@ impl GameMode {
             // not know the result locally, so send the off hand too when
             // the main hand does not look usable (a sword in front of a
             // shield, for example).
-            h.net.send(&UseItem {
-                hand,
-                sequence: self.next_sequence(),
-                y_rot,
-                x_rot,
-            });
+            self.send_use_item(h, hand);
             if Self::likely_uses_item(stack) {
                 break;
             }
         }
+    }
+
+    /// `Minecraft.startUseItem` with the crosshair on a block: the main
+    /// hand first, then the off hand when the main hand was empty. A block
+    /// whose class overrides `useItemOn`/`useWithoutItem` consumes the
+    /// click, so the held item is not used; otherwise an item that starts a
+    /// use gets `UseItem` after the block click, exactly as the vanilla
+    /// hand loop does.
+    fn use_on_block(&mut self, h: &mut Hands<'_>, hit: &BlockHit) {
+        let main = h.inventory.held().cloned();
+        let main_outcome = self.use_on_hand(h, hit, 0);
+        if main_outcome != UseOn::Pass {
+            return;
+        }
+        // `performUseItemOn` returns CONSUME for a spectator, so the hand
+        // loop stops here.
+        if h.player.spectator {
+            return;
+        }
+        // `performUseItemOn`: with something in the hands and secondary use
+        // active, the block's own interaction is skipped.
+        let secondary = h.player.key_presses.shift;
+        let have_something = h.inventory.held().is_some() || h.inventory.offhand().is_some();
+        let block_consumes = !(secondary && have_something)
+            && Registry::get()
+                .block_of(h.world.block_state_or_air(hit.pos.0, hit.pos.1, hit.pos.2))
+                .interactive;
+        if block_consumes {
+            return;
+        }
+        if let Some(stack) = &main {
+            if Self::likely_uses_item(stack) {
+                self.send_use_item(h, 0);
+            }
+            // A non-block item the client cannot classify may still have a
+            // `useOn` action (an axe on a log, a shovel on grass, ...), so
+            // do not try the off hand after a non-empty main hand.
+            return;
+        }
+        if let Some(stack) = h.inventory.offhand().cloned() {
+            if self.use_on_hand(h, hit, 1) != UseOn::Pass {
+                return;
+            }
+            if Self::likely_uses_item(&stack) {
+                self.send_use_item(h, 1);
+            }
+        }
+    }
+
+    /// `ServerboundUseItemPacket` with the player's current look.
+    fn send_use_item(&mut self, h: &Hands<'_>, hand: i32) {
+        h.net.send(&UseItem {
+            hand,
+            sequence: self.next_sequence(),
+            y_rot: h.player.y_rot,
+            x_rot: h.player.x_rot,
+        });
     }
 
     /// Whether an item looks like it starts a use in progress. The server
@@ -530,6 +638,8 @@ impl GameMode {
     fn likely_uses_item(stack: &ItemStack) -> bool {
         stack.has("minecraft:consumable")
             || stack.has("minecraft:blocks_attacks")
+            || stack.has("minecraft:equippable")
+            || stack.has("minecraft:use_cooldown")
             || matches!(
                 stack.name(),
                 "minecraft:bow"
@@ -719,6 +829,8 @@ impl GameMode {
             });
             self.destroying = false;
             self.destroy_progress = 0.0;
+            // stopDestroyBlock calls Player.resetAttackStrengthTicker().
+            self.attack_strength_ticker = 0;
         }
     }
 
@@ -789,6 +901,14 @@ impl GameMode {
         }
         let old = h.world.block_state_or_air(pos.0, pos.1, pos.2);
         if Registry::get().state(old).is_air {
+            return false;
+        }
+        // GameMasterBlock: command, structure, jigsaw and test blocks.
+        // `canUseGameMasterBlocks` also needs the command permission, which
+        // the bot does not track, so creative stands in for it.
+        if is_game_master_block(Registry::get().block_of(old).name.as_str())
+            && !h.player.abilities.instabuild
+        {
             return false;
         }
         let left = fluid_block(old);
@@ -867,6 +987,8 @@ impl GameMode {
             );
             self.destroying = false;
             self.destroy_progress = 0.0;
+            // Player.resetAttackStrengthTicker().
+            self.attack_strength_ticker = 0;
         }
     }
 
@@ -999,6 +1121,7 @@ impl GameMode {
             self.miss_time = 0;
         }
         if self.miss_time > 0
+            || h.player.using_item
             || h.inventory
                 .held()
                 .is_some_and(|s| s.has("minecraft:piercing_weapon"))
@@ -1029,9 +1152,13 @@ impl GameMode {
         pick: &Pick,
         mut carried: impl FnMut(&PacketSender),
     ) {
+        // `Minecraft.handleKeybinds`: while an item is in use, attack
+        // clicks are consumed without starting an attack.
         let mut instant = false;
-        for _ in 0..clicks {
-            instant |= self.start_attack(h, pick, &mut carried);
+        if !h.player.using_item {
+            for _ in 0..clicks {
+                instant |= self.start_attack(h, pick, &mut carried);
+            }
         }
         self.continue_attack(h, !instant && down, &pick.block, &mut carried);
         if self.miss_time > 0 {
@@ -1178,6 +1305,22 @@ mod tests {
                 self.mode.continue_destroy_block(&mut hands, pos, direction)
             };
             (continued, self.take_packets())
+        }
+
+        /// One direct `destroy_block` call; returns whether it removed the
+        /// block locally.
+        fn destroy_at(&mut self, pos: BlockPos) -> bool {
+            let mut hands = Hands {
+                player: &mut self.player,
+                world: &mut self.world,
+                inventory: &self.inventory,
+                entities: &self.entities,
+                tags: &self.tags,
+                net: &self.net,
+                restricted: self.restricted,
+                survival: true,
+            };
+            self.mode.destroy_block(&mut hands, pos)
         }
 
         /// Puts a stack in an inventory-menu slot (36 is hotbar 0).
@@ -1475,13 +1618,17 @@ mod tests {
             Some(default_state("minecraft:oak_log"))
         );
 
-        // A spectator sends nothing and predicts nothing, even with one.
+        // A spectator sends the `UseItemOn` the server uses for its own
+        // interaction result, but predicts nothing.
         let mut spectator = Scene::new();
         spectator.restricted = true;
         spectator.player.spectator = true;
         spectator.set_can_place_item(36, spectator.dirt);
         let packets = spectator.tick_use(true, true);
-        assert!(packets.is_empty());
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
         assert_eq!(spectator.world.block_state(1, 65, 0), Some(AIR));
     }
 
@@ -1890,6 +2037,130 @@ mod tests {
             [UseItem::ID]
         );
         assert_eq!(UseItem::decode(&mut &packets[0].1[..]).unwrap().hand, 0);
+    }
+
+    /// `Minecraft.startUseItem`: with a bow in hand and the crosshair on a
+    /// plain block, the click falls through from `UseItemOn` to `UseItem`.
+    /// An interactive block consumes the click first.
+    #[test]
+    fn use_item_falls_through_a_block_click() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:bow");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID, UseItem::ID]
+        );
+        let use_on = UseItemOn::decode(&mut &packets[0].1[..]).unwrap();
+        let use_item = UseItem::decode(&mut &packets[1].1[..]).unwrap();
+        assert_eq!((use_on.hand, use_on.sequence), (0, 1));
+        assert_eq!((use_item.hand, use_item.sequence), (0, 2));
+
+        let mut scene = Scene::new();
+        scene
+            .world
+            .set_block_state(1, 64, 0, state("minecraft:crafting_table"));
+        scene.set_item(36, "minecraft:bow");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+    }
+
+    /// A block item that places consumes the click, so no `UseItem` follows.
+    #[test]
+    fn use_item_does_not_follow_a_placement() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:oak_log");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+    }
+
+    /// `Minecraft.startUseItem`: a bow in hand gets `UseItem` after the
+    /// entity interaction, instead of only trying the off hand.
+    #[test]
+    fn use_item_falls_through_an_entity_click() {
+        let mut scene = Scene::new();
+        scene.player.x_rot = 0.0;
+        spawn(&mut scene, "minecraft:zombie", [2.5, 64.0, 0.5]);
+        scene.set_item(36, "minecraft:bow");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [Interact::ID, UseItem::ID]
+        );
+        assert_eq!(UseItem::decode(&mut &packets[1].1[..]).unwrap().hand, 0);
+    }
+
+    /// An empty main hand falls through to the off hand, which can place
+    /// its block (`Minecraft.startUseItem`).
+    #[test]
+    fn off_hand_places_when_the_main_hand_is_empty() {
+        let mut scene = Scene::new();
+        scene.set_item(45, "minecraft:oak_log");
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID, UseItemOn::ID]
+        );
+        assert_eq!(UseItemOn::decode(&mut &packets[0].1[..]).unwrap().hand, 0);
+        assert_eq!(UseItemOn::decode(&mut &packets[1].1[..]).unwrap().hand, 1);
+        assert_eq!(
+            scene.world.block_state(1, 65, 0),
+            Some(default_state("minecraft:oak_log"))
+        );
+    }
+
+    /// While an item is in use, attack clicks are consumed and the destroy
+    /// loop does nothing (`Minecraft.handleKeybinds`/`continueAttack`).
+    #[test]
+    fn using_an_item_blocks_attacks() {
+        let mut scene = Scene::new();
+        scene.player.start_using_item(false);
+        let packets = scene.tick(1, true);
+        assert!(packets.is_empty());
+
+        scene.player.stop_using_item();
+        // startAttack digs and swings; continueAttack in the same tick
+        // swings again.
+        let packets = scene.tick(1, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [PlayerAction::ID, Punch::ID, Punch::ID]
+        );
+    }
+
+    /// `MultiPlayerGameMode.stopDestroyBlock` restarts the attack charge.
+    #[test]
+    fn stopping_a_break_resets_the_attack_charge() {
+        let mut scene = Scene::new();
+        let packets = scene.tick(1, true);
+        assert!(
+            packets.iter().any(|p| p.0 == PlayerAction::ID),
+            "the break should have started"
+        );
+        assert!(scene.mode.destroying);
+        scene.mode.attack_strength_ticker = 7;
+
+        scene.tick(0, false);
+
+        // stopDestroyBlock resets it to 0; Player.tick then advances it once.
+        assert_eq!(scene.mode.attack_strength_ticker, 1);
+    }
+
+    /// `MultiPlayerGameMode.destroyBlock` refuses a `GameMasterBlock` unless
+    /// `canUseGameMasterBlocks`; the bot treats creative as the permission.
+    #[test]
+    fn survival_does_not_predict_game_master_block_breaks() {
+        let mut scene = Scene::new();
+        let command = state("minecraft:command_block");
+        scene.world.set_block_state(1, 64, 0, command);
+        assert!(!scene.destroy_at((1, 64, 0)));
+        assert_eq!(scene.world.block_state(1, 64, 0), Some(command));
     }
 
     /// Letting go while using sends the release action, then stops locally.

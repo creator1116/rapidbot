@@ -74,6 +74,9 @@ pub(super) struct PlayState {
     /// knows about.
     carried_index: u8,
     pub game_mode: crate::interact::GameMode,
+    /// `ClientLevel.tickRateManager`: gates level and entity ticks, and
+    /// speeds up stepped interpolation on a fast server.
+    pub tick_rate: super::TickRateManager,
 }
 
 impl PlayState {
@@ -128,6 +131,7 @@ impl PlayState {
             inventory: Default::default(),
             carried_index: 0,
             game_mode: crate::interact::GameMode::new(),
+            tick_rate: super::TickRateManager::default(),
         };
         state
             .entities
@@ -178,10 +182,12 @@ impl PlayState {
         let dimension = spawn.dimension.to_string();
         let dimension_changed = dimension != self.dimension;
         if dimension_changed {
-            // A new ClientLevel: chunks and entities start over. Vanilla
-            // keeps the same MultiPlayerGameMode across a respawn.
+            // A new ClientLevel: chunks, entities and its tick rate manager
+            // start over. Vanilla keeps the same MultiPlayerGameMode across
+            // a respawn.
             self.world = World::new(height);
             self.entities = Default::default();
+            self.tick_rate = super::TickRateManager::default();
             self.dimension = dimension;
         }
         self.player = LocalPlayer::respawned(&self.player, data_to_keep);
@@ -778,6 +784,18 @@ impl Game {
                     .inventory
                     .set_held_slot(&packet.body)?;
                 self.slot_press = None;
+            }
+            cb::TickingState::ID => {
+                let state = packet.decode::<cb::TickingState>()?;
+                let tick_rate = &mut play_mut(&mut self.play)?.tick_rate;
+                tick_rate.set_tick_rate(state.tick_rate);
+                tick_rate.set_frozen(state.frozen);
+            }
+            cb::TickingStep::ID => {
+                let step = packet.decode::<cb::TickingStep>()?;
+                play_mut(&mut self.play)?
+                    .tick_rate
+                    .set_frozen_ticks_to_run(step.tick_steps);
             }
             cb::OpenScreen::ID => {
                 play_mut(&mut self.play)?

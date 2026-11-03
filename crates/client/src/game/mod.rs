@@ -28,6 +28,68 @@ use crate::{ClientConfig, ClientError, InputMode, SessionData, clock};
 pub use frame::DisplaySettings;
 pub use player::LocalPlayer;
 
+/// `TickRateManager`: what decides whether the level and its entities tick
+/// on a given client tick. The client always ticks at 20 Hz; a frozen server
+/// skips level ticks, and tick rates above 20 only speed up stepped entity
+/// interpolation (`getRelativeTickSpeed`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TickRateManager {
+    tick_rate: f32,
+    frozen_ticks_to_run: i32,
+    run_game_elements: bool,
+    frozen: bool,
+}
+
+impl Default for TickRateManager {
+    fn default() -> Self {
+        Self {
+            tick_rate: 20.0,
+            frozen_ticks_to_run: 0,
+            run_game_elements: true,
+            frozen: false,
+        }
+    }
+}
+
+impl TickRateManager {
+    /// `setTickRate`: the rate is clamped to at least 1.
+    pub fn set_tick_rate(&mut self, rate: f32) {
+        self.tick_rate = rate.max(1.0);
+    }
+
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
+    }
+
+    /// `setFrozenTicksToRun`.
+    pub fn set_frozen_ticks_to_run(&mut self, ticks: i32) {
+        self.frozen_ticks_to_run = ticks;
+    }
+
+    /// `tick`: decide whether this tick's game elements run, then spend one
+    /// of the frozen steps.
+    pub fn tick(&mut self) {
+        self.run_game_elements = !self.frozen || self.frozen_ticks_to_run > 0;
+        if self.frozen_ticks_to_run > 0 {
+            self.frozen_ticks_to_run -= 1;
+        }
+    }
+
+    pub fn runs_normally(&self) -> bool {
+        self.run_game_elements
+    }
+
+    /// `ClientLevel.getRelativeTickSpeed`: fast servers interpolate entities
+    /// faster, slow ones still run client-side at 20 Hz.
+    pub fn relative_tick_speed(&self) -> f32 {
+        if self.tick_rate > 20.0 {
+            self.tick_rate / 20.0
+        } else {
+            1.0
+        }
+    }
+}
+
 pub(crate) struct Game {
     config: ClientConfig,
     net: PacketSender,
@@ -481,9 +543,10 @@ impl Game {
             // deferred packets, which we never defer.
             return;
         };
-        // Minecraft.tick: the right-click delay, then gameMode.tick()
-        // (connection.tick() would come next but has nothing to do here)
-        // → ClientPacketListener.tick().
+        // Minecraft.tick: the tick rate manager, the right-click delay, then
+        // gameMode.tick() (connection.tick() would come next but has nothing
+        // to do here) → ClientPacketListener.tick().
+        play.tick_rate.tick();
         play.game_mode.tick();
         if play.listener_tick(&self.net) {
             self.link.emit(BotEvent::Loaded);
@@ -527,12 +590,14 @@ impl Game {
             }
             let before = (play.player.physics.y_rot, play.player.physics.x_rot);
             // pick(1.0F): what the crosshair is on, before the keybinds.
-            let mut pick = crate::interact::pick(
+            let root_vehicle = play.player.riding_vehicle();
+            let mut pick = crate::interact::pick_with_vehicle(
                 &play.player.physics,
                 &play.world,
                 &play.entities,
                 play.player.id,
                 &play.tags,
+                root_vehicle,
             );
             let chat_open = self.typing.as_ref().is_some_and(|t| t.open);
             let screen_open = chat_open || play.inventory.container.is_some();
@@ -606,12 +671,13 @@ impl Game {
                         play.player.physics.x_rot = aim.pitch.clamp(-90.0, 90.0);
                         self.frames.on_input_received(clock::millis());
                     }
-                    pick = crate::interact::pick(
+                    pick = crate::interact::pick_with_vehicle(
                         &play.player.physics,
                         &play.world,
                         &play.entities,
                         play.player.id,
                         &play.tags,
+                        root_vehicle,
                     );
                     play.player.physics.held_keys = self.key_intent;
                 }
@@ -737,15 +803,23 @@ impl Game {
         // level.tickEntities(): the others glide towards where the server
         // last put them. Attached firework rockets then boost the local
         // player, matching FireworkRocketEntity.tick after LocalPlayer.tick.
-        for target in play.entities.tick() {
+        // `isEntityFrozen`: a frozen tick skips everything but players and
+        // the vehicles they ride.
+        for target in play.entities.tick(
+            play.tick_rate.runs_normally(),
+            play.tick_rate.relative_tick_speed(),
+            play.player.riding_vehicle(),
+        ) {
             if target == play.player.id {
                 play.player.physics.apply_firework_boost();
             }
         }
         // ClientLevel.tick: the border advances after entity ticks, so this
-        // tick's movement used the pre-update extent. This also runs while
-        // the player is dead or riding.
-        play.player.physics.world_border.tick();
+        // tick's movement used the pre-update extent, and only when the
+        // level runs normally.
+        if play.tick_rate.runs_normally() {
+            play.player.physics.world_border.tick();
+        }
         // The rest of level.tick(), particles, ...
         self.net
             .send(&rapidbot_protocol::packets::play::serverbound::ClientTickEnd);
@@ -760,4 +834,44 @@ fn stall_ms() -> Option<u64> {
             .ok()
             .and_then(|v| v.parse().ok())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TickRateManager;
+
+    #[test]
+    fn frozen_levels_run_their_steps_then_hold() {
+        let mut rate = TickRateManager::default();
+        assert!(rate.runs_normally());
+
+        rate.set_frozen(true);
+        rate.tick();
+        assert!(!rate.runs_normally(), "a plain freeze stops the level");
+
+        // `/tick step` runs exactly the given number of ticks.
+        rate.set_frozen_ticks_to_run(2);
+        rate.tick();
+        assert!(rate.runs_normally());
+        rate.tick();
+        assert!(rate.runs_normally());
+        rate.tick();
+        assert!(!rate.runs_normally());
+
+        rate.set_frozen(false);
+        rate.tick();
+        assert!(rate.runs_normally());
+    }
+
+    #[test]
+    fn relative_tick_speed_only_speeds_up() {
+        let mut rate = TickRateManager::default();
+        assert_eq!(rate.relative_tick_speed(), 1.0);
+        rate.set_tick_rate(10.0);
+        assert_eq!(rate.relative_tick_speed(), 1.0);
+        rate.set_tick_rate(40.0);
+        assert_eq!(rate.relative_tick_speed(), 2.0);
+        rate.set_tick_rate(0.0);
+        assert_eq!(rate.relative_tick_speed(), 1.0);
+    }
 }

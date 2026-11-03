@@ -69,6 +69,19 @@ pub fn pick_block(player: &Player, world: &World) -> BlockHit {
 /// its own: the nearest of the block and the entity along the view, each
 /// within its interaction range of the eyes.
 pub fn pick(player: &Player, world: &World, entities: &Entities, own_id: i32, tags: &Tags) -> Pick {
+    pick_with_vehicle(player, world, entities, own_id, tags, None)
+}
+
+/// [`pick`] with the local player's root vehicle, which
+/// `ProjectileUtil.getEntityHitResult` never picks as the nearest hit.
+pub fn pick_with_vehicle(
+    player: &Player,
+    world: &World,
+    entities: &Entities,
+    own_id: i32,
+    tags: &Tags,
+    root_vehicle: Option<i32>,
+) -> Pick {
     let block_range = player.attributes.value(attributes::BLOCK_INTERACTION_RANGE);
     let entity_range = player
         .attributes
@@ -106,7 +119,15 @@ pub fn pick(player: &Player, world: &World, entities: &Entities, own_id: i32, ta
         [search.min_x, search.min_y, search.min_z],
         [search.max_x, search.max_y, search.max_z],
     );
-    let entity = entities.pick(own_id, from, to, search, max_distance_sq, tags);
+    let entity = entities.pick(crate::entities::EntityPick {
+        except: own_id,
+        from,
+        to,
+        search,
+        max_distance_sq,
+        tags,
+        root_vehicle,
+    });
     match entity {
         Some(hit) if distance_sq(hit.location, from) < block_distance_sq => {
             if distance_sq(hit.location, from) < entity_range * entity_range {

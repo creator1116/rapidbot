@@ -626,6 +626,23 @@ pub mod clientbound {
     }
     packet!(SetHeldSlot, play, clientbound, SET_HELD_SLOT);
 
+    /// `ClientboundTickingStatePacket`: the level's tick rate and whether it
+    /// is frozen.
+    #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+    pub struct TickingState {
+        pub tick_rate: f32,
+        pub frozen: bool,
+    }
+    packet!(TickingState, play, clientbound, TICKING_STATE);
+
+    /// `ClientboundTickingStepPacket`: how many ticks to run while frozen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct TickingStep {
+        #[var]
+        pub tick_steps: i32,
+    }
+    packet!(TickingStep, play, clientbound, TICKING_STEP);
+
     /// `ClientboundOpenScreenPacket`: only the container ID is decoded.
     #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
     pub struct OpenScreen {

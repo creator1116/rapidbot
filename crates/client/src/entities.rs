@@ -180,9 +180,9 @@ impl Stepped {
         self.target
     }
 
-    /// `advance` at the normal tick rate.
-    fn advance(&mut self, interval: i32) {
-        let mut ticks = 1.0f32;
+    /// `advance`: `ticks` is `level.getRelativeTickSpeed()`.
+    fn advance(&mut self, interval: i32, ticks: f32) {
+        let mut ticks = ticks;
         let target_speed = (self.remaining_ticks / interval as f32).max(1.0);
         self.speed = math::lerp_f32(1.0 / interval as f32, self.speed, target_speed);
         if ticks * self.speed < self.remaining_ticks {
@@ -270,6 +270,9 @@ pub struct Entity {
     /// rocket is riding. The rocket gives that entity a boost each tick
     /// while it is gliding.
     firework_attached_to: Option<i32>,
+    /// `HappyGhast.STAYS_STILL`: the synced half of `isOnStillTimeout`,
+    /// which makes a landed ghast solid.
+    stays_still: bool,
 }
 
 /// `Mth.unpackDegrees`.
@@ -370,6 +373,7 @@ impl Entity {
             painting_size: None,
             framed_item: None,
             firework_attached_to: None,
+            stays_still: false,
         }
     }
 
@@ -993,7 +997,7 @@ impl Entity {
     }
 
     /// `Entity.commonTick`: `getInterpolation().interpolate()`.
-    fn tick(&mut self) {
+    fn tick(&mut self, relative_tick_speed: f32) {
         match self.info().interpolation {
             Interpolation::Snap => {}
             Interpolation::Linear(_) => {
@@ -1021,7 +1025,7 @@ impl Entity {
                 self.y_rot = next.y_rot;
                 self.x_rot = next.x_rot;
                 let interval = self.interval();
-                self.stepped.advance(interval);
+                self.stepped.advance(interval, relative_tick_speed);
             }
         }
         if self.info().is("Shulker") {
@@ -1217,6 +1221,21 @@ pub(crate) fn decode_entity_data(mut body: &[u8]) -> Result<Vec<(u8, DataValue)>
     }
 }
 
+/// One `ProjectileUtil.getEntityHitResult` query.
+pub struct EntityPick<'a> {
+    /// The camera or projectile entity to exclude (`source`).
+    pub except: i32,
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    /// The box entities must touch (`Level.getEntities`).
+    pub search: ([f64; 3], [f64; 3]),
+    pub max_distance_sq: f64,
+    pub tags: &'a Tags,
+    /// The projectile's root vehicle: an entity sharing it never becomes
+    /// the nearest hit, it only replaces a hit already at distance zero.
+    pub root_vehicle: Option<i32>,
+}
+
 #[derive(Default)]
 pub struct Entities {
     by_id: HashMap<i32, Entity>,
@@ -1295,11 +1314,16 @@ impl Entities {
             .filter_map(|entity| {
                 let info = entity.info();
                 let alive = entity.health.is_none_or(|h| h > 0.0);
+                // `HappyGhast.canBeCollidedWith`: an adult ghast is solid
+                // when the player stands on top of it, or once it has
+                // landed (`isOnStillTimeout`, which the client reads from
+                // the synced `staysStill` flag).
                 let collides = info.is("AbstractBoat")
                     || (info.is("Shulker") && alive)
                     || (info.is("HappyGhast")
+                        && !entity.baby
                         && alive
-                        && player_bottom >= entity.bounding_box().1[1]);
+                        && (player_bottom >= entity.bounding_box().1[1] || entity.stays_still));
                 if !collides {
                     return None;
                 }
@@ -1370,34 +1394,30 @@ impl Entities {
     }
 
     /// `ProjectileUtil.getEntityHitResult` for the crosshair: the nearest
-    /// pickable entity the segment passes through, nearer than
-    /// `max_distance_sq`. `search` is the box entities must touch
-    /// (`Level.getEntities`).
-    pub fn pick(
-        &self,
-        own_id: i32,
-        from: [f64; 3],
-        to: [f64; 3],
-        search: ([f64; 3], [f64; 3]),
-        max_distance_sq: f64,
-        tags: &Tags,
-    ) -> Option<EntityHit> {
-        let mut nearest = max_distance_sq;
+    /// pickable entity the segment passes through, nearer than the query's
+    /// distance limit.
+    pub fn pick(&self, query: EntityPick<'_>) -> Option<EntityHit> {
+        let mut nearest = query.max_distance_sq;
         let mut hovered: Option<EntityHit> = None;
         // Vanilla walks its entity sections; the order only matters between
         // entities hit at exactly the same distance. IDs make ours stable.
-        let mut candidates: Vec<&Entity> = self.by_id.values().filter(|e| e.id != own_id).collect();
+        let mut candidates: Vec<&Entity> = self
+            .by_id
+            .values()
+            .filter(|e| e.id != query.except)
+            .collect();
         candidates.sort_by_key(|e| e.id);
         for entity in candidates {
             let (min, max) = entity.bounding_box();
-            let touches = (0..3).all(|i| min[i] < search.1[i] && max[i] > search.0[i]);
-            if !touches || !self.can_be_picked(entity, tags) {
+            let from = query.from;
+            let touches = (0..3).all(|i| min[i] < query.search.1[i] && max[i] > query.search.0[i]);
+            if !touches || !self.can_be_picked(entity, query.tags) {
                 continue;
             }
-            let radius = entity.pick_radius(tags) as f64;
+            let radius = entity.pick_radius(query.tags) as f64;
             let min = [min[0] - radius, min[1] - radius, min[2] - radius];
             let max = [max[0] + radius, max[1] + radius, max[2] + radius];
-            let clip = clip_box(min, max, from, to);
+            let clip = clip_box(min, max, from, query.to);
             let contains = (0..3).all(|i| from[i] >= min[i] && from[i] < max[i]);
             if contains {
                 if nearest >= 0.0 {
@@ -1412,11 +1432,23 @@ impl Entities {
                     .map(|i| (location[i] - from[i]) * (location[i] - from[i]))
                     .sum();
                 if distance < nearest || nearest == 0.0 {
-                    hovered = Some(EntityHit {
-                        id: entity.id,
-                        location,
-                    });
-                    nearest = distance;
+                    if Some(entity.id) == query.root_vehicle {
+                        // Same root vehicle as the projectile: only
+                        // replaces a hovered entity already at distance
+                        // zero, and never lowers `nearest`.
+                        if nearest == 0.0 {
+                            hovered = Some(EntityHit {
+                                id: entity.id,
+                                location,
+                            });
+                        }
+                    } else {
+                        hovered = Some(EntityHit {
+                            id: entity.id,
+                            location,
+                        });
+                        nearest = distance;
+                    }
                 }
             }
         }
@@ -1427,10 +1459,23 @@ impl Entities {
     /// Returns the target IDs of attached firework rockets: the caller is
     /// the local player's vehicle and applies their `FireworkRocketEntity`
     /// boost after its own tick.
-    pub fn tick(&mut self) -> Vec<i32> {
+    ///
+    /// `runs_normally` is `TickRateManager.runsNormally`: on a frozen tick,
+    /// `isEntityFrozen` skips every entity except players and the entities
+    /// they ride. `relative_tick_speed` is `getRelativeTickSpeed`, which
+    /// speeds up stepped interpolation on a fast server.
+    pub fn tick(
+        &mut self,
+        runs_normally: bool,
+        relative_tick_speed: f32,
+        player_vehicle: Option<i32>,
+    ) -> Vec<i32> {
         let mut attached = Vec::new();
         for entity in self.by_id.values_mut() {
-            entity.tick();
+            if !runs_normally && !entity.is_player() && Some(entity.id) != player_vehicle {
+                continue;
+            }
+            entity.tick(relative_tick_speed);
             if let Some(target) = entity.firework_attached_to {
                 attached.push(target);
             }
@@ -1487,6 +1532,7 @@ impl Entities {
             painting_size: None,
             framed_item: None,
             firework_attached_to: None,
+            stays_still: false,
         };
         if entity.info().is("HangingEntity") {
             // The add packet carries the attached block, not the box center.
@@ -1715,6 +1761,9 @@ impl Entities {
                 }
                 (18, DataValue::Int(state)) if info.is("Sniffer") => {
                     entity.sniffer_state = state;
+                }
+                (19, DataValue::Bool(stays_still)) if info.is("HappyGhast") => {
+                    entity.stays_still = stays_still;
                 }
                 _ => {}
             }
@@ -1962,16 +2011,16 @@ mod tests {
         mv(&mut e, 7, [-8192, 0, 0]);
         assert_eq!(e.get(7).unwrap().pos.x, 5.0);
         // startInterpolating sets currentStepTicks to 1 of the step's 2.
-        e.tick();
+        e.tick(true, 1.0, None);
         assert_eq!(e.get(7).unwrap().pos.x, 4.0);
-        e.tick();
+        e.tick(true, 1.0, None);
         assert_eq!(e.get(7).unwrap().pos.x, 3.0);
-        e.tick();
+        e.tick(true, 1.0, None);
         assert_eq!(e.get(7).unwrap().pos.x, 3.0);
         // The next delta is relative to the server's position.
         mv(&mut e, 7, [4096, 0, 0]);
-        e.tick();
-        e.tick();
+        e.tick(true, 1.0, None);
+        e.tick(true, 1.0, None);
         assert_eq!(e.get(7).unwrap().pos.x, 4.0);
     }
 
@@ -1986,7 +2035,7 @@ mod tests {
         assert_eq!(e.get(2).unwrap().pos.x, 3.0);
         let mut seen = Vec::new();
         for _ in 0..4 {
-            e.tick();
+            e.tick(true, 1.0, None);
             seen.push(e.get(1).unwrap().pos.x);
         }
         assert_eq!(seen, [1.0, 2.0, 3.0, 3.0]);
@@ -2104,7 +2153,7 @@ mod tests {
         set_byte(&mut e, 1, 17, 100);
         set_byte(&mut e, 2, 17, 100);
         for _ in 0..20 {
-            e.tick();
+            e.tick(true, 1.0, None);
         }
 
         assert_dims(&e, 1, (1.0, 2.0));
@@ -2238,14 +2287,15 @@ mod tests {
 
         let tags = Tags::default();
         let hit = e
-            .pick(
-                1,
-                [2.0, 64.5, 0.0],
-                [2.0, 64.5, 2.0],
-                ([-10.0; 3], [100.0; 3]),
-                25.0,
-                &tags,
-            )
+            .pick(EntityPick {
+                except: 1,
+                from: [2.0, 64.5, 0.0],
+                to: [2.0, 64.5, 2.0],
+                search: ([-10.0; 3], [100.0; 3]),
+                max_distance_sq: 25.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
             .unwrap();
         assert_eq!(
             hit,
@@ -2278,11 +2328,11 @@ mod tests {
         VarInt(7).encode(&mut data);
         data.push(0xff);
         e.set_entity_data(1, &data).unwrap();
-        assert_eq!(e.tick(), [7]);
+        assert_eq!(e.tick(true, 1.0, None), [7]);
 
         // Clearing the optional int stops the boost.
         e.set_entity_data(1, &[9, 19, 0, 0xff]).unwrap();
-        assert!(e.tick().is_empty());
+        assert!(e.tick(true, 1.0, None).is_empty());
     }
 
     #[test]
@@ -2298,30 +2348,142 @@ mod tests {
         // Items and (untagged) arrows are passed through; the nearer zombie
         // is hit on its near face.
         let hit = e
-            .pick(1, from, [6.0, 65.0, 0.0], search, 36.0, &tags)
+            .pick(EntityPick {
+                except: 1,
+                from,
+                to: [6.0, 65.0, 0.0],
+                search,
+                max_distance_sq: 36.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
             .unwrap();
         assert_eq!(hit.id, 7);
         assert_eq!(hit.location, [3.0 - 0.3f32 as f64, 65.0, 0.0]);
         // Not beyond the distance limit, and never the player itself.
         assert!(
-            e.pick(1, from, [6.0, 65.0, 0.0], search, 4.0, &tags)
-                .is_none()
+            e.pick(EntityPick {
+                except: 1,
+                from,
+                to: [6.0, 65.0, 0.0],
+                search,
+                max_distance_sq: 4.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+            .is_none()
         );
         assert_eq!(
-            e.pick(7, from, [6.0, 65.0, 0.0], search, 36.0, &tags)
-                .unwrap()
-                .id,
+            e.pick(EntityPick {
+                except: 7,
+                from,
+                to: [6.0, 65.0, 0.0],
+                search,
+                max_distance_sq: 36.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+            .unwrap()
+            .id,
             8
         );
         // From inside a box: that entity, at the eye. (Vanilla lets a later
         // entity further along the ray replace it, so keep the ray short.)
         let inside = e
-            .pick(1, [3.0, 65.0, 0.0], [3.2, 65.0, 0.0], search, 36.0, &tags)
+            .pick(EntityPick {
+                except: 1,
+                from: [3.0, 65.0, 0.0],
+                to: [3.2, 65.0, 0.0],
+                search,
+                max_distance_sq: 36.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
             .unwrap();
         assert_eq!((inside.id, inside.location), (7, [3.0, 65.0, 0.0]));
         // What the client counts as a landed hit.
         assert!(!e.get(7).unwrap().hurt_client());
         assert!(e.get(7).unwrap().is_attackable(&tags));
         assert!(!e.get(9).unwrap().is_attackable(&tags));
+    }
+
+    /// `ProjectileUtil.getEntityHitResult`: an entity sharing the
+    /// projectile's root vehicle never becomes the nearest hit.
+    #[test]
+    fn an_entity_sharing_the_root_vehicle_is_not_picked() {
+        let mut e = Entities::default();
+        let tags = Tags::default();
+        // A tall enough "vehicle" that the eye is outside its box, so the
+        // segment clip decides rather than the eye-inside rule.
+        add(&mut e, 2, "minecraft:horse", [1.0, 64.0, 0.0]);
+        add(&mut e, 7, "minecraft:zombie", [3.0, 64.0, 0.0]);
+        let search = ([-10.0; 3], [100.0; 3]);
+        let from = [0.0, 65.0, 0.0];
+
+        let hit = e
+            .pick(EntityPick {
+                except: 1,
+                from,
+                to: [6.0, 65.0, 0.0],
+                search,
+                max_distance_sq: 36.0,
+                tags: &tags,
+                root_vehicle: Some(2),
+            })
+            .unwrap();
+        assert_eq!(hit.id, 7, "the ridden horse must not be picked");
+
+        let hit = e
+            .pick(EntityPick {
+                except: 1,
+                from,
+                to: [6.0, 65.0, 0.0],
+                search,
+                max_distance_sq: 36.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+            .unwrap();
+        assert_eq!(hit.id, 2, "with no root vehicle the nearer horse wins");
+    }
+
+    /// `ClientLevel.tickEntities`: a frozen level still ticks players and
+    /// the vehicles they ride, but holds every other entity.
+    #[test]
+    fn a_frozen_tick_skips_remote_entities_but_not_players() {
+        let mut e = Entities::default();
+        add(&mut e, 7, "minecraft:player", [5.0, 64.0, 0.0]);
+        add(&mut e, 8, "minecraft:zombie", [5.0, 64.0, 0.0]);
+        mv(&mut e, 7, [-8192, 0, 0]);
+        mv(&mut e, 8, [-8192, 0, 0]);
+
+        e.tick(false, 1.0, None);
+        assert_eq!(e.get(7).unwrap().pos.x, 4.0, "players interpolate");
+        assert_eq!(e.get(8).unwrap().pos.x, 5.0, "mobs hold while frozen");
+
+        // A vehicle the player rides is not frozen either.
+        e.tick(false, 1.0, Some(8));
+        assert!(
+            e.get(8).unwrap().pos.x < 5.0,
+            "the ridden vehicle resumes interpolating"
+        );
+    }
+
+    /// `HappyGhast.canBeCollidedWith`: adults are solid when stood on or
+    /// once landed; babies are never solid.
+    #[test]
+    fn a_landed_happy_ghast_becomes_solid() {
+        let mut e = Entities::default();
+        add(&mut e, 1, "minecraft:happy_ghast", [0.0, 64.0, 0.0]);
+        assert!(e.collision_boxes(64.0).is_empty());
+        assert_eq!(e.collision_boxes(70.0).len(), 1, "stood on");
+
+        set_bool(&mut e, 1, 16, true);
+        assert!(e.collision_boxes(70.0).is_empty(), "a baby never collides");
+        set_bool(&mut e, 1, 16, false);
+
+        // `staysStill` (HappyGhast.STAYS_STILL = 19) makes it solid.
+        set_bool(&mut e, 1, 19, true);
+        assert_eq!(e.collision_boxes(64.0).len(), 1, "landed ghast");
     }
 }

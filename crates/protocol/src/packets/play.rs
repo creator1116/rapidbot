@@ -626,6 +626,17 @@ pub mod clientbound {
     }
     packet!(SetHeldSlot, play, clientbound, SET_HELD_SLOT);
 
+    /// `ClientboundContainerSetDataPacket`: one menu data slot (a furnace's
+    /// progress, the crafter's slot states).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct ContainerSetData {
+        #[var]
+        pub container_id: i32,
+        pub id: i16,
+        pub value: i16,
+    }
+    packet!(ContainerSetData, play, clientbound, CONTAINER_SET_DATA);
+
     /// `ClientboundTickingStatePacket`: the level's tick rate and whether it
     /// is frozen.
     #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]

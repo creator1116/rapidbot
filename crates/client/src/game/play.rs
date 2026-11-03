@@ -814,6 +814,9 @@ impl Game {
                     warn!("could not read container contents: {e}");
                 }
             }
+            ids::CONTAINER_SET_DATA => {
+                play_mut(&mut self.play)?.inventory.set_data(&packet.body)?;
+            }
             ids::SET_PLAYER_INVENTORY => {
                 if let Err(e) = play_mut(&mut self.play)?
                     .inventory

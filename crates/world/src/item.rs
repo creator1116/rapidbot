@@ -686,7 +686,16 @@ impl ItemStack {
 
     /// Enchantment registry IDs (as the server numbers them) and levels.
     pub fn enchantments(&self) -> Vec<(i32, i32)> {
-        let Some(mut value) = self.component("minecraft:enchantments") else {
+        self.enchantments_of("minecraft:enchantments")
+    }
+
+    /// The enchantments a book stores (`minecraft:stored_enchantments`).
+    pub fn stored_enchantments(&self) -> Vec<(i32, i32)> {
+        self.enchantments_of("minecraft:stored_enchantments")
+    }
+
+    fn enchantments_of(&self, component: &str) -> Vec<(i32, i32)> {
+        let Some(mut value) = self.component(component) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -700,6 +709,11 @@ impl ItemStack {
             }
         }
         out
+    }
+
+    /// `EnchantmentHelper.hasAnyEnchantments`: either component non-empty.
+    pub fn has_any_enchantments(&self) -> bool {
+        !self.enchantments().is_empty() || !self.stored_enchantments().is_empty()
     }
 }
 

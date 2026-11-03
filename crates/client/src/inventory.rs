@@ -77,7 +77,9 @@ impl MenuKind {
         if self == Self::Crafter { 9 } else { own }
     }
 
-    /// The container's own slot indices that `Slot.mayPlace` rejects.
+    /// The container's own slot indices whose `Slot.mayPlace` rejects items.
+    /// For the crafter that is own slot 9 (menu slot 45); everywhere else
+    /// own and menu indices coincide.
     fn result_slots(self) -> &'static [usize] {
         match self {
             Self::Anvil => &[2],
@@ -112,6 +114,8 @@ pub struct Container {
     /// The container's own slots, in the menu's own-slot order. The player's
     /// 36 storage slots live in [`Inventory`].
     pub slots: Vec<Option<ItemStack>>,
+    /// `ContainerData`: menu data slots (`set_data`).
+    pub data: Vec<i16>,
     pub state_id: i32,
 }
 
@@ -209,12 +213,27 @@ fn is_beacon_payment(stack: &ItemStack) -> bool {
     )
 }
 
+/// `AbstractFurnaceMenu.isFuel`: an item that cooks.
 fn is_furnace_fuel(stack: &ItemStack) -> bool {
-    stack.has("minecraft:cooking_fuel") || stack.name() == "minecraft:bucket"
+    stack.has("minecraft:cooking_fuel")
 }
 
+/// `FurnaceFuelSlot.mayPlace`: fuel, or an empty bucket.
+fn fuel_slot_may_place(stack: &ItemStack) -> bool {
+    is_furnace_fuel(stack) || stack.name() == "minecraft:bucket"
+}
+
+/// `ItemTags.BREWING_POTION_INPUTS`: the three potion items and the empty
+/// bottle. Tipped arrows carry `potion_contents` by default too, so the
+/// component cannot stand in for the tag.
 fn is_potion_input(stack: &ItemStack) -> bool {
-    stack.has("minecraft:potion_contents") || stack.name() == "minecraft:glass_bottle"
+    matches!(
+        stack.name(),
+        "minecraft:potion"
+            | "minecraft:splash_potion"
+            | "minecraft:lingering_potion"
+            | "minecraft:glass_bottle"
+    )
 }
 
 fn is_brewing_fuel(stack: &ItemStack) -> bool {
@@ -234,11 +253,17 @@ fn is_banner_pattern(stack: &ItemStack) -> bool {
 }
 
 fn is_cartography_addition(stack: &ItemStack) -> bool {
+    // `CartographyTableMenu` slot 1: plain glass panes only, no dyed ones.
     matches!(
         stack.name(),
         "minecraft:paper" | "minecraft:map" | "minecraft:glass_pane"
-    ) || stack.name().ends_with("_glass_pane")
-        || stack.has("minecraft:map_id")
+    )
+}
+
+/// `GrindstoneMenu` input slots: a damageable item or one with
+/// enchantments, stored ones included (enchanted books).
+fn is_grindstone_input(stack: &ItemStack) -> bool {
+    stack.is_damageable() || stack.has_any_enchantments()
 }
 
 /// `ScrollWheelHandler.getNextScrollWheelSelection`: one wheel event moves
@@ -434,6 +459,31 @@ impl Inventory {
         Ok(())
     }
 
+    /// `CrafterMenu.isSlotDisabled`: data slot `own` holds 1 while the grid
+    /// slot is switched off.
+    fn crafter_slot_disabled(&self, own: usize) -> bool {
+        self.container
+            .as_ref()
+            .is_some_and(|c| c.data.get(own).copied().unwrap_or(0) == 1)
+    }
+
+    /// `handleContainerSetData`: `AbstractContainerMenu.setData`.
+    pub(crate) fn set_data(&mut self, mut body: &[u8]) -> Result<(), DecodeError> {
+        let container_id = VarInt::decode(&mut body)?.0;
+        let id = i16::decode(&mut body)?;
+        let value = i16::decode(&mut body)?;
+        if let Some(container) = self.container.as_mut().filter(|c| c.id == container_id) {
+            let Ok(index) = usize::try_from(id) else {
+                return Ok(());
+            };
+            if index >= container.data.len() {
+                container.data.resize(index + 1, 0);
+            }
+            container.data[index] = value;
+        }
+        Ok(())
+    }
+
     /// `handleSetHeldSlot`.
     pub(crate) fn set_held_slot(&mut self, mut body: &[u8]) -> Result<(), DecodeError> {
         let index = VarInt::decode(&mut body)?.0;
@@ -507,6 +557,13 @@ impl Inventory {
         }
     }
 
+    /// `Slot.mayPickup`: only the crafter's result is a
+    /// `NonInteractiveResultSlot`.
+    fn slot_may_pickup(&self, index: usize) -> bool {
+        !(self.menu_kind() == MenuKind::Crafter
+            && matches!(self.slot_ref(index), Some(SlotRef::Container(9))))
+    }
+
     /// The menu's slot filters (`Slot.mayPlace`).
     fn slot_accepts(&self, index: usize, stack: &ItemStack) -> bool {
         match self.slot_ref(index) {
@@ -534,9 +591,11 @@ impl Inventory {
                     return false;
                 }
                 match kind {
+                    // `CrafterSlot.mayPlace`: a disabled slot takes nothing.
+                    MenuKind::Crafter if own < 9 => !self.crafter_slot_disabled(own),
                     MenuKind::Beacon if own == 0 => is_beacon_payment(stack),
                     MenuKind::BlastFurnace | MenuKind::Furnace | MenuKind::Smoker if own == 1 => {
-                        is_furnace_fuel(stack)
+                        fuel_slot_may_place(stack)
                     }
                     MenuKind::BrewingStand => match own {
                         0..=2 => is_potion_input(stack),
@@ -555,9 +614,7 @@ impl Inventory {
                         1 => is_cartography_addition(stack),
                         _ => true,
                     },
-                    MenuKind::Grindstone if own < 2 => {
-                        stack.is_damageable() || stack.has("minecraft:enchantments")
-                    }
+                    MenuKind::Grindstone if own < 2 => is_grindstone_input(stack),
                     _ => true,
                 }
             }
@@ -577,6 +634,12 @@ impl Inventory {
                 if (kind == MenuKind::Beacon && own == 0)
                     || (kind == MenuKind::Enchantment && own == 0)
                     || (kind == MenuKind::BrewingStand && own <= 2)
+                    // `FurnaceFuelSlot.getMaxStackSize`: buckets alone.
+                    || (matches!(
+                        kind,
+                        MenuKind::BlastFurnace | MenuKind::Furnace | MenuKind::Smoker
+                    ) && own == 1
+                        && stack.name() == "minecraft:bucket")
                 {
                     return 1;
                 }
@@ -643,6 +706,11 @@ impl Inventory {
             return;
         };
         if index >= self.menu_len() {
+            return;
+        }
+        // `doClick`: an unpickable slot with an item ignores the click;
+        // an empty one still rejects the carried stack via `mayPlace`.
+        if self.menu_item(index).is_some() && !self.slot_may_pickup(index) {
             return;
         }
         match (self.menu_item(index).cloned(), self.cursor.take()) {
@@ -854,9 +922,8 @@ impl Inventory {
         if self.cursor.is_none() || index >= self.menu_len() {
             return;
         }
-        // Every slot in our model allows pickup; collection only starts from
-        // an empty slot, as in `doClick`.
-        if self.menu_item(index).is_some() {
+        // `doClick`: collection starts from an empty or unpickable slot.
+        if self.menu_item(index).is_some() && self.slot_may_pickup(index) {
             return;
         }
         let max = self
@@ -883,7 +950,8 @@ impl Inventory {
                 let Some(target) = self.menu_item(i) else {
                     continue;
                 };
-                if !ItemStack::same_item_same_components(Some(target), Some(carried))
+                if !self.slot_may_pickup(i)
+                    || !ItemStack::same_item_same_components(Some(target), Some(carried))
                     || (pass == 0 && target.count == target.max_stack_size())
                 {
                     continue;
@@ -911,7 +979,7 @@ impl Inventory {
         let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        if index >= self.menu_len() {
+        if index >= self.menu_len() || !self.slot_may_pickup(index) {
             return;
         }
         if let Some(stack) = self.menu_item(index).cloned() {
@@ -928,7 +996,7 @@ impl Inventory {
         let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        if index >= self.menu_len() {
+        if index >= self.menu_len() || !self.slot_may_pickup(index) {
             return;
         }
         let Some(mut stack) = self.menu_item(index).cloned() else {
@@ -958,7 +1026,8 @@ impl Inventory {
                 let reverse = result
                     || matches!(
                         kind,
-                        MenuKind::Generic
+                        MenuKind::Crafter
+                            | MenuKind::Generic
                             | MenuKind::Hopper
                             | MenuKind::Beacon
                             | MenuKind::BrewingStand
@@ -970,35 +1039,65 @@ impl Inventory {
             return;
         }
 
-        let moved = match kind {
-            MenuKind::Lectern => false,
-            MenuKind::Generic | MenuKind::Hopper => self.move_range(&mut stack, 0..own, false),
-            MenuKind::Crafter => self.move_range(&mut stack, 0..9, false),
-            MenuKind::Crafting => self.move_range(&mut stack, 1..own, false),
-            MenuKind::BlastFurnace | MenuKind::Furnace | MenuKind::Smoker => {
-                if is_furnace_fuel(&stack) {
-                    self.move_range(&mut stack, 1..2, false)
+        // `Some(moved)`: the menu's own quick-move rule claimed the click.
+        // When the rule applies but the move fails vanilla returns EMPTY, it
+        // does not fall back to the player storage; `None` means the item
+        // belongs in the player storage instead.
+        let container_move: Option<bool> = match kind {
+            // `LecternMenu.quickMoveStack` returns EMPTY for every slot.
+            MenuKind::Lectern => Some(false),
+            MenuKind::Generic | MenuKind::Hopper => {
+                Some(self.move_range(&mut stack, 0..own, false))
+            }
+            MenuKind::Crafter => Some(self.move_range(&mut stack, 0..9, false)),
+            // On failure the crafting menu moves between main and hotbar.
+            MenuKind::Crafting => {
+                if self.move_range(&mut stack, 1..own, false) {
+                    Some(true)
                 } else {
-                    self.move_range(&mut stack, 0..1, false)
+                    None
+                }
+            }
+            MenuKind::BlastFurnace | MenuKind::Furnace | MenuKind::Smoker => {
+                // The cookable check needs synced recipes; treat non-fuel
+                // items as cookable (vanilla checks cookable before fuel).
+                if is_furnace_fuel(&stack) {
+                    Some(self.move_range(&mut stack, 1..2, false))
+                } else {
+                    Some(self.move_range(&mut stack, 0..1, false))
                 }
             }
             MenuKind::Beacon => {
-                stack.count == 1
-                    && self.menu_item(0).is_none()
-                    && self.move_range(&mut stack, 0..1, false)
+                // `paymentSlot.mayPlace` is part of the claim: a non-payment
+                // item takes the main-to-hotbar fallback instead.
+                if stack.count == 1 && self.menu_item(0).is_none() && self.slot_accepts(0, &stack) {
+                    Some(self.move_range(&mut stack, 0..1, false))
+                } else {
+                    None
+                }
             }
             MenuKind::BrewingStand => {
+                // `BREWING_REAGENTS` is a recipe property set this client
+                // does not sync: non-fuel, non-potion items are assumed to
+                // be reagents, which vanilla routes to the ingredient slot
+                // and returns EMPTY for on a failed move.
                 if is_brewing_fuel(&stack) {
-                    self.move_range(&mut stack, 4..5, false)
+                    if self.move_range(&mut stack, 4..5, false) {
+                        Some(true)
+                    } else {
+                        // A fuel that overflows the fuel slot may still be a
+                        // reagent (blaze powder).
+                        Some(self.move_range(&mut stack, 3..4, false))
+                    }
                 } else if is_potion_input(&stack) {
-                    self.move_range(&mut stack, 0..3, false)
+                    Some(self.move_range(&mut stack, 0..3, false))
                 } else {
-                    self.move_range(&mut stack, 3..4, false)
+                    Some(self.move_range(&mut stack, 3..4, false))
                 }
             }
             MenuKind::Enchantment => {
                 if stack.name() == "minecraft:lapis_lazuli" {
-                    self.move_range(&mut stack, 1..2, false)
+                    Some(self.move_range(&mut stack, 1..2, false))
                 } else if self.menu_item(0).is_none() {
                     // `quickMoveStack` moves exactly one item into the
                     // enchanting slot and leaves the rest in the source.
@@ -1006,51 +1105,58 @@ impl Inventory {
                     one.count = 1;
                     if self.insert_at(0, &mut one, 1) {
                         stack.count -= 1;
-                        true
+                        Some(true)
                     } else {
-                        false
+                        Some(false)
                     }
                 } else {
-                    false
+                    Some(false)
                 }
             }
-            MenuKind::Anvil | MenuKind::Smithing => {
-                let inputs = if kind == MenuKind::Anvil { 0..2 } else { 0..3 };
-                self.move_range(&mut stack, inputs, false)
+            // `canMoveIntoInputSlots` is true for the anvil.
+            MenuKind::Anvil => Some(self.move_range(&mut stack, 0..2, false)),
+            MenuKind::Smithing => {
+                // The input filters come from synced recipe property sets
+                // this client does not track; keep the storage fallback.
+                if self.move_range(&mut stack, 0..3, false) {
+                    Some(true)
+                } else {
+                    None
+                }
             }
             MenuKind::Grindstone => {
-                let acceptable = stack.is_damageable() || stack.has("minecraft:enchantments");
-                acceptable
-                    && (self.move_range(&mut stack, 0..1, false)
-                        || self.move_range(&mut stack, 1..2, false))
+                if self.menu_item(0).is_some() && self.menu_item(1).is_some() {
+                    None
+                } else {
+                    Some(self.move_range(&mut stack, 0..2, false))
+                }
             }
             MenuKind::Loom => {
                 if is_banner(&stack) {
-                    self.move_range(&mut stack, 0..1, false)
+                    Some(self.move_range(&mut stack, 0..1, false))
                 } else if is_dye(&stack) {
-                    self.move_range(&mut stack, 1..2, false)
+                    Some(self.move_range(&mut stack, 1..2, false))
                 } else if is_banner_pattern(&stack) {
-                    self.move_range(&mut stack, 2..3, false)
+                    Some(self.move_range(&mut stack, 2..3, false))
                 } else {
-                    false
+                    None
                 }
             }
             MenuKind::CartographyTable => {
                 if stack.has("minecraft:map_id") {
-                    self.move_range(&mut stack, 0..1, false)
+                    Some(self.move_range(&mut stack, 0..1, false))
                 } else if is_cartography_addition(&stack) {
-                    self.move_range(&mut stack, 1..2, false)
+                    Some(self.move_range(&mut stack, 1..2, false))
                 } else {
-                    false
+                    None
                 }
             }
-            MenuKind::Stonecutter => {
-                self.menu_item(0).is_none() && self.move_range(&mut stack, 0..1, false)
-            }
-            MenuKind::Merchant | MenuKind::Inventory => false,
+            // The stonecutter input check needs synced recipes.
+            MenuKind::Stonecutter => Some(self.move_range(&mut stack, 0..1, false)),
+            MenuKind::Merchant | MenuKind::Inventory => None,
         };
 
-        if !moved {
+        if container_move.is_none() {
             self.move_player_storage(&mut stack, index, player_start);
         }
         self.set_menu_item(index, (stack.count > 0).then_some(stack));
@@ -1104,6 +1210,9 @@ impl Inventory {
         match (source_stack, target_stack) {
             (None, None) => {}
             (None, Some(target_stack)) => {
+                if !self.slot_may_pickup(target) {
+                    return;
+                }
                 self.slots[source] = Some(target_stack);
                 self.set_menu_item(target, None);
             }
@@ -1126,6 +1235,7 @@ impl Inventory {
             (Some(source_stack), Some(target_stack)) => {
                 let max = self.slot_max_stack(target, &source_stack);
                 if self.slot_accepts(target, &source_stack)
+                    && self.slot_may_pickup(target)
                     && source_stack.count <= max
                     && target_stack.count <= 64
                 {
@@ -1143,7 +1253,7 @@ impl Inventory {
         let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        if index >= self.menu_len() {
+        if index >= self.menu_len() || !self.slot_may_pickup(index) {
             return;
         }
         let count = if all {
@@ -1657,6 +1767,261 @@ mod tests {
         // Player storage quick-moves back into the 3x3 grid.
         inv.click(9, 0, ContainerInput::QuickMove).unwrap();
         assert_eq!(container_get(&inv, 1).unwrap().name(), "minecraft:stick");
+    }
+
+    /// `CrafterSlot.mayPlace`: data slots 0..8 switch grid slots off.
+    #[test]
+    fn crafter_disabled_slots_reject_placement() {
+        let mut inv = menu(7, 10);
+        inv.cursor = Some(item("minecraft:stone", 4));
+
+        let data = |value: i16| {
+            let mut body = Vec::new();
+            write_var_int(&mut body, 5);
+            body.extend_from_slice(&0i16.to_be_bytes());
+            body.extend_from_slice(&value.to_be_bytes());
+            body
+        };
+
+        inv.set_data(&data(1)).unwrap();
+        inv.click(0, 0, ContainerInput::Pickup).unwrap();
+        assert_eq!(
+            container_get(&inv, 0),
+            None,
+            "a disabled slot takes nothing"
+        );
+        assert_eq!(inv.cursor.as_ref().unwrap().count, 4);
+
+        inv.set_data(&data(0)).unwrap();
+        inv.click(0, 0, ContainerInput::Pickup).unwrap();
+        assert_eq!(container_get(&inv, 0).unwrap().count, 4);
+        assert!(inv.cursor.is_none());
+    }
+
+    /// `CartographyTableMenu` slot 1 takes plain glass panes, not dyed ones.
+    #[test]
+    fn cartography_rejects_stained_glass_panes() {
+        let inv = menu(23, 3);
+        assert!(inv.slot_accepts(1, &item("minecraft:paper", 1)));
+        assert!(inv.slot_accepts(1, &item("minecraft:map", 1)));
+        assert!(inv.slot_accepts(1, &item("minecraft:glass_pane", 1)));
+        assert!(!inv.slot_accepts(1, &item("minecraft:white_stained_glass_pane", 1)));
+        assert!(!inv.slot_accepts(0, &item("minecraft:stone", 1)));
+    }
+
+    /// When a menu's targeted input move fails, vanilla returns EMPTY; it
+    /// does not move the stack between the player's main slots and hotbar.
+    #[test]
+    fn failed_input_quick_moves_do_not_fall_back() {
+        // The clicked menu slot for the inventory's first main slot is the
+        // menu's own slot count; the container's slots come first.
+
+        // Loom: the banner slot already holds a different banner.
+        let mut loom = menu(18, 4);
+        container_set(&mut loom, 0, item("minecraft:red_banner", 1));
+        loom.slots[slot::MAIN] = Some(item("minecraft:white_banner", 1));
+        loom.click(4, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(
+            loom.get(slot::MAIN).unwrap().name(),
+            "minecraft:white_banner"
+        );
+        assert!(loom.get(slot::HOTBAR).is_none());
+
+        // Cartography: the addition slot already holds a different addition.
+        let mut cartography = menu(23, 3);
+        container_set(&mut cartography, 1, item("minecraft:paper", 1));
+        cartography.slots[slot::MAIN] = Some(item("minecraft:map", 1));
+        cartography.click(3, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(cartography.get(slot::MAIN).unwrap().name(), "minecraft:map");
+        assert!(cartography.get(slot::HOTBAR).is_none());
+
+        // Anvil: both inputs are full.
+        let mut anvil = menu(8, 3);
+        container_set(&mut anvil, 0, item("minecraft:netherite_scrap", 1));
+        container_set(&mut anvil, 1, item("minecraft:netherite_scrap", 1));
+        anvil.slots[slot::MAIN] = Some(item("minecraft:dirt", 1));
+        anvil.click(3, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(anvil.get(slot::MAIN).unwrap().name(), "minecraft:dirt");
+        assert!(anvil.get(slot::HOTBAR).is_none());
+
+        // Lectern: quick move is empty for every slot.
+        let mut lectern = menu(17, 1);
+        lectern.slots[slot::MAIN] = Some(item("minecraft:writable_book", 1));
+        lectern.click(1, 0, ContainerInput::QuickMove).unwrap();
+        assert!(lectern.get(slot::MAIN).is_some());
+        assert!(lectern.get(slot::HOTBAR).is_none());
+    }
+
+    /// `BrewingStandMenu.PotionSlot`: potion items and empty bottles only.
+    /// Tipped arrows carry the `potion_contents` default too.
+    #[test]
+    fn brewing_potion_slots_reject_tipped_arrows() {
+        let inv = menu(11, 5);
+        for name in [
+            "minecraft:potion",
+            "minecraft:splash_potion",
+            "minecraft:lingering_potion",
+            "minecraft:glass_bottle",
+        ] {
+            assert!(inv.slot_accepts(0, &item(name, 1)), "{name}");
+        }
+        assert!(!inv.slot_accepts(0, &item("minecraft:tipped_arrow", 1)));
+        assert!(!inv.slot_accepts(2, &item("minecraft:tipped_arrow", 1)));
+    }
+
+    /// `FurnaceFuelSlot`: empty buckets are placeable, one at a time.
+    #[test]
+    fn furnace_fuel_slot_takes_buckets_one_at_a_time() {
+        let inv = menu(14, 3);
+        let bucket = item("minecraft:bucket", 3);
+        assert!(inv.slot_accepts(1, &bucket));
+        assert_eq!(inv.slot_max_stack(1, &bucket), 1);
+        assert!(!inv.slot_accepts(1, &item("minecraft:stone", 3)));
+        assert!(inv.slot_accepts(1, &item("minecraft:coal", 3)));
+        assert_eq!(inv.slot_max_stack(1, &item("minecraft:coal", 3)), 64);
+    }
+
+    /// The crafter's result is a `NonInteractiveResultSlot`: nothing takes
+    /// from it, and collection may start there but skips it.
+    #[test]
+    fn crafter_result_slot_is_non_interactive() {
+        let mut inv = menu(7, 10);
+        container_set(&mut inv, 9, item("minecraft:diamond", 1));
+
+        inv.pickup(45, false);
+        inv.quick_move(45);
+        inv.throw(45, false);
+        assert!(inv.cursor.is_none());
+        assert_eq!(container_get(&inv, 9).unwrap().count, 1);
+
+        let mut creative = menu(7, 10);
+        container_set(&mut creative, 9, item("minecraft:diamond", 1));
+        creative.creative = true;
+        creative.clone_slot(45);
+        assert!(creative.cursor.is_none());
+
+        // A swap from the hotbar cannot displace it either.
+        let mut inv = menu(7, 10);
+        container_set(&mut inv, 9, item("minecraft:diamond", 1));
+        inv.slots[slot::HOTBAR] = Some(item("minecraft:stone", 1));
+        inv.swap(45, 0);
+        assert_eq!(inv.get(slot::HOTBAR).unwrap().name(), "minecraft:stone");
+        assert_eq!(container_get(&inv, 9).unwrap().name(), "minecraft:diamond");
+
+        // Pickup-all may start from the result, but only collects elsewhere.
+        let mut inv = menu(7, 10);
+        container_set(&mut inv, 9, item("minecraft:diamond", 1));
+        container_set(&mut inv, 0, item("minecraft:diamond", 2));
+        inv.cursor = Some(item("minecraft:diamond", 1));
+        inv.pickup_all(45, false);
+        assert_eq!(container_get(&inv, 9).unwrap().count, 1);
+        assert!(container_get(&inv, 0).is_none());
+        assert_eq!(inv.cursor.as_ref().unwrap().count, 3);
+    }
+
+    /// `BeaconMenu`: only a single payment item claims the payment slot;
+    /// anything else takes the main-to-hotbar fallback.
+    #[test]
+    fn beacon_payment_only_for_single_payment_items() {
+        // The beacon's first menu slot is the payment slot, so its first
+        // player slot (the inventory's main slot 9) is menu slot 1.
+        let mut inv = menu(9, 1);
+        inv.slots[slot::MAIN] = Some(item("minecraft:diamond", 1));
+        inv.click(1, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(container_get(&inv, 0).unwrap().name(), "minecraft:diamond");
+
+        // Two payment items do not fit the single payment slot.
+        let mut inv = menu(9, 1);
+        inv.slots[slot::MAIN] = Some(item("minecraft:emerald", 2));
+        inv.click(1, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(container_get(&inv, 0), None);
+        assert_eq!(inv.get(slot::HOTBAR).unwrap().name(), "minecraft:emerald");
+
+        // A non-payment item falls back to the hotbar, not the slot.
+        let mut inv = menu(9, 1);
+        inv.slots[slot::MAIN] = Some(item("minecraft:stone", 1));
+        inv.click(1, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(container_get(&inv, 0), None);
+        assert_eq!(inv.get(slot::HOTBAR).unwrap().name(), "minecraft:stone");
+    }
+
+    /// `BrewingStandMenu`: fuel goes to the fuel slot, bottles to the
+    /// bottle slots, and the rest is treated as a reagent.
+    #[test]
+    fn brewing_quick_move_routes_fuel_bottles_and_reagents() {
+        // The brewing stand's five own slots come first, so the inventory's
+        // first main slot is menu slot 5.
+        // Fuel fits the fuel slot.
+        let mut inv = menu(11, 5);
+        inv.slots[slot::MAIN] = Some(item("minecraft:blaze_powder", 4));
+        inv.click(5, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(
+            container_get(&inv, 4).unwrap().name(),
+            "minecraft:blaze_powder"
+        );
+
+        // Fuel overflows into the ingredient slot (blaze powder is a
+        // reagent), then stops without touching the player's storage.
+        let mut inv = menu(11, 5);
+        container_set(&mut inv, 4, item("minecraft:blaze_powder", 64));
+        inv.slots[slot::MAIN] = Some(item("minecraft:blaze_powder", 4));
+        inv.click(5, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(
+            container_get(&inv, 3).unwrap().name(),
+            "minecraft:blaze_powder"
+        );
+        assert!(inv.get(slot::MAIN).is_none());
+
+        // A reagent claims the ingredient slot; a full ingredient slot
+        // leaves it in place.
+        let mut inv = menu(11, 5);
+        inv.slots[slot::MAIN] = Some(item("minecraft:nether_wart", 4));
+        inv.click(5, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(
+            container_get(&inv, 3).unwrap().name(),
+            "minecraft:nether_wart"
+        );
+
+        let mut inv = menu(11, 5);
+        container_set(&mut inv, 3, item("minecraft:nether_wart", 64));
+        inv.slots[slot::MAIN] = Some(item("minecraft:nether_wart", 4));
+        inv.click(5, 0, ContainerInput::QuickMove).unwrap();
+        assert_eq!(inv.get(slot::MAIN).unwrap().count, 4);
+        assert!(inv.get(slot::HOTBAR).is_none());
+
+        // Bottles and potions go to the bottle slots.
+        for name in [
+            "minecraft:glass_bottle",
+            "minecraft:potion",
+            "minecraft:splash_potion",
+        ] {
+            let mut inv = menu(11, 5);
+            inv.slots[slot::MAIN] = Some(item(name, 1));
+            inv.click(5, 0, ContainerInput::QuickMove).unwrap();
+            assert_eq!(container_get(&inv, 0).unwrap().name(), name);
+        }
+    }
+
+    /// `CrafterMenu`: the grid quick-moves to the player storage in reverse
+    /// order, filling the hotbar's last slot first.
+    #[test]
+    fn crafter_grid_quick_moves_in_reverse() {
+        let mut inv = menu(7, 10);
+        container_set(&mut inv, 0, item("minecraft:oak_planks", 3));
+        inv.click(0, 0, ContainerInput::QuickMove).unwrap();
+        assert!(container_get(&inv, 0).is_none());
+        assert_eq!(inv.get(44).unwrap().name(), "minecraft:oak_planks");
+        assert!(inv.get(9).is_none());
+    }
+
+    /// `GrindstoneMenu` inputs take damageable or enchanted items only.
+    #[test]
+    fn grindstone_rejects_plain_items() {
+        let inv = menu(15, 3);
+        // `minecraft:enchantments` is a default (empty) component on every
+        // item, so the check must look at the entries, not the component.
+        assert!(!inv.slot_accepts(0, &item("minecraft:stone", 1)));
+        assert!(!inv.slot_accepts(1, &item("minecraft:stone", 1)));
     }
 
     #[test]

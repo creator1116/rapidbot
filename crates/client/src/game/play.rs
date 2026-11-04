@@ -1007,6 +1007,11 @@ impl Game {
                     warn!("could not read entity data: {e}");
                 }
             }
+            ids::SET_EQUIPMENT => {
+                play_mut(&mut self.play)?
+                    .entities
+                    .set_equipment(&packet.body)?;
+            }
             ids::CONTAINER_SET_SLOT => {
                 let mut body = packet.body.as_slice();
                 let _container = VarInt::decode(&mut body)?.0;

@@ -399,6 +399,38 @@ pub struct Entity {
     stays_still: bool,
     /// `DragonFlightHistory` of an `EnderDragon`, recorded each tick.
     flight: Option<Box<DragonFlight>>,
+    /// `LivingEntity` equipment slots, from `ClientboundSetEquipmentPacket`.
+    equipment: Equipment,
+}
+
+/// What another entity wears and holds (`ClientboundSetEquipmentPacket`).
+/// Empty slots are the default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Equipment {
+    pub main_hand: Option<ItemStack>,
+    pub off_hand: Option<ItemStack>,
+    pub feet: Option<ItemStack>,
+    pub legs: Option<ItemStack>,
+    pub chest: Option<ItemStack>,
+    pub head: Option<ItemStack>,
+    pub body: Option<ItemStack>,
+    pub saddle: Option<ItemStack>,
+}
+
+impl Equipment {
+    fn slot_mut(&mut self, slot: rapidbot_world::item::EquipmentSlot) -> &mut Option<ItemStack> {
+        use rapidbot_world::item::EquipmentSlot;
+        match slot {
+            EquipmentSlot::MainHand => &mut self.main_hand,
+            EquipmentSlot::OffHand => &mut self.off_hand,
+            EquipmentSlot::Feet => &mut self.feet,
+            EquipmentSlot::Legs => &mut self.legs,
+            EquipmentSlot::Chest => &mut self.chest,
+            EquipmentSlot::Head => &mut self.head,
+            EquipmentSlot::Body => &mut self.body,
+            EquipmentSlot::Saddle => &mut self.saddle,
+        }
+    }
 }
 
 /// `Mth.unpackDegrees`.
@@ -501,6 +533,7 @@ impl Entity {
             firework_attached_to: None,
             stays_still: false,
             flight: None,
+            equipment: Equipment::default(),
         }
     }
 
@@ -1028,6 +1061,18 @@ impl Entity {
         .any(|c| info.is(c))
     }
 
+    /// What this entity wears and holds, as last sent by the server.
+    pub fn equipment(&self) -> &Equipment {
+        &self.equipment
+    }
+
+    /// `Entity.canBePickedFromInside`: vanilla's default is true, so the
+    /// crosshair can pick an entity whose box contains the eyes. Only a
+    /// sulfur cube carrying something in its body slot says no.
+    pub fn can_be_picked_from_inside(&self) -> bool {
+        !self.info().is("SulfurCube") || self.equipment.body.is_none()
+    }
+
     /// `Entity.hurtClient` for a player's attack: whether the client
     /// itself counts the hit as landed. True for other players and
     /// vehicles; for mobs only the server knows.
@@ -1549,7 +1594,9 @@ impl Entities {
             let clip = clip_box(min, max, from, query.to);
             let contains = (0..3).all(|i| from[i] >= min[i] && from[i] < max[i]);
             if contains {
-                if nearest >= 0.0 {
+                // `ProjectileUtil.getEntityHitResult`: an entity the eyes are
+                // inside is only picked when it allows it.
+                if nearest >= 0.0 && entity.can_be_picked_from_inside() {
                     hovered = Some(EntityHit {
                         id: entity.id,
                         location: clip.unwrap_or(from),
@@ -1720,6 +1767,7 @@ impl Entities {
             firework_attached_to: None,
             stays_still: false,
             flight: None,
+            equipment: Equipment::default(),
         };
         if entity.info().is("HangingEntity") {
             // The add packet carries the attached block, not the box center.
@@ -1892,6 +1940,37 @@ impl Entities {
             entity.snap_to(pos, y_rot, x_rot);
         } else {
             entity.move_or_interpolate_to(Some(PositionPath::Linear(pos)), Some((y_rot, x_rot)));
+        }
+        Ok(())
+    }
+
+    /// `ClientboundSetEquipmentPacket`: the entity ID, then pairs of a slot
+    /// byte (its high bit means another pair follows) and a stack. Slots are
+    /// validated while decoding, as vanilla's constructor does, so a bad slot
+    /// fails even for an entity the client does not have.
+    pub fn set_equipment(&mut self, mut body: &[u8]) -> Result<(), DecodeError> {
+        let id = VarInt::decode(&mut body)?.0;
+        let mut slots = Vec::new();
+        loop {
+            let raw = u8::decode(&mut body)?;
+            let stack = ItemStack::decode(&mut body)?;
+            // `EquipmentSlot.VALUES.get(slotId & 127)`: an unknown slot is a
+            // packet error, as it is vanilla.
+            let slot =
+                rapidbot_world::item::EquipmentSlot::from_equipment_packet((raw & 0x7f) as usize)
+                    .ok_or_else(|| {
+                    DecodeError::Custom(format!("unknown equipment slot {}", raw & 0x7f))
+                })?;
+            slots.push((slot, stack));
+            if raw & 0x80 == 0 {
+                break;
+            }
+        }
+        let Some(entity) = self.by_id.get_mut(&id) else {
+            return Ok(());
+        };
+        for (slot, stack) in slots {
+            *entity.equipment.slot_mut(slot) = stack;
         }
         Ok(())
     }
@@ -2860,5 +2939,63 @@ mod tests {
         e.player_info_update(&body(&[9, 9, 9], &signature), None)
             .unwrap();
         assert!(e.player_info(&uuid).unwrap().chat_session.is_some());
+    }
+
+    /// `ClientboundSetEquipmentPacket`: a slot byte's high bit chains the
+    /// next pair, and an empty stack clears a slot.
+    #[test]
+    fn equipment_packets_fill_and_clear_entity_slots() {
+        let mut e = Entities::default();
+        add(&mut e, 7, "minecraft:zombie", [0.0, 64.0, 0.0]);
+        // Main hand (ordinal 0, more follows) then body (ordinal 6).
+        let body = [7, 0x80, 1, 5, 0, 0, 6, 1, 9, 0, 0];
+        e.set_equipment(&body).unwrap();
+        let equipment = e.get(7).unwrap().equipment();
+        assert_eq!(equipment.main_hand.as_ref().unwrap().item, 5);
+        assert_eq!(equipment.body.as_ref().unwrap().item, 9);
+        assert!(equipment.off_hand.is_none());
+        assert!(equipment.head.is_none());
+
+        // A zero count is the empty stack.
+        e.set_equipment(&[7, 0, 0, 0]).unwrap();
+        assert!(e.get(7).unwrap().equipment().main_hand.is_none());
+
+        // Equipment for an entity the client does not have is ignored, but
+        // an unknown slot fails while the packet is decoded.
+        assert!(e.set_equipment(&[99, 0, 1, 5, 0, 0]).is_ok());
+        assert!(e.set_equipment(&[7, 8, 1, 5, 0, 0]).is_err());
+        assert!(e.set_equipment(&[99, 8, 1, 5, 0, 0]).is_err());
+    }
+
+    /// `ProjectileUtil.getEntityHitResult`: an entity whose box contains the
+    /// eyes is picked by default, but a sulfur cube with something in its
+    /// body slot reports `canBePickedFromInside` false.
+    #[test]
+    fn a_sulfur_cube_with_a_body_item_cannot_be_picked_from_inside() {
+        let mut e = Entities::default();
+        let tags = Tags::default();
+        add(&mut e, 7, "minecraft:sulfur_cube", [0.0, 64.0, 0.0]);
+        // A cube large enough to close around the player's eyes.
+        e.by_id.get_mut(&7).unwrap().scale = 4.0;
+        let pick = |e: &Entities| {
+            e.pick(EntityPick {
+                except: 1,
+                from: [0.0, 64.5, 0.0],
+                to: [0.0, 64.5, 1.0],
+                search: ([-4.0, 60.0, -4.0], [4.0, 68.0, 4.0]),
+                max_distance_sq: 25.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+        };
+        assert_eq!(
+            pick(&e).map(|hit| hit.id),
+            Some(7),
+            "an empty cube is picked from inside"
+        );
+
+        // Body slot 6 with one item: hasBodyItem, so not pickable from inside.
+        e.set_equipment(&[7, 6, 1, 5, 0, 0]).unwrap();
+        assert!(pick(&e).is_none());
     }
 }

@@ -51,6 +51,33 @@ struct DoorWait {
     clicked: bool,
 }
 
+/// While mining the blocks of the next waypoint.
+struct DigWait {
+    cell: (i32, i32, i32),
+    ticks: u32,
+    /// The attack button is down for this dig, so it can be let go after.
+    pressed: bool,
+}
+
+/// While placing the block a waypoint stands on.
+struct PlaceWait {
+    cell: (i32, i32, i32),
+    ticks: u32,
+    /// The right click has been sent; wait for the server's block update.
+    clicked: bool,
+}
+
+/// Whether the blocks of a waypoint cell still have to be mined.
+fn dig_still_needed(ctx: &TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+    path::blocks(ctx.world, cell.0, cell.1, cell.2)
+        || path::blocks(ctx.world, cell.0, cell.1 + 1, cell.2)
+}
+
+/// Whether the floor of a waypoint cell still has to be placed.
+fn place_still_needed(ctx: &TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+    !path::blocks(ctx.world, cell.0, cell.1 - 1, cell.2)
+}
+
 /// Places a search may examine before settling for the nearest it found.
 const SEARCH_LIMIT: usize = 24_000;
 /// Places examined per tick: about a millisecond's work.
@@ -92,6 +119,17 @@ pub struct Walker {
     exact: bool,
     /// The door being opened, if the next waypoint is one.
     door_wait: Option<DoorWait>,
+    /// What routes may mine through. `None` (the default) plans around
+    /// blocks the player cannot walk through.
+    pub dig: Option<path::DigPolicy>,
+    /// What a route may place to fill a hole in the floor. `None` (the
+    /// default) only walks on ground that is already there, and the block
+    /// named here has to be the one in hand when the click is made.
+    pub place: Option<path::PlacePolicy>,
+    /// The waypoint cell being mined, if the next one needs it.
+    dig_wait: Option<DigWait>,
+    /// The waypoint cell being floored, if the next one needs it.
+    place_wait: Option<PlaceWait>,
 }
 
 impl Walker {
@@ -108,6 +146,10 @@ impl Walker {
             replans: 0,
             exact: false,
             door_wait: None,
+            dig: None,
+            place: None,
+            dig_wait: None,
+            place_wait: None,
             goal: None,
             state: State::Idle,
             gaze_pitch: 8.0,
@@ -230,7 +272,16 @@ impl Walker {
                 };
                 self.best_distance = f64::MAX;
                 self.stalled_ticks = 0;
-                self.plan = match Search::new(ctx.world, pos, target, SEARCH_LIMIT) {
+                let search = Search::new(ctx.world, pos, target, SEARCH_LIMIT).map(|mut search| {
+                    if let Some(dig) = self.dig {
+                        search = search.with_digging(dig);
+                    }
+                    if let Some(place) = self.place {
+                        search = search.with_placing(place);
+                    }
+                    search
+                });
+                self.plan = match search {
                     Some(search) => Plan::Searching(search),
                     None => Plan::Straight,
                 };
@@ -314,6 +365,74 @@ impl Walker {
             return;
         }
 
+        // The next waypoint may need its blocks mined before it can be stood
+        // in, and, like a closed door, it must not be ticked off from
+        // outside: the cell is not reached until the blocks are gone.
+        let next_dig = match &self.plan {
+            Plan::Following { path, next, .. } if *next < path.points.len() => {
+                let waypoint = path.points[*next];
+                (waypoint.dig && dig_still_needed(ctx, waypoint.cell)).then_some(waypoint.cell)
+            }
+            _ => None,
+        };
+        let first_dig = match &self.plan {
+            Plan::Following { path, next, .. } => path
+                .points
+                .iter()
+                .enumerate()
+                .skip(*next)
+                .find(|(_, w)| w.dig && dig_still_needed(ctx, w.cell))
+                .map(|(i, _)| i),
+            _ => None,
+        };
+        if self
+            .dig_wait
+            .as_ref()
+            .is_some_and(|wait| Some(wait.cell) != next_dig)
+        {
+            // Finished, or the route changed: let go of the button.
+            if self.dig_wait.take().is_some_and(|wait| wait.pressed) {
+                ctx.hold_attack(false);
+            }
+        }
+        if let Some(cell) = next_dig
+            && self.dig_at(ctx, cell)
+        {
+            return;
+        }
+
+        // The next waypoint may need a block placed under it first, and the
+        // cell is not reached until that block is there.
+        let next_place = match &self.plan {
+            Plan::Following { path, next, .. } if *next < path.points.len() => {
+                let waypoint = path.points[*next];
+                (waypoint.place && place_still_needed(ctx, waypoint.cell)).then_some(waypoint.cell)
+            }
+            _ => None,
+        };
+        let first_place = match &self.plan {
+            Plan::Following { path, next, .. } => path
+                .points
+                .iter()
+                .enumerate()
+                .skip(*next)
+                .find(|(_, w)| w.place && place_still_needed(ctx, w.cell))
+                .map(|(i, _)| i),
+            _ => None,
+        };
+        if self
+            .place_wait
+            .as_ref()
+            .is_some_and(|wait| Some(wait.cell) != next_place)
+        {
+            self.place_wait = None;
+        }
+        if let Some(cell) = next_place
+            && self.place_at(ctx, cell)
+        {
+            return;
+        }
+
         let Plan::Following {
             path,
             next,
@@ -329,7 +448,10 @@ impl Walker {
         // Tick off waypoints: the one aimed for, or any on the way to it.
         // Stop before a closed door: the door itself is not reached until it
         // has been opened.
-        let limit = first_closed
+        let limit = [first_closed, first_dig, first_place]
+            .into_iter()
+            .flatten()
+            .min()
             .unwrap_or(path.points.len())
             .min(path.points.len());
         let reach = (*target + 1).min(path.points.len()).min(limit).max(*next);
@@ -367,7 +489,11 @@ impl Walker {
                 .any(|w| {
                     // A door is opened on arrival, so its closed shape is
                     // expected. A door that has gone is caught at the door.
+                    // A waypoint to mine or to floor has no surface until
+                    // that is done, and is checked there instead.
                     w.door.is_none()
+                        && !w.dig
+                        && !w.place
                         && path::surface(ctx.world, w.cell.0, w.cell.1, w.cell.2)
                             .is_none_or(|s| (s - w.surface).abs() > 0.01)
                 });
@@ -501,6 +627,153 @@ impl Walker {
         true
     }
 
+    /// Mines the blocks of the next waypoint. Returns true while the walker
+    /// should stand still: it aims at the lowest block that is still there
+    /// and holds the attack button until the server's block update takes it
+    /// away, exactly as the dig example does.
+    fn dig_at(&mut self, ctx: &mut TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+        // Stand still, and do not carry a jump over from the last stretch.
+        self.jump_hold = 0;
+        self.jump_in = None;
+        ctx.set_keys(Keys::default());
+
+        // Feet first, then head: the player fits through a one-high hole.
+        let Some(y) = [cell.1, cell.1 + 1]
+            .into_iter()
+            .find(|y| path::blocks(ctx.world, cell.0, *y, cell.2))
+        else {
+            if self.dig_wait.take().is_some_and(|wait| wait.pressed) {
+                ctx.hold_attack(false);
+            }
+            return false;
+        };
+
+        let wait = match &mut self.dig_wait {
+            Some(wait) if wait.cell == cell => wait,
+            _ => {
+                self.dig_wait = Some(DigWait {
+                    cell,
+                    ticks: 0,
+                    pressed: false,
+                });
+                self.dig_wait.as_mut().expect("just set")
+            }
+        };
+        wait.ticks = wait.ticks.saturating_add(1);
+        ctx.aim_at(
+            Vec3::new(cell.0 as f64 + 0.5, y as f64 + 0.5, cell.2 as f64 + 0.5),
+            3.0,
+        );
+
+        // The crosshair is the pick from before this tick's mouse movement.
+        // Hold the button only once it is actually on the block.
+        let hit = ctx.crosshair;
+        if !hit.miss && hit.pos == (cell.0, y, cell.2) {
+            ctx.hold_attack(true);
+            wait.pressed = true;
+        }
+        let (timed_out, pressed) = (wait.ticks > 400, wait.pressed);
+
+        // Twenty seconds without the block going: think again, and
+        // eventually give up.
+        if timed_out {
+            if pressed {
+                ctx.hold_attack(false);
+            }
+            self.dig_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return true;
+        }
+        true
+    }
+
+    /// Fills the hole under the next waypoint. Returns true while the walker
+    /// should stand still: it aims at the face of a block beside the hole and
+    /// clicks only once the crosshair is really on such a face, so a face
+    /// that cannot be reached is never clicked blindly.
+    fn place_at(&mut self, ctx: &mut TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+        self.jump_hold = 0;
+        self.jump_in = None;
+        ctx.set_keys(Keys::default());
+
+        let hole = (cell.0, cell.1 - 1, cell.2);
+        if path::blocks(ctx.world, hole.0, hole.1, hole.2) {
+            // Already floored: nothing to do.
+            self.place_wait = None;
+            return false;
+        }
+        let Some(place) = self.place else {
+            return false;
+        };
+        // The block has to be the one in hand, or the click would place
+        // something else (or nothing).
+        let in_hand = ctx
+            .inventory
+            .held()
+            .and_then(|stack| path::PlacePolicy::for_item(stack.item))
+            .is_some_and(|held| held.block == place.block);
+        if !in_hand {
+            self.place_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return true;
+        }
+
+        let wait = match &mut self.place_wait {
+            Some(wait) if wait.cell == cell => wait,
+            _ => {
+                self.place_wait = Some(PlaceWait {
+                    cell,
+                    ticks: 0,
+                    clicked: false,
+                });
+                self.place_wait.as_mut().expect("just set")
+            }
+        };
+        wait.ticks = wait.ticks.saturating_add(1);
+
+        // The crosshair is the pick from before this tick's mouse movement.
+        // Aim at one face at a time, trying the next every fifteen ticks, and
+        // click as soon as the crosshair is on any face beside the hole.
+        let targets = path::place_targets(ctx.world, hole);
+        if let Some(aim) = targets.get((wait.ticks / 15) as usize % targets.len().max(1)) {
+            ctx.aim_at(*aim, 3.0);
+        }
+        let hit = ctx.crosshair;
+        let on_face = !hit.miss
+            && path::NEIGHBOURS.iter().any(|((dx, dy, dz), face)| {
+                hit.pos == (hole.0 + dx, hole.1 + dy, hole.2 + dz) && hit.direction == *face
+            });
+        if !wait.clicked && on_face {
+            ctx.click_use();
+            wait.clicked = true;
+        }
+        let timed_out = wait.ticks > 200;
+
+        // Ten seconds without the block appearing: think again, and
+        // eventually give up.
+        if timed_out {
+            self.place_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return true;
+        }
+        true
+    }
+
     /// Turns towards `target` and holds the keys to get there. `distance`
     /// is how much room there is to build up speed. `force_sprint` is for a
     /// gap jump, where speed matters even over a short run-up.
@@ -571,6 +844,8 @@ mod tests {
     use rapidbot_human::MouseModel;
     use rapidbot_physics::Player;
     use rapidbot_world::chunk::Chunk;
+    use rapidbot_world::item::ItemData;
+    use rapidbot_world::raycast::Direction;
     use rapidbot_world::tags::Tags;
     use rapidbot_world::{DimensionHeight, Registry, World};
 
@@ -695,6 +970,36 @@ mod tests {
                     let name = Registry::get().blocks[block as usize].name.clone();
                     self.set_door(door.lower.0, door.lower.1, door.lower.2, &name, true);
                 }
+            }
+
+            // Stand in for the server's mining: a held attack on a block
+            // takes it away (at once here, rather than after the break
+            // time).
+            if self.actions.attack == Some(true) && !crosshair.miss {
+                let (x, y, z) = crosshair.pos;
+                self.world.set_block_state(x, y, z, 0);
+            }
+
+            // Stand in for the server's placement: a click on a block face
+            // puts the walker's chosen block in front of that face.
+            if self.actions.use_block
+                && !crosshair.miss
+                && let Some(place) = self.walker.place
+            {
+                let (dx, dy, dz) = match crosshair.direction {
+                    Direction::Down => (0, -1, 0),
+                    Direction::Up => (0, 1, 0),
+                    Direction::North => (0, 0, -1),
+                    Direction::South => (0, 0, 1),
+                    Direction::West => (-1, 0, 0),
+                    Direction::East => (1, 0, 0),
+                };
+                self.world.set_block_state(
+                    crosshair.pos.0 + dx,
+                    crosshair.pos.1 + dy,
+                    crosshair.pos.2 + dz,
+                    place.block,
+                );
             }
 
             // No keyboard model here: fingers follow at once.
@@ -1061,5 +1366,139 @@ mod tests {
         assert!(!sim.walker.gave_up());
         assert_eq!(sim.player.pos.y, 64.0);
         assert!(sim.player.pos.z > 14.0);
+    }
+
+    /// A dirt box around the goal is mined into: the walker aims at the
+    /// blocks it has to break and holds the attack button until they go.
+    #[test]
+    fn digs_into_a_walled_goal() {
+        let mut sim = Sim::new();
+        let dirt = state("minecraft:dirt", "");
+        for x in 5..=7 {
+            for z in -1..=1 {
+                if x == 6 && z == 0 {
+                    continue;
+                }
+                for y in 64..=65 {
+                    sim.world.set_block_state(x, y, z, dirt);
+                }
+            }
+        }
+        sim.walker.dig = Some(path::DigPolicy::HAND);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        let mut ticks = 0;
+        while !sim.walker.arrived() && !sim.walker.gave_up() && ticks < 3_000 {
+            sim.step();
+            ticks += 1;
+        }
+        // Arriving means inside the box, which is only reachable by mining.
+        assert!(
+            !sim.walker.gave_up() && sim.player.pos.x > 5.5,
+            "did not mine in, at {:?}, after {ticks} ticks",
+            sim.player.pos
+        );
+    }
+
+    /// Stone is harder than a hand policy allows, so the same box stays a
+    /// wall and the walker gives up rather than mining it out.
+    #[test]
+    fn does_not_dig_stone_by_hand() {
+        let mut sim = Sim::new();
+        let stone = state("minecraft:stone", "");
+        for x in 5..=7 {
+            for z in -1..=1 {
+                if x == 6 && z == 0 {
+                    continue;
+                }
+                for y in 64..=65 {
+                    sim.world.set_block_state(x, y, z, stone);
+                }
+            }
+        }
+        sim.walker.dig = Some(path::DigPolicy::HAND);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        for _ in 0..900 {
+            sim.step();
+        }
+        assert!(sim.walker.gave_up(), "stone should not be mined by hand");
+    }
+
+    /// The item registry id of a name.
+    fn item_id(name: &str) -> u32 {
+        ItemData::get()
+            .items
+            .iter()
+            .position(|item| item.name == name)
+            .unwrap() as u32
+    }
+
+    /// A `set_slot` body putting one `item` in the player's slot `slot`.
+    fn held_block_body(slot: i16, item: u32) -> Vec<u8> {
+        let mut body = vec![0, 0]; // container 0: the player's own inventory
+        body.extend_from_slice(&slot.to_be_bytes());
+        body.push(1); // one item
+        rapidbot_buf::write_var_int(&mut body, item as i32);
+        body.push(0); // no components added
+        body.push(0); // none removed
+        body
+    }
+
+    /// A void gap across the world is bridged with a placed block, clicked
+    /// against the floor on the far side. The ceiling rules out jumping it.
+    #[test]
+    fn places_a_block_across_a_gap() {
+        let mut sim = Sim::new();
+        let dirt = state("minecraft:dirt", "");
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            sim.world.set_block_state(4, 63, z, 0);
+            sim.world.set_block_state(4, 66, z, 1);
+            sim.world.set_block_state(5, 66, z, 1);
+        }
+        assert_eq!(
+            Registry::get()
+                .block_for_item(item)
+                .map(|block| block.name.as_str()),
+            Some("minecraft:dirt"),
+            "item id {item}"
+        );
+        sim.inventory.set_slot(&held_block_body(36, item)).unwrap();
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        let mut ticks = 0;
+        while !sim.walker.arrived() && !sim.walker.gave_up() && ticks < 2_000 {
+            sim.step();
+            ticks += 1;
+        }
+        assert!(
+            !sim.walker.gave_up() && sim.player.pos.x > 5.0,
+            "did not place across, at {:?}, after {ticks} ticks",
+            sim.player.pos
+        );
+        assert_eq!(
+            sim.world.block_state(4, 63, 0),
+            Some(dirt),
+            "the gap is filled"
+        );
+    }
+
+    /// Without the block in hand the walker does not click at all: it gives
+    /// up rather than placing something else.
+    #[test]
+    fn does_not_place_without_the_block_in_hand() {
+        let mut sim = Sim::new();
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            sim.world.set_block_state(4, 63, z, 0);
+            sim.world.set_block_state(4, 66, z, 1);
+            sim.world.set_block_state(5, 66, z, 1);
+        }
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        for _ in 0..900 {
+            sim.step();
+        }
+        assert!(sim.walker.gave_up(), "no block, no bridge");
+        assert_eq!(sim.world.block_state(4, 63, 0), Some(0), "nothing placed");
     }
 }

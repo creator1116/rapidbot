@@ -170,8 +170,24 @@ land.
 ## Ready-made behaviour
 
 - `nav::Walker`: `go_to(point)`, then `tick(ctx)` every tick. It plans a
-  route (around walls, up steps, down drops, clear of lava) and follows it
-  using modeled input. Check `arrived()` and `gave_up()`.
+  route (around walls, up steps, down drops, clear of lava, through open
+  doors) and follows it using modeled input. Check `arrived()` and
+  `gave_up()`.
+
+  Set `walker.dig = Some(path::DigPolicy::HAND)` to let it mine through
+  blocks the policy allows: the route then includes cells whose blocks have
+  to be broken, and the walker stops at each, aims at them and holds the
+  attack button until the server's block update takes them away. Mining is
+  costed by hardness, so a route through a wall is only chosen when it beats
+  walking around; `DigPolicy::HAND` covers soil, sand, gravel and wood, not
+  stone or ores.
+
+  Set `walker.place = Some(path::PlacePolicy::for_item(item)?)` to let it
+  fill a hole in the floor on the way: such a waypoint has a block placed
+  under it, clicked against the face of a block beside the hole, and the
+  click is only made once the crosshair really is on that face. The block
+  has to be the one in hand, in the selected hotbar slot. Bridging out over
+  open air (the sneak-bridge a person does) is not supported yet.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
   approaches, keeps the crosshair on the target and clicks when the attack
   charge is back.

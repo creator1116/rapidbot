@@ -66,6 +66,60 @@ impl SenderValidator {
 
 /// `LastSeenMessages.LAST_SEEN_MESSAGES_MAX_LENGTH`.
 const LAST_SEEN: usize = 20;
+
+/// `FilterMask`: how much of a chat message the server filtered out.
+enum FilterMask {
+    PassThrough,
+    FullyFiltered,
+    /// `BitSet.valueOf` bytes; bit `i` masks UTF-16 unit `i`.
+    Partial(Vec<u8>),
+}
+
+impl FilterMask {
+    /// `FilterMask.STREAM_CODEC`: a type id, then the bitset for a partial
+    /// mask. Unknown ids map to pass-through (`ByIdMap` fallback ZERO).
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(match VarInt::decode(buf)?.0 {
+            1 => Self::FullyFiltered,
+            2 => Self::Partial(rapidbot_buf::ByteArray::decode(buf)?.0),
+            _ => Self::PassThrough,
+        })
+    }
+
+    /// The message as `ChatListener.showMessageToPlayer` renders it, or
+    /// `None` when the message is fully filtered. A pass-through mask shows
+    /// the unsigned content when the server sent any, while a partial mask
+    /// masks the signed content (`FilterMask.applyWithFormatting`).
+    fn display(&self, signed: &str, unsigned: Option<&rapidbot_nbt::Tag>) -> Option<String> {
+        match self {
+            Self::PassThrough => Some(match unsigned {
+                Some(content) => crate::text::nbt_to_plain(content),
+                None => signed.to_owned(),
+            }),
+            Self::FullyFiltered => None,
+            Self::Partial(bits) => Some(masked(signed, bits)),
+        }
+    }
+}
+
+/// `FilterMask.apply`: masked characters are shown as `#`.
+fn masked(text: &str, bits: &[u8]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut unit = 0usize;
+    for c in text.chars() {
+        if bits
+            .get(unit >> 3)
+            .is_some_and(|b| b & (1 << (unit & 7)) != 0)
+        {
+            out.push('#');
+        } else {
+            out.push(c);
+        }
+        unit += c.len_utf16();
+    }
+    out
+}
+
 /// `MessageSignatureCache.DEFAULT_CAPACITY`.
 const CACHE_SIZE: usize = 128;
 /// `ChatScreen`/`ServerboundChatPacket`: 256 UTF-16 units.
@@ -329,16 +383,23 @@ impl ChatState {
         let timestamp = i64::decode(buf)?;
         let salt = i64::decode(buf)?;
         let count = VarInt::decode(buf)?.0;
-        let mut last_seen = Vec::with_capacity(count.clamp(0, LAST_SEEN as i32) as usize);
+        // `ByteBufCodecs.list(20)` rejects longer lists.
+        if count > LAST_SEEN as i32 {
+            return Err(DecodeError::Custom(format!(
+                "{count} last-seen entries, max is {LAST_SEEN}"
+            ))
+            .into());
+        }
+        let mut last_seen = Vec::with_capacity(count.max(0) as usize);
         for _ in 0..count {
             last_seen.push(self.cache.read(buf)?.ok_or(ChatError::UnknownSignature)?);
         }
-        // Unsigned content, then the filter mask: fully filtered (type 1)
-        // messages are not shown.
-        if bool::decode(buf)? {
-            rapidbot_nbt::Tag::decode(buf)?;
-        }
-        let fully_filtered = VarInt::decode(buf)?.0 == 1;
+        let unsigned = if bool::decode(buf)? {
+            Some(rapidbot_nbt::Tag::decode(buf)?)
+        } else {
+            None
+        };
+        let mask = FilterMask::decode(buf)?;
 
         self.cache.push(&last_seen, signature.as_ref());
         let info = sender_info(&sender);
@@ -355,13 +416,10 @@ impl ChatState {
                     self.validators.remove(&sender);
                     if enforces_secure_chat {
                         tracked = signature;
-                    } else if !fully_filtered {
+                    } else if let Some(text) = mask.display(&text, unsigned.as_ref()) {
                         // `SignedMessageValidator.ACCEPT_UNSIGNED` strips a
                         // signature and shows the content.
-                        incoming = Some(Incoming {
-                            sender,
-                            text: text.clone(),
-                        });
+                        incoming = Some(Incoming { sender, text });
                     }
                 }
                 Some(session) => {
@@ -376,11 +434,8 @@ impl ChatState {
                         &last_seen,
                     ) {
                         tracked = signature;
-                        if !fully_filtered {
-                            incoming = Some(Incoming {
-                                sender,
-                                text: text.clone(),
-                            });
+                        if let Some(text) = mask.display(&text, unsigned.as_ref()) {
+                            incoming = Some(Incoming { sender, text });
                         }
                     } else {
                         // `handleChatMessageError` still marks the invalid
@@ -597,23 +652,69 @@ fn signed_bytes(
     data
 }
 
-/// `ChatScreen.normalizeChatMessage` after the edit box's character filter
-/// (`StringUtil.filterText`): no section signs or control characters, runs
-/// of whitespace collapsed, at most 256 UTF-16 units.
+/// `StringUtil.isAllowedChatCharacter`, the edit box's input filter.
+fn allowed_chat_char(c: char) -> bool {
+    let c = c as u32;
+    c != 0xa7 && c >= 32 && c != 127
+}
+
+/// `Character.isWhitespace`: the Unicode space separators except the
+/// non-breaking ones (`U+00A0`, `U+2007`, `U+202F`), plus the control
+/// whitespace `U+0009..=U+000D` and `U+001C..=U+001F`.
+fn is_java_whitespace(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x09..=0x0D
+            | 0x1C..=0x1F
+            | 0x20
+            | 0x1680
+            | 0x2000..=0x2006
+            | 0x2008..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x205F
+            | 0x3000
+    )
+}
+
+/// `ChatScreen.normalizeChatMessage` after the edit box's character filter:
+/// `StringUtil.filterText`, then `StringUtils.normalizeSpace` (Java
+/// `isWhitespace` runs collapse to one space, both ends stripped), then
+/// `StringUtil.trimChatMessage` (at most 256 UTF-16 units). A surrogate
+/// pair cut by the limit becomes `?` when the packet writes UTF-8.
 pub fn normalize(message: &str) -> String {
-    let filtered: String = message
-        .chars()
-        .filter(|&c| c != '\u{a7}' && c >= ' ' && c != '\u{7f}')
-        .collect();
-    let collapsed = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
+    let filtered: String = message.chars().filter(|&c| allowed_chat_char(c)).collect();
+    let mut collapsed = String::with_capacity(filtered.len());
+    let mut last_was_space = true;
+    for c in filtered.chars() {
+        if is_java_whitespace(c) {
+            if !last_was_space {
+                collapsed.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            collapsed.push(c);
+            last_was_space = false;
+        }
+    }
+    if last_was_space {
+        // `StrBuilder.trim` of `normalizeSpace`.
+        collapsed.pop();
+    }
+    let mut out = String::with_capacity(collapsed.len());
     let mut units = 0;
-    collapsed
-        .chars()
-        .take_while(|c| {
-            units += c.len_utf16();
-            units <= MAX_MESSAGE_LENGTH
-        })
-        .collect()
+    for c in collapsed.chars() {
+        let n = c.len_utf16();
+        if units + n > MAX_MESSAGE_LENGTH {
+            if n == 2 && units + 1 == MAX_MESSAGE_LENGTH {
+                out.push('?');
+            }
+            break;
+        }
+        out.push(c);
+        units += n;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -732,6 +833,31 @@ mod tests {
         timestamp: i64,
         salt: i64,
     ) -> Vec<u8> {
+        player_chat_with(
+            global_index,
+            index,
+            sender,
+            signature,
+            text,
+            timestamp,
+            salt,
+            None,
+            (0, &[]),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn player_chat_with(
+        global_index: i32,
+        index: i32,
+        sender: Uuid,
+        signature: Option<Signature>,
+        text: &str,
+        timestamp: i64,
+        salt: i64,
+        unsigned: Option<rapidbot_nbt::Tag>,
+        mask: (i32, &[u8]),
+    ) -> Vec<u8> {
         let mut b = Vec::new();
         VarInt(global_index).encode(&mut b);
         sender.encode(&mut b);
@@ -744,8 +870,15 @@ mod tests {
         timestamp.encode(&mut b);
         salt.encode(&mut b);
         VarInt(0).encode(&mut b); // last seen
-        false.encode(&mut b); // unsigned content
-        VarInt(0).encode(&mut b); // filter mask: pass through
+        unsigned.is_some().encode(&mut b);
+        if let Some(unsigned) = unsigned {
+            unsigned.encode(&mut b);
+        }
+        VarInt(mask.0).encode(&mut b);
+        if mask.0 == 2 {
+            VarInt(mask.1.len() as i32).encode(&mut b);
+            b.extend_from_slice(mask.1);
+        }
         b
     }
 
@@ -1043,5 +1176,70 @@ mod tests {
         assert_eq!(normalize("  hello   world \u{a7}c!\n"), "hello world c!");
         assert_eq!(normalize(&"x".repeat(300)).len(), 256);
         assert_eq!(normalize("   "), "");
+        // `Character.isWhitespace` does not treat non-breaking spaces as
+        // whitespace; they survive untouched.
+        assert_eq!(normalize("a\u{a0}b"), "a\u{a0}b");
+        assert_eq!(normalize("a\u{202f}b"), "a\u{202f}b");
+        // Unicode spaces are trimmed and collapsed.
+        assert_eq!(normalize("\u{2003}a\u{2003}\u{3000}b\u{2003}"), "a b");
+        // A surrogate pair cut at 256 UTF-16 units becomes `?`.
+        let mut long = "x".repeat(255);
+        long.push('\u{1f600}');
+        assert_eq!(normalize(&long), format!("{}?", "x".repeat(255)));
+    }
+
+    #[test]
+    fn unsigned_content_and_filter_masks_shape_display() {
+        let mut chat = ChatState::new();
+        let sender = Uuid::from_u128(7);
+        let info = PlayerInfo::default();
+
+        // Pass-through mask: the unsigned content is shown.
+        let body = player_chat_with(
+            0,
+            0,
+            sender,
+            None,
+            "signed",
+            0,
+            0,
+            Some(rapidbot_nbt::Tag::String("shown".into())),
+            (0, &[]),
+        );
+        let got = chat.player_chat(&body, |_| Some(&info), false).unwrap();
+        assert_eq!(got.incoming.unwrap().text, "shown");
+
+        // A partial mask masks the signed content, even when unsigned
+        // content is present (`applyWithFormatting(signedContent)`).
+        let body = player_chat_with(
+            1,
+            1,
+            sender,
+            None,
+            "abcd",
+            0,
+            0,
+            Some(rapidbot_nbt::Tag::String("ignored".into())),
+            (2, &[0b0101]),
+        );
+        let got = chat.player_chat(&body, |_| Some(&info), false).unwrap();
+        assert_eq!(got.incoming.unwrap().text, "#b#d");
+
+        // Fully filtered messages are not shown but still counted.
+        let body = player_chat_with(2, 2, sender, None, "secret", 0, 0, None, (1, &[]));
+        let got = chat.player_chat(&body, |_| Some(&info), false).unwrap();
+        assert!(got.incoming.is_none());
+
+        // More than 20 last-seen entries is a protocol violation.
+        let mut body = Vec::new();
+        VarInt(3).encode(&mut body); // global index
+        sender.encode(&mut body);
+        VarInt(3).encode(&mut body); // index
+        false.encode(&mut body); // no signature
+        "x".encode(&mut body);
+        0i64.encode(&mut body); // timestamp
+        0i64.encode(&mut body); // salt
+        VarInt(21).encode(&mut body); // 21 last-seen entries
+        assert!(chat.player_chat(&body, |_| Some(&info), false).is_err());
     }
 }

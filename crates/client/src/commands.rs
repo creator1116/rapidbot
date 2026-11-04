@@ -248,11 +248,16 @@ fn is_unquoted(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+')
 }
 
-/// Length of a quoted string including both quotes.
+/// Length of a quoted string including both quotes, when the closing quote
+/// is found. `readStringUntil` only accepts escaping the quote or the
+/// backslash, so anything else is a parse failure.
 fn quoted_length(s: &str, quote: char) -> Option<usize> {
     let mut escaped = false;
     for (i, c) in s.char_indices().skip(1) {
         if escaped {
+            if c != quote && c != '\\' {
+                return None;
+            }
             escaped = false;
         } else if c == '\\' {
             escaped = true;
@@ -476,6 +481,15 @@ mod tests {
         );
         // Behind a redirect to the root nothing is signed.
         assert!(t.signable_arguments("execute msg Steve hi").is_empty());
+    }
+
+    #[test]
+    fn quoted_strings_reject_invalid_escapes() {
+        assert_eq!(quoted_length(r#""ab""#, '"'), Some(4));
+        assert_eq!(quoted_length(r#""a\"b""#, '"'), Some(6));
+        assert_eq!(quoted_length(r#""a\\b""#, '"'), Some(6));
+        assert_eq!(quoted_length(r#""a\qb""#, '"'), None);
+        assert_eq!(quoted_length(r#""ab"#, '"'), None);
     }
 
     #[test]

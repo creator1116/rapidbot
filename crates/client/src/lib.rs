@@ -206,6 +206,7 @@ pub struct SessionData {
     pub server_brand: Option<String>,
     /// `ClientboundStoreCookiePacket` values, answered on request.
     pub cookies: HashMap<Identifier, Vec<u8>>,
+    /// One entry per synchronized registry, in the order collected.
     pub registries: Vec<(Identifier, Vec<RegistryEntry>)>,
     pub enabled_features: Vec<Identifier>,
     /// Raw `ClientboundUpdateTagsPacket` bodies, decoded once the world model
@@ -213,6 +214,25 @@ pub struct SessionData {
     pub tags: Vec<Vec<u8>>,
     pub profile: Option<GameProfile>,
     pub session_id: Option<Uuid>,
+}
+
+impl SessionData {
+    /// `RegistryDataCollector.appendContents`: a registry's contents arrive in
+    /// one packet, so a later packet for the same registry replaces what this
+    /// session collected before. Vanilla builds a fresh collector for every
+    /// configuration phase, including the one `/debugconfig` starts; keeping
+    /// one entry per registry gives that behaviour across a reconfiguration
+    /// instead of counting each registry twice.
+    pub fn set_registry(&mut self, registry: Identifier, entries: Vec<RegistryEntry>) {
+        match self
+            .registries
+            .iter_mut()
+            .find(|(name, _)| *name == registry)
+        {
+            Some((_, existing)) => *existing = entries,
+            None => self.registries.push((registry, entries)),
+        }
+    }
 }
 
 /// Connects, logs in and idles until disconnected. Returns why the
@@ -345,7 +365,9 @@ fn transfer_address(host: &str, port: i32) -> Result<String, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Account, ClientConfig, InputMode, transfer_address};
+    use super::{Account, ClientConfig, InputMode, SessionData, transfer_address};
+    use rapidbot_buf::Identifier;
+    use rapidbot_protocol::packets::configuration::RegistryEntry;
 
     #[test]
     fn direct_input_is_opt_in() {
@@ -356,6 +378,42 @@ mod tests {
             },
         );
         assert_eq!(config.input_mode, InputMode::Human);
+    }
+
+    /// `RegistryDataCollector` is per configuration phase, so a second phase
+    /// (a reconfiguration) must not leave the first phase's entries counted
+    /// again: the chunk reader takes the registry length from this list.
+    #[test]
+    fn configuration_phases_replace_registry_contents() {
+        let entry = |name: &str| RegistryEntry {
+            id: Identifier::from(name),
+            data: None,
+        };
+        let biome = Identifier::from("minecraft:worldgen/biome");
+        let mut session = SessionData::default();
+        session.set_registry(
+            biome.clone(),
+            vec![entry("minecraft:plains"), entry("minecraft:desert")],
+        );
+        // A reconfiguration re-sends every synchronized registry.
+        session.set_registry(
+            biome.clone(),
+            vec![entry("minecraft:plains"), entry("minecraft:desert")],
+        );
+        assert_eq!(session.registries.len(), 1);
+        assert_eq!(session.registries[0].1.len(), 2);
+
+        // Other registries collected in the same phase stay separate.
+        session.set_registry(
+            Identifier::from("minecraft:dimension_type"),
+            vec![entry("minecraft:overworld")],
+        );
+        assert_eq!(session.registries.len(), 2);
+        assert_eq!(
+            session.registries[1].0.normalized(),
+            "minecraft:dimension_type"
+        );
+        assert_eq!(session.registries[1].1.len(), 1);
     }
 
     #[test]

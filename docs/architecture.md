@@ -55,6 +55,21 @@ Like the vanilla client, a bot has network tasks and one main thread.
 
 Tick regularity is visible to servers, so bots are run in release builds.
 
+## The configuration phase
+
+Between login and play the server runs a configuration phase of its own: it
+selects the known packs the client shares with it, sends every synchronized
+registry (entries the selected packs already cover arrive without their data)
+and the tags, and may push resource packs, transfer the client, or show a code
+of conduct. `crates/client/src/game/configuration.rs` collects registries one
+phase at a time and replaces a registry's entries if the same registry arrives
+again, because vanilla builds a fresh collector for every phase. A
+server-initiated transfer starts a fresh login and keeps only the cookie jar
+(the one thing the server remembers between the two); a reconfiguration runs
+the phase again on the same connection, keeping the state vanilla hands the
+new listener (the cookie jar and the account) while collecting the registries
+from scratch.
+
 ## Inside `rapidbot-client`
 
 | File | Role |

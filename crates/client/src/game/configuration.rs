@@ -59,7 +59,7 @@ impl Game {
             }
             cb::RegistryData::ID => {
                 let data = packet.decode::<cb::RegistryData>()?;
-                self.session.registries.push((data.registry, data.entries));
+                self.session.set_registry(data.registry, data.entries);
             }
             cb::UpdateTags::ID => {
                 self.session

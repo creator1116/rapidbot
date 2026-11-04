@@ -485,6 +485,24 @@ impl EquipmentSlot {
             _ => return None,
         })
     }
+
+    /// `EquipmentSlot.VALUES`, the ordinal `ClientboundSetEquipmentPacket`
+    /// encodes: main hand, off hand, feet, legs, chest, head, body, saddle.
+    /// Vanilla's declaration order is what the packet uses; it differs from
+    /// the `id` values above (off hand is 5 there, 1 here).
+    pub fn from_equipment_packet(ordinal: usize) -> Option<Self> {
+        Some(match ordinal {
+            0 => Self::MainHand,
+            1 => Self::OffHand,
+            2 => Self::Feet,
+            3 => Self::Legs,
+            4 => Self::Chest,
+            5 => Self::Head,
+            6 => Self::Body,
+            7 => Self::Saddle,
+            _ => return None,
+        })
+    }
 }
 
 /// `UseEffects`: how using the item in hand changes movement.

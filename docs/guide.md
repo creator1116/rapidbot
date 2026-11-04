@@ -302,6 +302,10 @@ For a different radius or players outside the default range, use
 the client. The framework exposes state; application-specific meaning and
 policy are left to the package user.
 
+`entity.equipment()` is what another entity wears and holds — main hand, off
+hand, the four armor slots, body and saddle — as last sent by
+`ClientboundSetEquipmentPacket`. Empty slots are `None`.
+
 ## Chat verification
 
 Player chat packets are checked against the sender's chat session from the

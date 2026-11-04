@@ -973,9 +973,10 @@ impl Game {
                 .entities
                 .teleport_entity(&packet.body)?,
             ids::PLAYER_INFO_UPDATE => {
+                let keys = self.config.profile_keys.as_ref();
                 play_mut(&mut self.play)?
                     .entities
-                    .player_info_update(&packet.body)?;
+                    .player_info_update(&packet.body, keys)?;
             }
             ids::PLAYER_INFO_REMOVE => play_mut(&mut self.play)?
                 .entities

@@ -14,6 +14,7 @@
 mod accounts;
 mod browser;
 mod cache;
+mod keys;
 mod microsoft;
 mod minecraft;
 mod realms;
@@ -29,6 +30,7 @@ use uuid::Uuid;
 
 pub use accounts::{AccountStatus, AccountStore, StoredAccount};
 pub use cache::{CachedMinecraft, CachedMsa, TokenCache};
+pub use keys::ServicesKeySet;
 pub use microsoft::DeviceCode;
 pub use minecraft::{ChatKeys, JoinError, join_server};
 pub use realms::{Realm, RealmCompatibility, RealmJoin, RealmPlayer, RealmState, RealmsClient};
@@ -54,6 +56,9 @@ pub(crate) struct Endpoints {
     pub minecraft_login: String,
     pub minecraft_profile: String,
     pub minecraft_certificates: String,
+    /// `getPublicKeys`: the `playerCertificateKeys` that sign chat profile
+    /// keys.
+    pub minecraft_public_keys: String,
 }
 
 impl Default for Endpoints {
@@ -68,6 +73,7 @@ impl Default for Endpoints {
                 .into(),
             minecraft_profile: "https://api.minecraftservices.com/minecraft/profile".into(),
             minecraft_certificates: "https://api.minecraftservices.com/player/certificates".into(),
+            minecraft_public_keys: "https://api.minecraftservices.com/publickeys".into(),
         }
     }
 }
@@ -455,6 +461,27 @@ impl Authenticator {
             }
         }
     }
+
+    /// Fetches Mojang's chat profile keys (`ServicesKeyType.PROFILE_KEY`).
+    /// Vanilla does this once at startup; without them a client cannot tell a
+    /// real profile key from one the server invented, and vanilla drops every
+    /// announced chat session.
+    pub async fn services_keys(&self) -> Result<ServicesKeySet, AuthError> {
+        let response = self
+            .http
+            .get(&self.endpoints.minecraft_public_keys)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(AuthError::Minecraft(format!(
+                "public keys: HTTP {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+        ServicesKeySet::from_json(&body)
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +604,7 @@ mod tests {
             minecraft_login: format!("{base}/minecraft/login"),
             minecraft_profile: format!("{base}/minecraft/profile"),
             minecraft_certificates: format!("{base}/minecraft/certificates"),
+            minecraft_public_keys: format!("{base}/publickeys"),
         };
         (endpoints, hits, server)
     }

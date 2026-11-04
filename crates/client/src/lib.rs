@@ -204,6 +204,13 @@ pub struct ClientConfig {
     /// keeps the keys the account was created with, which is enough for a
     /// session shorter than the key pair's lifetime.
     pub chat_key_renewer: Option<ChatKeySource>,
+    /// Mojang's `PROFILE_KEY` service keys
+    /// ([`Authenticator::services_keys`](rapidbot_auth::Authenticator::services_keys)).
+    /// With them, a player's announced chat key is accepted only when Mojang
+    /// signed it; without them the key is trusted, which is a documented
+    /// approximation of vanilla (which fetches the keys at startup and drops
+    /// every announcement it cannot check).
+    pub profile_keys: Option<rapidbot_auth::ServicesKeySet>,
     /// Click "Respawn" on the death screen after a human delay.
     pub auto_respawn: bool,
     /// The server's code of conduct was accepted on an earlier visit
@@ -231,6 +238,7 @@ impl ClientConfig {
             human_seed: None,
             mouse_profile: None,
             chat_key_renewer: None,
+            profile_keys: None,
             auto_respawn: true,
             code_of_conduct_accepted: false,
             pack_cache: None,

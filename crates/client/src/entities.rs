@@ -1989,7 +1989,16 @@ impl Entities {
     /// `ClientboundPlayerInfoUpdatePacket`: an action bit set, then per
     /// player a UUID and the data of each action in order. Returns the
     /// names of newly added players.
-    pub fn player_info_update(&mut self, mut body: &[u8]) -> Result<Vec<String>, DecodeError> {
+    ///
+    /// `profile_keys` are Mojang's `PROFILE_KEY` service keys, when the
+    /// caller has them: a chat session whose key Mojang did not sign is
+    /// dropped, as `PlayerInfo.initializeChatSession` does. Without a key set
+    /// there is nothing to check against, so the announced key is trusted.
+    pub fn player_info_update(
+        &mut self,
+        mut body: &[u8],
+        profile_keys: Option<&rapidbot_auth::ServicesKeySet>,
+    ) -> Result<Vec<String>, DecodeError> {
         let buf = &mut body;
         let actions = u8::decode(buf)?;
         let count = VarInt::decode(buf)?.0;
@@ -2009,15 +2018,23 @@ impl Entities {
                     let session_id = Uuid::decode(buf)?;
                     let expires_at = i64::decode(buf)?;
                     let public_key_der = ByteArray::decode(buf)?.0;
-                    // Mojang's signature over the profile key is not
-                    // validated here; the key still authenticates messages
-                    // within this connection.
-                    let _key_signature = ByteArray::decode(buf)?;
-                    Some(crate::chat::ChatSession {
-                        session_id,
-                        expires_at,
-                        public_key_der,
-                    })
+                    let key_signature = ByteArray::decode(buf)?.0;
+                    let signed = profile_keys.is_none_or(|keys| {
+                        keys.validate_profile_key(uuid, expires_at, &public_key_der, &key_signature)
+                    });
+                    if signed {
+                        Some(crate::chat::ChatSession {
+                            session_id,
+                            expires_at,
+                            public_key_der,
+                        })
+                    } else {
+                        tracing::warn!(
+                            %uuid,
+                            "ignoring a chat session whose profile key Mojang did not sign"
+                        );
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2163,7 +2180,7 @@ mod tests {
         info.push(3); // spectator
         info.push(1); // listed
         VarInt(73).encode(&mut info);
-        assert_eq!(e.player_info_update(&info).unwrap(), ["PlayerOne"]);
+        assert_eq!(e.player_info_update(&info, None).unwrap(), ["PlayerOne"]);
 
         add(&mut e, 42, "minecraft:player", [5.0, 64.0, 0.0]);
         assert!(e.get(42).unwrap().is_player());
@@ -2782,5 +2799,66 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// `PlayerInfo.initializeChatSession`: when Mojang's service keys are
+    /// available, a chat session whose key they did not sign is dropped.
+    #[test]
+    fn a_chat_session_key_must_be_signed_by_mojang() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+
+        let der = |key: &rsa::RsaPrivateKey| {
+            key.to_public_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        };
+        let service = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let keys = rapidbot_auth::ServicesKeySet::from_der_keys(&[der(&service)]);
+
+        let profile = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let profile_der = der(&profile);
+        let uuid = Uuid::from_u128(42);
+        let expires = 1_700_000_000_000i64;
+        let mut payload = uuid.as_bytes().to_vec();
+        payload.extend_from_slice(&expires.to_be_bytes());
+        payload.extend_from_slice(&profile_der);
+        let signature = SigningKey::<sha1::Sha1>::new(service)
+            .sign(&payload)
+            .to_vec();
+
+        let body = |profile_der: &[u8], signature: &[u8]| {
+            let mut info = vec![2u8, 1];
+            uuid.encode(&mut info);
+            info.push(1);
+            Uuid::from_u128(99).encode(&mut info);
+            expires.encode(&mut info);
+            ByteArray(profile_der.to_vec()).encode(&mut info);
+            ByteArray(signature.to_vec()).encode(&mut info);
+            info
+        };
+
+        let mut e = Entities::default();
+        e.player_info_update(&body(&profile_der, &signature), Some(&keys))
+            .unwrap();
+        assert!(
+            e.player_info(&uuid).unwrap().chat_session.is_some(),
+            "Mojang signed this key"
+        );
+
+        // A key the signature does not cover is not accepted.
+        let mut e = Entities::default();
+        e.player_info_update(&body(&[9, 9, 9], &signature), Some(&keys))
+            .unwrap();
+        assert!(e.player_info(&uuid).unwrap().chat_session.is_none());
+
+        // Without a key set there is nothing to check against.
+        let mut e = Entities::default();
+        e.player_info_update(&body(&[9, 9, 9], &signature), None)
+            .unwrap();
+        assert!(e.player_info(&uuid).unwrap().chat_session.is_some());
     }
 }

@@ -136,6 +136,12 @@ pub(crate) struct Game {
     packs: Option<crate::packs::PackManager>,
     /// A pack the server requires is waiting on the prompt.
     pack_required: bool,
+    /// `ProfileKeyPairManager`: where a session's chat keys are renewed from,
+    /// results waiting for the next tick, and the runtime the fetch runs on
+    /// (the main thread blocks for the whole game loop).
+    chat_key_tx: std::sync::mpsc::Sender<Result<rapidbot_auth::ChatKeys, String>>,
+    chat_key_rx: std::sync::mpsc::Receiver<Result<rapidbot_auth::ChatKeys, String>>,
+    runtime: tokio::runtime::Handle,
 }
 
 /// Everything `run_inner` needs to start the next connection after a
@@ -164,8 +170,10 @@ impl Game {
         session: SessionData,
         controller: Box<dyn Controller>,
         link: BotLink,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         let now = clock::millis();
+        let (chat_key_tx, chat_key_rx) = std::sync::mpsc::channel();
         let frames = frame::FrameLimiter::new(config.display, now);
         let seed = config.human_seed.unwrap_or_else(|| {
             // FNV-1a of the account name: a stable "person" per account.
@@ -213,6 +221,9 @@ impl Game {
             close_press: None,
             packs: None,
             pack_required: false,
+            chat_key_tx,
+            chat_key_rx,
+            runtime,
         }
     }
 
@@ -544,10 +555,17 @@ impl Game {
             return;
         };
         // Minecraft.tick: the tick rate manager, the right-click delay, then
-        // gameMode.tick() (connection.tick() would come next but has nothing
-        // to do here) → ClientPacketListener.tick().
+        // gameMode.tick() (connection.tick() → ClientPacketListener.tick()).
         play.tick_rate.tick();
         play.game_mode.tick();
+        // ClientPacketListener.tick starts with the profile key pair check.
+        play.poll_chat_keys(
+            &self.net,
+            self.config.chat_key_renewer.as_ref(),
+            &self.chat_key_rx,
+            &self.chat_key_tx,
+            &self.runtime,
+        );
         if play.listener_tick(&self.net) {
             self.link.emit(BotEvent::Loaded);
         }

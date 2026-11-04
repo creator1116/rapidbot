@@ -29,6 +29,9 @@ pub mod text;
 pub mod webshare;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use rapidbot_buf::Identifier;
 use rapidbot_protocol::packets::common::ClientInformation;
@@ -112,6 +115,70 @@ pub enum ResourcePackPolicy {
     Enabled,
 }
 
+/// The async factory behind a [`ChatKeySource`]: call it for the next pair.
+type RenewChatKeys = dyn Fn() -> Pin<Box<dyn Future<Output = Result<rapidbot_auth::ChatKeys, String>> + Send>>
+    + Send
+    + Sync;
+
+/// Where a long-running session gets renewed chat-signing keys.
+///
+/// Vanilla fetches a new `ProfileKeyPair` once the announced one's
+/// `refreshed_after` has passed (at most once an hour) and announces it with
+/// `chat_session_update`; signatures stop being accepted when the key pair
+/// expires. A bot that stays connected longer than that needs the same, so
+/// [`ClientConfig::chat_key_renewer`] takes one of these.
+///
+/// [`Authenticator`](rapidbot_auth::Authenticator) is the usual source:
+/// [`ChatKeySource::from_authenticator`] wraps one.
+#[derive(Clone)]
+pub struct ChatKeySource(Arc<RenewChatKeys>);
+
+impl ChatKeySource {
+    /// Builds a source from an async factory. The factory runs again for
+    /// every renewal.
+    pub fn new<F, Fut>(renew: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<rapidbot_auth::ChatKeys, String>> + Send + 'static,
+    {
+        Self(Arc::new(move || {
+            Box::pin(renew()) as Pin<Box<dyn Future<Output = _> + Send>>
+        }))
+    }
+
+    /// Renews through a shared [`Authenticator`](rapidbot_auth::Authenticator)
+    /// with [`refresh_if_needed`](rapidbot_auth::Authenticator::refresh_if_needed),
+    /// so tokens that are still fresh are not requested again.
+    pub fn from_authenticator(
+        authenticator: Arc<tokio::sync::Mutex<rapidbot_auth::Authenticator>>,
+    ) -> Self {
+        Self::new(move || {
+            let authenticator = authenticator.clone();
+            async move {
+                let account = authenticator
+                    .lock()
+                    .await
+                    .refresh_if_needed(rapidbot_auth::REFRESH_SKEW_SECS)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                account
+                    .chat_keys
+                    .ok_or_else(|| "the account has no chat keys".to_owned())
+            }
+        })
+    }
+
+    pub(crate) async fn renew(&self) -> Result<rapidbot_auth::ChatKeys, String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for ChatKeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChatKeySource")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// As a player would type it into the server list: `host[:port]`.
@@ -133,6 +200,10 @@ pub struct ClientConfig {
     /// Mouse habits fitted to a real player (from `rapidbot-recorder
     /// analyze`). Without one, traits are generated from the seed.
     pub mouse_profile: Option<rapidbot_human::MouseProfile>,
+    /// Renews the account's chat-signing keys while a session runs; `None`
+    /// keeps the keys the account was created with, which is enough for a
+    /// session shorter than the key pair's lifetime.
+    pub chat_key_renewer: Option<ChatKeySource>,
     /// Click "Respawn" on the death screen after a human delay.
     pub auto_respawn: bool,
     /// The server's code of conduct was accepted on an earlier visit
@@ -159,6 +230,7 @@ impl ClientConfig {
             mouse: MouseSettings::default(),
             human_seed: None,
             mouse_profile: None,
+            chat_key_renewer: None,
             auto_respawn: true,
             code_of_conduct_accepted: false,
             pack_cache: None,
@@ -300,7 +372,15 @@ async fn run_inner(
         let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
         let reader_task = net::spawn_reader(reader, sender.clone(), inbound_tx);
 
-        let game = game::Game::new(config, sender, inbound_rx, session, controller, link);
+        let game = game::Game::new(
+            config,
+            sender,
+            inbound_rx,
+            session,
+            controller,
+            link,
+            tokio::runtime::Handle::current(),
+        );
         let outcome = match tokio::task::spawn_blocking(move || game.run()).await {
             Ok(outcome) => outcome,
             Err(e) => {

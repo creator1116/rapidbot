@@ -1,6 +1,7 @@
 //! Play state (`ClientPacketListener`), main-thread half.
 
 use rand::Rng;
+use rapidbot_auth::ChatKeys;
 use rapidbot_buf::{ByteArray, Decode, VarInt};
 use rapidbot_physics::attributes::Operation;
 use rapidbot_physics::math::Vec3;
@@ -13,13 +14,26 @@ use rapidbot_world::chunk::Chunk;
 use rapidbot_world::tags::Tags;
 use rapidbot_world::{DimensionHeight, Registry, World};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use super::{Game, LocalPlayer};
 use crate::net::PacketSender;
-use crate::{ClientError, SessionData, clock};
+use crate::{ChatKeySource, ClientError, SessionData, clock};
 
 /// `LevelLoadTracker.CLIENT_WAIT_TIMEOUT_MS`.
 const CLIENT_WAIT_TIMEOUT_MS: i64 = 30_000;
+
+/// `AccountProfileKeyPairManager.MINIMUM_PROFILE_KEY_REFRESH_INTERVAL`: an
+/// hour between chat key fetches, even if the pair says it is due sooner.
+const CHAT_KEY_REFRESH_INTERVAL_MS: i64 = 3_600_000;
+
+/// `Instant.now()` and `ProfileKeyPair.refreshedAfter` are Unix time.
+/// [`clock::millis`] is modelled uptime, so it must not be compared with them.
+fn wall_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
 
 /// `LevelLoadTracker.ClientState`.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +78,16 @@ pub(super) struct PlayState {
     /// `keyPairFuture`: set on an online-mode login when the account has
     /// chat keys, sent (as `setKeyPair` does) on the next listener tick.
     pending_chat_session: Option<sb::ChatSessionUpdate>,
+    /// The profile a chat session was announced for; `None` keeps the key
+    /// pair manager idle (offline mode, or no keys).
+    chat_profile: Option<Uuid>,
+    /// `nextProfileKeyRefreshTime` (Unix ms): an hour after the keys were
+    /// prepared before another pair is fetched.
+    chat_key_refresh_at: i64,
+    /// The announced pair's `refreshed_after` (Unix ms): `dueRefresh`.
+    chat_key_refreshed_after: i64,
+    /// A fetch is running on the runtime.
+    chat_key_refresh_pending: bool,
     /// Signed-chat bookkeeping (`lastSeenMessages`, `messageSignatureCache`,
     /// `signedMessageEncoder`).
     chat: crate::chat::ChatState,
@@ -112,6 +136,17 @@ impl PlayState {
         let mut player = LocalPlayer::new(login.player_id);
         player.physics.spectator = login.spawn.game_type == GameType::Spectator;
         player.physics.fast_lava = fast_lava(session, login.spawn.dimension_type);
+        // `prepareKeyPair`: when the keys were announced, vanilla starts the
+        // hourly refresh timer and remembers when the pair itself is due.
+        let (chat_profile, chat_key_refresh_at, chat_key_refreshed_after) =
+            match (&pending_chat_session, chat_keys) {
+                (Some(_), Some(keys)) => (
+                    session.profile.as_ref().map(|profile| profile.id),
+                    wall_millis() + CHAT_KEY_REFRESH_INTERVAL_MS,
+                    keys.refreshed_after,
+                ),
+                _ => (None, i64::MAX, i64::MAX),
+            };
         let mut state = Self {
             player,
             game_type: login.spawn.game_type,
@@ -126,6 +161,10 @@ impl PlayState {
             respawn_in: None,
             dimension: login.spawn.dimension.to_string(),
             pending_chat_session,
+            chat_profile,
+            chat_key_refresh_at,
+            chat_key_refreshed_after,
+            chat_key_refresh_pending: false,
             chat,
             commands: Default::default(),
             inventory: Default::default(),
@@ -145,9 +184,7 @@ impl PlayState {
     /// `sendCommand` for a slash command, `sendChat` otherwise.
     pub fn send_chat_line(&mut self, line: &str, net: &PacketSender) {
         use crate::chat::Outgoing;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
+        let now = wall_millis();
         let outgoing = match line.strip_prefix('/') {
             Some(command) => {
                 let signable = self.commands.signable_arguments(command);
@@ -161,6 +198,75 @@ impl PlayState {
             Outgoing::Command(packet) => net.send(&packet),
             Outgoing::SignedCommand(packet) => net.send(&packet),
         }
+    }
+
+    /// `ClientPacketListener.tick`'s `ProfileKeyPairManager` half: deliver a
+    /// renewal that finished on the runtime, or start one when vanilla would.
+    /// `shouldRefreshKeyPair` needs a finished future, the hourly minimum and
+    /// `ProfileKeyPair.dueRefresh`; the future here is "nothing pending".
+    pub fn poll_chat_keys(
+        &mut self,
+        net: &PacketSender,
+        renewer: Option<&ChatKeySource>,
+        results: &std::sync::mpsc::Receiver<Result<ChatKeys, String>>,
+        requests: &std::sync::mpsc::Sender<Result<ChatKeys, String>>,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        while let Ok(result) = results.try_recv() {
+            self.finish_chat_key_renewal(result, net);
+        }
+        let now = wall_millis();
+        if !self.chat_keys_due(now) {
+            return;
+        }
+        let Some(renewer) = renewer else { return };
+        // `prepareKeyPair` starts the hourly wait before the fetch.
+        self.chat_key_refresh_pending = true;
+        self.chat_key_refresh_at = now + CHAT_KEY_REFRESH_INTERVAL_MS;
+        let renewer = renewer.clone();
+        let requests = requests.clone();
+        runtime.spawn(async move {
+            // A closed channel only means the connection is gone.
+            let _ = requests.send(renewer.renew().await);
+        });
+    }
+
+    /// `ProfileKeyPairManager.shouldRefreshKeyPair`.
+    fn chat_keys_due(&self, now: i64) -> bool {
+        self.chat_profile.is_some()
+            && !self.chat_key_refresh_pending
+            && now > self.chat_key_refresh_at
+            && now > self.chat_key_refreshed_after
+    }
+
+    /// `setKeyPair` for a finished fetch: announce the new key pair with
+    /// `chat_session_update`. A failed fetch keeps the current one, as
+    /// vanilla does, and waits for the next hourly window.
+    fn finish_chat_key_renewal(&mut self, result: Result<ChatKeys, String>, net: &PacketSender) {
+        self.chat_key_refresh_pending = false;
+        let keys = match result {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("could not renew chat keys: {e}");
+                return;
+            }
+        };
+        self.chat_key_refreshed_after = keys.refreshed_after;
+        let Some(profile) = self.chat_profile else {
+            return;
+        };
+        let Some(session_id) = self.chat.start_session(profile, &keys.private_key_pem) else {
+            warn!("could not read the renewed chat signing key");
+            return;
+        };
+        debug!("announcing renewed chat session");
+        self.chat_key_refresh_at = wall_millis() + CHAT_KEY_REFRESH_INTERVAL_MS;
+        net.send(&sb::ChatSessionUpdate {
+            session_id,
+            expires_at: keys.expires_at,
+            public_key: ByteArray(keys.public_key_der),
+            key_signature: ByteArray(keys.signature_v2),
+        });
     }
 
     /// `startWaitingForNewLevel` → `LevelLoadTracker.startClientLoad`.
@@ -1333,6 +1439,150 @@ mod tests {
         assert_eq!(play.world.height, DimensionHeight::NETHER);
         assert_eq!(play.world.chunk_count(), 0);
         assert!(play.entities.get(42).is_none());
+    }
+
+    fn chat_keys() -> ChatKeys {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        ChatKeys {
+            private_key_pem: pem,
+            public_key_der: vec![1, 2, 3],
+            signature_v2: vec![4, 5],
+            expires_at: 42,
+            refreshed_after: 0,
+        }
+    }
+
+    /// A play state that announced a chat session on login.
+    fn online_play_state(keys: &ChatKeys) -> PlayState {
+        let login = cb::Login {
+            player_id: 7,
+            hardcore: false,
+            levels: Vec::new(),
+            max_players: 20,
+            chunk_radius: 10,
+            simulation_distance: 10,
+            reduced_debug_info: false,
+            show_death_screen: true,
+            do_limited_crafting: false,
+            spawn: spawn_info("minecraft:overworld", 0),
+            online_mode: true,
+            enforces_secure_chat: false,
+        };
+        let session = SessionData {
+            profile: Some(rapidbot_protocol::packets::login::GameProfile {
+                id: Uuid::from_u128(1),
+                name: "Steve".into(),
+                properties: Vec::new(),
+            }),
+            ..SessionData::default()
+        };
+        PlayState::new(&login, Some(keys), &session)
+    }
+
+    /// `ProfileKeyPairManager.shouldRefreshKeyPair`: an online session whose
+    /// declared pair is due, at most once an hour, never while a fetch is
+    /// running, and never without a session.
+    #[test]
+    fn a_chat_key_pair_is_renewed_once_hourly_when_due() {
+        let keys = chat_keys();
+        let mut play = online_play_state(&keys);
+        assert!(play.pending_chat_session.is_some(), "announced on login");
+        assert_eq!(play.chat_profile, Some(Uuid::from_u128(1)));
+        let now = wall_millis();
+        assert!(!play.chat_keys_due(now), "the hour has not passed yet");
+
+        // Both the hourly minimum and the pair's own `refreshed_after` pass.
+        play.chat_key_refresh_at = 0;
+        play.chat_key_refreshed_after = 0;
+        assert!(play.chat_keys_due(now));
+        play.chat_key_refresh_pending = true;
+        assert!(!play.chat_keys_due(now), "one fetch at a time");
+        play.chat_key_refresh_pending = false;
+        play.chat_profile = None;
+        assert!(!play.chat_keys_due(now), "offline mode never refreshes");
+    }
+
+    /// `setKeyPair` for a finished fetch: the new pair is announced with
+    /// `chat_session_update`.
+    #[test]
+    fn a_renewed_pair_is_announced_with_chat_session_update() {
+        let keys = chat_keys();
+        let mut play = online_play_state(&keys);
+        play.chat_key_refresh_at = 0;
+        play.chat_key_refreshed_after = 0;
+        let (net, mut sent) = PacketSender::for_test();
+        play.finish_chat_key_renewal(Ok(keys.clone()), &net);
+
+        let mut ids = Vec::new();
+        while let Ok(frame) = sent.try_recv() {
+            let mut body = frame.as_slice();
+            ids.push(VarInt::decode(&mut body).unwrap().0);
+            if ids.last() == Some(&sb::ChatSessionUpdate::ID) {
+                let packet = sb::ChatSessionUpdate::from_body(body).unwrap();
+                assert_eq!(packet.expires_at, 42);
+                assert_eq!(packet.public_key.0, vec![1, 2, 3]);
+                assert_eq!(packet.key_signature.0, vec![4, 5]);
+            }
+        }
+        assert_eq!(ids, [sb::ChatSessionUpdate::ID]);
+        assert!(
+            play.chat_key_refresh_at > wall_millis(),
+            "the next window is an hour away"
+        );
+    }
+
+    /// A fetch that fails keeps the announced pair and waits for the next
+    /// hourly window instead of retrying every tick.
+    #[test]
+    fn a_failed_renewal_keeps_the_current_pair() {
+        let keys = chat_keys();
+        let mut play = online_play_state(&keys);
+        let before = play.chat_key_refreshed_after;
+        let (net, mut sent) = PacketSender::for_test();
+        play.finish_chat_key_renewal(Err("offline".into()), &net);
+        assert_eq!(play.chat_key_refreshed_after, before);
+        assert!(sent.try_recv().is_err(), "nothing was announced");
+    }
+
+    /// The fetch itself runs on the tokio runtime, because the main thread
+    /// blocks for the whole game loop.
+    #[tokio::test]
+    async fn poll_chat_keys_starts_a_fetch_off_the_main_thread() {
+        let keys = chat_keys();
+        let mut play = online_play_state(&keys);
+        play.chat_key_refresh_at = 0;
+        play.chat_key_refreshed_after = 0;
+        let source = ChatKeySource::new({
+            let keys = keys.clone();
+            move || {
+                let keys = keys.clone();
+                async move { Ok(keys) }
+            }
+        });
+        let (requests, results) = std::sync::mpsc::channel();
+        let (net, _sent) = PacketSender::for_test();
+        play.poll_chat_keys(
+            &net,
+            Some(&source),
+            &results,
+            &requests,
+            &tokio::runtime::Handle::current(),
+        );
+        assert!(play.chat_key_refresh_pending);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(result) = results.try_recv() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fetch should be delivered");
+        assert!(result.is_ok());
     }
 
     #[test]

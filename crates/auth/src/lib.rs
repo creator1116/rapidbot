@@ -117,7 +117,9 @@ pub struct Authenticator {
     cache: TokenCache,
 }
 
-pub(crate) const REFRESH_SKEW_SECS: i64 = 300;
+/// How long before expiry [`Authenticator::refresh_if_needed`] renews tokens:
+/// five minutes.
+pub const REFRESH_SKEW_SECS: i64 = 300;
 
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()

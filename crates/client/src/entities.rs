@@ -90,6 +90,130 @@ impl PositionPath {
     }
 }
 
+/// `DragonFlightHistory`: the last 64 `(y, yRot)` samples of a dragon, used
+/// to place its parts.
+#[derive(Debug, Clone)]
+struct DragonFlight {
+    samples: [(f64, f32); 64],
+    head: i32,
+}
+
+impl Default for DragonFlight {
+    fn default() -> Self {
+        Self {
+            samples: [(0.0, 0.0); 64],
+            head: -1,
+        }
+    }
+}
+
+impl DragonFlight {
+    /// `DragonFlightHistory.record`: the first sample fills the buffer.
+    fn record(&mut self, y: f64, y_rot: f32) {
+        if self.head < 0 {
+            self.samples = [(y, y_rot); 64];
+        }
+        self.head = (self.head + 1) & 63;
+        self.samples[self.head as usize] = (y, y_rot);
+    }
+
+    /// `DragonFlightHistory.get`: the sample from `delay` ticks ago.
+    fn get(&self, delay: i32) -> (f64, f32) {
+        self.samples[((self.head - delay) & 63) as usize]
+    }
+}
+
+/// One `EnderDragonPart`: a hit box parented to a dragon. The server never
+/// sends these; the client creates them from the dragon and positions them
+/// each tick, and `Level.getEntities` appends them for picking.
+#[derive(Debug, Clone)]
+pub struct DragonPart {
+    pub id: i32,
+    pub parent: i32,
+    /// `head`, `neck`, `body`, `tail`, or `wing`.
+    pub name: &'static str,
+    /// `EnderDragonPart.getDimensions`: width and height.
+    size: (f32, f32),
+    pub pos: Vec3,
+}
+
+/// `EnderDragon`'s parts, in `getSubEntities` order: id offset, name and size
+/// (`EnderDragon`'s constructor).
+const DRAGON_PART_LAYOUT: [(i32, &str, f32, f32); 8] = [
+    (1, "head", 1.0, 1.0),
+    (2, "neck", 3.0, 3.0),
+    (3, "body", 5.0, 3.0),
+    (4, "tail", 2.0, 2.0),
+    (5, "tail", 2.0, 2.0),
+    (6, "tail", 2.0, 2.0),
+    (7, "wing", 4.0, 2.0),
+    (8, "wing", 4.0, 2.0),
+];
+
+impl DragonPart {
+    /// `EnderDragonPart.getBoundingBox`: width and height, feet at `pos.y`.
+    pub fn bounding_box(&self) -> ([f64; 3], [f64; 3]) {
+        let w = self.size.0 as f64 / 2.0;
+        let h = self.size.1 as f64;
+        (
+            [self.pos.x - w, self.pos.y, self.pos.z - w],
+            [self.pos.x + w, self.pos.y + h, self.pos.z + w],
+        )
+    }
+}
+
+/// `EnderDragon.aiStep`'s part placement, client side: the flight history and
+/// `yRot` decide where each part goes. `yRotA` is only advanced in the
+/// server-side branch of `aiStep`, so it is zero here, and the client stays in
+/// the holding-pattern phase (`isSitting` false), which makes the head offset
+/// the height difference from the history.
+fn dragon_part_positions(pos: Vec3, y_rot: f32, flight: &DragonFlight) -> [Vec3; 8] {
+    let deg = std::f64::consts::PI / 180.0;
+    let tilt = ((flight.get(5).0 - flight.get(10).0) * 10.0 * deg) as f32;
+    let cc_tilt = math::cos(tilt as f64);
+    let ss_tilt = math::sin(tilt as f64);
+    let rot1 = (y_rot as f64 * deg) as f32;
+    let ss1 = math::sin(rot1 as f64);
+    let cc1 = math::cos(rot1 as f64);
+    let at =
+        |x: f32, y: f32, z: f32| Vec3::new(pos.x + x as f64, pos.y + y as f64, pos.z + z as f64);
+    let body = at(ss1 * 0.5, 0.0, -cc1 * 0.5);
+    let wing1 = at(cc1 * 4.5, 2.0, ss1 * 4.5);
+    let wing2 = at(cc1 * -4.5, 2.0, ss1 * -4.5);
+
+    let ss2 = math::sin(y_rot as f64 * deg);
+    let cc2 = math::cos(y_rot as f64 * deg);
+    let head_offset = (flight.get(5).0 - flight.get(0).0) as f32;
+    let head = at(
+        ss2 * 6.5 * cc_tilt,
+        head_offset + ss_tilt * 6.5,
+        -cc2 * 6.5 * cc_tilt,
+    );
+    let neck = at(
+        ss2 * 5.5 * cc_tilt,
+        head_offset + ss_tilt * 5.5,
+        -cc2 * 5.5 * cc_tilt,
+    );
+
+    let (p1_y, p1_rot) = flight.get(5);
+    let mut tails = [Vec3::ZERO; 3];
+    for (i, tail) in tails.iter_mut().enumerate() {
+        let (p0_y, p0_rot) = flight.get(12 + i as i32 * 2);
+        let rot =
+            (y_rot as f64 * deg) as f32 + (math::wrap_degrees(p0_rot - p1_rot) as f64 * deg) as f32;
+        let ss = math::sin(rot as f64);
+        let cc = math::cos(rot as f64);
+        let dd = (i as f32 + 1.0) * 2.0;
+        *tail = at(
+            -(ss1 * 1.5 + ss * dd) * cc_tilt,
+            (p0_y - p1_y) as f32 - (dd + 1.5) * ss_tilt + 1.5,
+            (cc1 * 1.5 + cc * dd) * cc_tilt,
+        );
+    }
+
+    [head, neck, body, tails[0], tails[1], tails[2], wing1, wing2]
+}
+
 /// `SteppedInterpolationHandler.InterpolationData`.
 #[derive(Debug, Clone)]
 struct Stepped {
@@ -273,6 +397,8 @@ pub struct Entity {
     /// `HappyGhast.STAYS_STILL`: the synced half of `isOnStillTimeout`,
     /// which makes a landed ghast solid.
     stays_still: bool,
+    /// `DragonFlightHistory` of an `EnderDragon`, recorded each tick.
+    flight: Option<Box<DragonFlight>>,
 }
 
 /// `Mth.unpackDegrees`.
@@ -374,6 +500,7 @@ impl Entity {
             framed_item: None,
             firework_attached_to: None,
             stays_still: false,
+            flight: None,
         }
     }
 
@@ -1242,6 +1369,8 @@ pub struct Entities {
     players: HashMap<Uuid, PlayerInfo>,
     /// `minecraft:painting_variant` dimensions by registry ID.
     painting_variants: Vec<(i32, i32)>,
+    /// `ClientLevel.dragonParts`: the hit boxes of every tracked dragon.
+    dragon_parts: Vec<DragonPart>,
 }
 
 /// `VecDeltaCodec.encode`: `Math.round(v * 4096)`.
@@ -1452,6 +1581,41 @@ impl Entities {
                 }
             }
         }
+        // `Level.getEntities` appends the dragon parts after the tracked
+        // entities, so theirs is the last say among equal distances.
+        for part in &self.dragon_parts {
+            if part.id == query.except || part.parent == query.except {
+                continue;
+            }
+            let (min, max) = part.bounding_box();
+            let from = query.from;
+            let touches = (0..3).all(|i| min[i] < query.search.1[i] && max[i] > query.search.0[i]);
+            if !touches {
+                continue;
+            }
+            let clip = clip_box(min, max, from, query.to);
+            let contains = (0..3).all(|i| from[i] >= min[i] && from[i] < max[i]);
+            if contains {
+                if nearest >= 0.0 {
+                    hovered = Some(EntityHit {
+                        id: part.id,
+                        location: clip.unwrap_or(from),
+                    });
+                    nearest = 0.0;
+                }
+            } else if let Some(location) = clip {
+                let distance: f64 = (0..3)
+                    .map(|i| (location[i] - from[i]) * (location[i] - from[i]))
+                    .sum();
+                if distance < nearest || nearest == 0.0 {
+                    hovered = Some(EntityHit {
+                        id: part.id,
+                        location,
+                    });
+                    nearest = distance;
+                }
+            }
+        }
         hovered
     }
 
@@ -1471,15 +1635,37 @@ impl Entities {
         player_vehicle: Option<i32>,
     ) -> Vec<i32> {
         let mut attached = Vec::new();
+        let mut dragon_updates = Vec::new();
         for entity in self.by_id.values_mut() {
             if !runs_normally && !entity.is_player() && Some(entity.id) != player_vehicle {
                 continue;
             }
             entity.tick(relative_tick_speed);
+            if let Some(flight) = &mut entity.flight {
+                // `EnderDragon.aiStep`: record the flight history and then
+                // place the parts around the new position.
+                flight.record(entity.pos.y, entity.y_rot);
+                dragon_updates.push((
+                    entity.id,
+                    dragon_part_positions(entity.pos, entity.y_rot, flight),
+                ));
+            }
             if let Some(target) = entity.firework_attached_to {
                 attached.push(target);
             }
         }
+        for (parent, positions) in dragon_updates {
+            for part in self.dragon_parts.iter_mut().filter(|p| p.parent == parent) {
+                let index = (part.id - parent - 1) as usize;
+                if let Some(position) = positions.get(index) {
+                    part.pos = *position;
+                }
+            }
+        }
+        // `onTrackingEnd`: parts go with their dragon.
+        let alive: std::collections::HashSet<i32> = self.by_id.keys().copied().collect();
+        self.dragon_parts
+            .retain(|part| alive.contains(&part.parent));
         attached
     }
 
@@ -1533,6 +1719,7 @@ impl Entities {
             framed_item: None,
             firework_attached_to: None,
             stays_still: false,
+            flight: None,
         };
         if entity.info().is("HangingEntity") {
             // The add packet carries the attached block, not the box center.
@@ -1545,15 +1732,36 @@ impl Entities {
             ]);
             entity.recenter_hanging();
         }
+        let dragon = entity.info().is("EnderDragon");
+        if dragon {
+            entity.flight = Some(Box::default());
+        }
         self.by_id.insert(id, entity);
+        if dragon {
+            // `EnderDragon`'s constructor creates the parts; they are placed
+            // by the first `aiStep`, so they start at the origin.
+            for (offset, name, width, height) in DRAGON_PART_LAYOUT {
+                self.dragon_parts.push(DragonPart {
+                    id: id + offset,
+                    parent: id,
+                    name,
+                    size: (width, height),
+                    pos: Vec3::ZERO,
+                });
+            }
+        }
         Ok(self.by_id.get(&id))
     }
 
     /// `ClientboundRemoveEntitiesPacket`.
     pub fn remove_entities(&mut self, mut body: &[u8]) -> Result<(), DecodeError> {
+        let mut removed = Vec::new();
         for id in Vec::<VarInt>::decode(&mut body)? {
             self.by_id.remove(&id.0);
+            removed.push(id.0);
         }
+        self.dragon_parts
+            .retain(|part| !removed.contains(&part.parent) && !removed.contains(&part.id));
         Ok(())
     }
 
@@ -2485,5 +2693,94 @@ mod tests {
         // `staysStill` (HappyGhast.STAYS_STILL = 19) makes it solid.
         set_bool(&mut e, 1, 19, true);
         assert_eq!(e.collision_boxes(64.0).len(), 1, "landed ghast");
+    }
+
+    /// `EnderDragon`'s parts are client-made: the client creates them from
+    /// the dragon, `EnderDragon.aiStep` places them from the flight history,
+    /// and `Level.getEntities` appends them for picking.
+    #[test]
+    fn dragon_parts_follow_the_dragon_and_are_pickable() {
+        let mut e = Entities::default();
+        add(&mut e, 10, "minecraft:ender_dragon", [0.0, 64.0, 0.0]);
+        // Created with the dragon, and at the origin until the first aiStep.
+        assert_eq!(
+            e.dragon_parts.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [11, 12, 13, 14, 15, 16, 17, 18]
+        );
+        assert!(e.dragon_parts.iter().all(|part| part.pos == Vec3::ZERO));
+
+        e.tick(true, 1.0, None);
+        let close = |a: Vec3, b: Vec3| {
+            (a.x - b.x).abs() < 1.0e-9 && (a.y - b.y).abs() < 1.0e-9 && (a.z - b.z).abs() < 1.0e-9
+        };
+        fn at(e: &Entities, id: i32) -> Vec3 {
+            e.dragon_parts
+                .iter()
+                .find(|part| part.id == id)
+                .unwrap()
+                .pos
+        }
+        // Flying level, yaw 0: the parts sit where aiStep puts them.
+        assert!(close(at(&e, 11), Vec3::new(0.0, 64.0, -6.5)), "head");
+        assert!(close(at(&e, 12), Vec3::new(0.0, 64.0, -5.5)), "neck");
+        assert!(close(at(&e, 13), Vec3::new(0.0, 64.0, -0.5)), "body");
+        assert!(close(at(&e, 14), Vec3::new(0.0, 65.5, 3.5)), "tail 1");
+        assert!(close(at(&e, 15), Vec3::new(0.0, 65.5, 5.5)), "tail 2");
+        assert!(close(at(&e, 16), Vec3::new(0.0, 65.5, 7.5)), "tail 3");
+        assert!(close(at(&e, 17), Vec3::new(4.5, 66.0, 0.0)), "wing 1");
+        assert!(close(at(&e, 18), Vec3::new(-4.5, 66.0, 0.0)), "wing 2");
+
+        // The dragon itself is not pickable, its parts are, and a click
+        // reports the part's own id.
+        let tags = Tags::default();
+        let pick = |e: &Entities| {
+            e.pick(EntityPick {
+                except: 1,
+                from: [0.0, 64.5, -20.0],
+                to: [0.0, 64.5, 10.0],
+                search: ([-8.0, 60.0, -25.0], [8.0, 70.0, 15.0]),
+                max_distance_sq: 1000.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+        };
+        assert_eq!(pick(&e).map(|hit| hit.id), Some(11), "the head");
+
+        // A tick later, one block higher: the head offset comes from the
+        // history (the height five samples back), not from the new position.
+        e.by_id.get_mut(&10).unwrap().pos.y = 65.0;
+        e.tick(true, 1.0, None);
+        assert!(
+            close(at(&e, 11), Vec3::new(0.0, 64.0, -6.5)),
+            "the head trails the climb"
+        );
+    }
+
+    #[test]
+    fn dragon_parts_are_dropped_with_their_dragon() {
+        let mut e = Entities::default();
+        add(&mut e, 10, "minecraft:ender_dragon", [0.0, 64.0, 0.0]);
+        e.tick(true, 1.0, None);
+        assert_eq!(e.dragon_parts.len(), 8);
+
+        let mut body = Vec::new();
+        VarInt(1).encode(&mut body);
+        VarInt(10).encode(&mut body);
+        e.remove_entities(&body).unwrap();
+        assert!(e.dragon_parts.is_empty());
+
+        let tags = Tags::default();
+        assert!(
+            e.pick(EntityPick {
+                except: 1,
+                from: [0.0, 64.5, -20.0],
+                to: [0.0, 64.5, 10.0],
+                search: ([-8.0, 60.0, -25.0], [8.0, 70.0, 15.0]),
+                max_distance_sq: 1000.0,
+                tags: &tags,
+                root_vehicle: None,
+            })
+            .is_none()
+        );
     }
 }

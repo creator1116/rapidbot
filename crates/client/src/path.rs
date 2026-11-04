@@ -4,8 +4,8 @@
 //! bot logic, and it only decides *where* to go. [`crate::nav::Walker`]
 //! turns the result into mouse and key input.
 //!
-//! Not handled yet: breaking or placing blocks. Doors are opened on the way
-//! through, but not broken.
+//! Doors are opened on the way through. Blocks are broken too, when the
+//! search is given a [`DigPolicy`]; placing blocks is not handled yet.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -40,6 +40,35 @@ const DANGER: u8 = 1;
 const WATER: u8 = 2;
 const CACTUS: u8 = 4;
 const CLIMB: u8 = 8;
+
+/// What one broken block adds to a move's cost, before its hardness: a
+/// couple of ticks to aim and swing, then roughly the time it takes.
+const DIG_BASE: f64 = 0.5;
+const DIG_PER_HARDNESS: f64 = 1.5;
+
+/// What a route may mine through. Without one (the default) the walker only
+/// uses blocks it can stand on; with one the planner may break through what
+/// the bot is willing to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DigPolicy {
+    /// The hardest block that may be mined, as `Block.getDestroySpeed`
+    /// (`hardness`; bedrock, barriers and the like are -1). Dirt, sand and
+    /// gravel are 0.5, stone 1.5.
+    pub max_hardness: f32,
+}
+
+impl DigPolicy {
+    /// By hand: soil, sand, gravel, wood and plants, but not stone.
+    pub const HAND: Self = Self { max_hardness: 1.0 };
+}
+
+/// Whether the block at (x, y, z) has a collision shape, so a player cannot
+/// simply walk through it.
+pub(crate) fn blocks(world: &World, x: i32, y: i32, z: i32) -> bool {
+    world
+        .block_state(x, y, z)
+        .is_some_and(|state| Registry::get().collision_shape(state).is_some())
+}
 
 /// Per block state: whether touching it hurts or traps, whether it holds
 /// water, and whether it can be climbed.
@@ -223,6 +252,41 @@ pub fn nearest_surface(world: &World, x: i32, z: i32, y: i32) -> Option<(i32, f6
         .find_map(|cy| surface(world, x, cy, z).map(|s| (cy, s)))
 }
 
+/// Like [`surface`] for a column a bot may mine through: the block below
+/// must be a full one to stand on, and the feet and head cells must be free
+/// or breakable under `dig`. Returns the surface and what breaking them
+/// costs. Water, lava, fire and the like are never dug through, and a cactus
+/// beside the way in still hurts.
+fn dig_surface(world: &World, cell: (i32, i32, i32), dig: DigPolicy) -> Option<(f64, f64)> {
+    let (x, y, z) = cell;
+    let registry = Registry::get();
+    let below = registry.collision_shape(world.block_state(x, y - 1, z)?)?;
+    if below.at(0, 0, 0).max(Axis::Y) < 1.0 {
+        return None;
+    }
+    let mut cost = 0.0;
+    for dy in 0..2 {
+        let state = world.block_state(x, y + dy, z)?;
+        if traits()[state as usize] & (DANGER | WATER) != 0 {
+            return None;
+        }
+        if registry.collision_shape(state).is_none() {
+            continue;
+        }
+        let hardness = registry.state(state).hardness;
+        if hardness < 0.0 || hardness > dig.max_hardness {
+            return None;
+        }
+        cost += DIG_BASE + hardness as f64 * DIG_PER_HARDNESS;
+    }
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        if trait_at(world, x + dx, y, z + dz) & CACTUS != 0 {
+            return None;
+        }
+    }
+    Some((y as f64, cost))
+}
+
 /// Where a search is headed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Goal {
@@ -266,6 +330,9 @@ pub struct Waypoint {
     pub jump: bool,
     /// The door to open here, if this is the lower half of one.
     pub door: Option<Door>,
+    /// Blocks in this cell have to be mined before the player can stand
+    /// there.
+    pub dig: bool,
 }
 
 impl Waypoint {
@@ -294,6 +361,9 @@ struct Node {
     cost: f64,
     parent: u32,
     closed: bool,
+    /// Reached by mining: the cell's blocks have to go before it can be
+    /// walked into.
+    dig: bool,
 }
 
 /// An A* search that can be run a bit at a time, so a long search does not
@@ -307,6 +377,8 @@ pub struct Search {
     best: u32,
     expanded: usize,
     limit: usize,
+    /// What this search is allowed to mine through, if anything.
+    dig: Option<DigPolicy>,
 }
 
 const NO_PARENT: u32 = u32::MAX;
@@ -332,6 +404,7 @@ impl Search {
                 cost: 0.0,
                 parent: NO_PARENT,
                 closed: false,
+                dig: false,
             }],
             index: HashMap::from([(cell, 0)]),
             open: BinaryHeap::new(),
@@ -339,9 +412,16 @@ impl Search {
             best: 0,
             expanded: 0,
             limit,
+            dig: None,
         };
         search.open.push(Reverse((0, 0)));
         Some(search)
+    }
+
+    /// Lets the search mine through blocks `dig` covers, at a cost.
+    pub fn with_digging(mut self, dig: DigPolicy) -> Self {
+        self.dig = Some(dig);
+        self
     }
 
     fn surface(&mut self, world: &World, cell: (i32, i32, i32)) -> Option<f64> {
@@ -422,6 +502,24 @@ impl Search {
                     if self.door_step(world, id, (x + dx, ny, z + dz), s, cost) {
                         break;
                     }
+                }
+            }
+            if !stepped && let Some(dig) = self.dig {
+                // Mine through: the column must be breakable under `dig`, and
+                // standable once its blocks are gone. Slower than walking, so
+                // the search only takes it when it pays.
+                for ny in (y - 1..=y + 1).rev() {
+                    let Some((s2, break_cost)) = dig_surface(world, (x + dx, ny, z + dz), dig)
+                    else {
+                        continue;
+                    };
+                    let d = s2 - s;
+                    if d > JUMP || d < -MAX_DROP {
+                        continue;
+                    }
+                    let step_cost = 1.0 + d.abs().max(0.0) + break_cost;
+                    self.relax_dig(world, id, (x + dx, ny, z + dz), s2, cost + step_cost);
+                    break;
                 }
             }
         }
@@ -590,7 +688,31 @@ impl Search {
         parent: u32,
         cell: (i32, i32, i32),
         surface: f64,
+        cost: f64,
+    ) {
+        self.relax_node(world, parent, cell, surface, cost, false);
+    }
+
+    /// A move that has to mine its way in.
+    fn relax_dig(
+        &mut self,
+        world: &World,
+        parent: u32,
+        cell: (i32, i32, i32),
+        surface: f64,
+        cost: f64,
+    ) {
+        self.relax_node(world, parent, cell, surface, cost, true);
+    }
+
+    fn relax_node(
+        &mut self,
+        world: &World,
+        parent: u32,
+        cell: (i32, i32, i32),
+        surface: f64,
         mut cost: f64,
+        dig: bool,
     ) {
         // Wading is slow.
         if trait_at(world, cell.0, cell.1, cell.2) & WATER != 0 {
@@ -604,6 +726,7 @@ impl Search {
                 }
                 node.cost = cost;
                 node.parent = parent;
+                node.dig = dig;
                 id
             }
             None => {
@@ -614,6 +737,7 @@ impl Search {
                     cost,
                     parent,
                     closed: false,
+                    dig,
                 });
                 self.index.insert(cell, id);
                 id
@@ -636,6 +760,7 @@ impl Search {
                 surface: node.surface,
                 jump: false,
                 door,
+                dig: node.dig,
             });
             id = node.parent;
         }
@@ -1118,5 +1243,70 @@ mod tests {
             Vec3::new(0.69, 64.0, 6.5)
         ));
         assert!(line_walkable(&world, a, b));
+    }
+
+    /// [`find`] with a digging policy.
+    fn find_digging(
+        world: &World,
+        from: Vec3,
+        goal: Goal,
+        limit: usize,
+        dig: DigPolicy,
+    ) -> Option<Path> {
+        let mut search = Search::new(world, from, goal, limit)?.with_digging(dig);
+        loop {
+            if let Some(path) = search.step(world, 4096) {
+                return Some(path);
+            }
+        }
+    }
+
+    /// A wall right across the loaded world is mined through, and the
+    /// waypoint says so. The search takes the highest place it can reach, as
+    /// the walking moves do, so it mines the wall's top block and steps onto
+    /// the stump: one block instead of a two-block tunnel.
+    #[test]
+    fn digs_through_a_dirt_wall() {
+        let mut world = flat();
+        let dirt = state("minecraft:dirt", "");
+        for z in -32..=47 {
+            for y in 64..=65 {
+                world.set_block_state(4, y, z, dirt);
+            }
+        }
+        let goal = Goal::Column { x: 10, z: 0 };
+        // The long way round the wall's end is far; through it is short.
+        let path = find_digging(&world, start(), goal, 40_000, DigPolicy::HAND).unwrap();
+        assert!(path.complete, "did not plan through the wall");
+        let dug: Vec<&Waypoint> = path.points.iter().filter(|w| w.dig).collect();
+        assert_eq!(dug.len(), 1, "one cell of the wall is mined: {dug:?}");
+        assert_eq!(dug[0].cell, (4, 65, 0), "the wall's top block");
+        assert_eq!(dug[0].surface, 65.0, "standing on the block that is left");
+
+        // Without a policy it walks around instead, and mines nothing.
+        let path = find(&world, start(), goal, 40_000).unwrap();
+        assert!(path.points.iter().all(|w| !w.dig));
+    }
+
+    /// Stone is harder than a hand policy allows, so a wall of it right
+    /// across the loaded world is not a route.
+    #[test]
+    fn does_not_dig_what_the_policy_forbids() {
+        let mut world = flat();
+        for z in -32..=47 {
+            for y in 64..=65 {
+                world.set_block_state(4, y, z, 1);
+            }
+        }
+        let path = find_digging(
+            &world,
+            start(),
+            Goal::Column { x: 10, z: 0 },
+            40_000,
+            DigPolicy::HAND,
+        )
+        .unwrap();
+        assert!(!path.complete, "stone is not mineable by hand");
+        assert!(path.points.iter().all(|w| !w.dig));
     }
 }

@@ -51,6 +51,20 @@ struct DoorWait {
     clicked: bool,
 }
 
+/// While mining the blocks of the next waypoint.
+struct DigWait {
+    cell: (i32, i32, i32),
+    ticks: u32,
+    /// The attack button is down for this dig, so it can be let go after.
+    pressed: bool,
+}
+
+/// Whether the blocks of a waypoint cell still have to be mined.
+fn dig_still_needed(ctx: &TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+    path::blocks(ctx.world, cell.0, cell.1, cell.2)
+        || path::blocks(ctx.world, cell.0, cell.1 + 1, cell.2)
+}
+
 /// Places a search may examine before settling for the nearest it found.
 const SEARCH_LIMIT: usize = 24_000;
 /// Places examined per tick: about a millisecond's work.
@@ -92,6 +106,11 @@ pub struct Walker {
     exact: bool,
     /// The door being opened, if the next waypoint is one.
     door_wait: Option<DoorWait>,
+    /// What routes may mine through. `None` (the default) plans around
+    /// blocks the player cannot walk through.
+    pub dig: Option<path::DigPolicy>,
+    /// The waypoint cell being mined, if the next one needs it.
+    dig_wait: Option<DigWait>,
 }
 
 impl Walker {
@@ -108,6 +127,8 @@ impl Walker {
             replans: 0,
             exact: false,
             door_wait: None,
+            dig: None,
+            dig_wait: None,
             goal: None,
             state: State::Idle,
             gaze_pitch: 8.0,
@@ -230,7 +251,13 @@ impl Walker {
                 };
                 self.best_distance = f64::MAX;
                 self.stalled_ticks = 0;
-                self.plan = match Search::new(ctx.world, pos, target, SEARCH_LIMIT) {
+                let search = Search::new(ctx.world, pos, target, SEARCH_LIMIT).map(|search| {
+                    match self.dig {
+                        Some(dig) => search.with_digging(dig),
+                        None => search,
+                    }
+                });
+                self.plan = match search {
                     Some(search) => Plan::Searching(search),
                     None => Plan::Straight,
                 };
@@ -314,6 +341,42 @@ impl Walker {
             return;
         }
 
+        // The next waypoint may need its blocks mined before it can be stood
+        // in, and, like a closed door, it must not be ticked off from
+        // outside: the cell is not reached until the blocks are gone.
+        let next_dig = match &self.plan {
+            Plan::Following { path, next, .. } if *next < path.points.len() => path.points[*next..]
+                .iter()
+                .find(|w| w.dig && dig_still_needed(ctx, w.cell))
+                .map(|w| w.cell),
+            _ => None,
+        };
+        let first_dig = match &self.plan {
+            Plan::Following { path, next, .. } => path
+                .points
+                .iter()
+                .enumerate()
+                .skip(*next)
+                .find(|(_, w)| w.dig && dig_still_needed(ctx, w.cell))
+                .map(|(i, _)| i),
+            _ => None,
+        };
+        if self
+            .dig_wait
+            .as_ref()
+            .is_some_and(|wait| Some(wait.cell) != next_dig)
+        {
+            // Finished, or the route changed: let go of the button.
+            if self.dig_wait.take().is_some_and(|wait| wait.pressed) {
+                ctx.hold_attack(false);
+            }
+        }
+        if let Some(cell) = next_dig
+            && self.dig_at(ctx, cell)
+        {
+            return;
+        }
+
         let Plan::Following {
             path,
             next,
@@ -329,9 +392,12 @@ impl Walker {
         // Tick off waypoints: the one aimed for, or any on the way to it.
         // Stop before a closed door: the door itself is not reached until it
         // has been opened.
-        let limit = first_closed
-            .unwrap_or(path.points.len())
-            .min(path.points.len());
+        let limit = match (first_closed, first_dig) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => path.points.len(),
+        }
+        .min(path.points.len());
         let reach = (*target + 1).min(path.points.len()).min(limit).max(*next);
         if let Some(i) = (*next..reach).rev().find(|&i| {
             let w = path.points[i].pos();
@@ -367,7 +433,10 @@ impl Walker {
                 .any(|w| {
                     // A door is opened on arrival, so its closed shape is
                     // expected. A door that has gone is caught at the door.
+                    // A waypoint to mine has no surface until it is cleared,
+                    // and is checked at the dig instead.
                     w.door.is_none()
+                        && !w.dig
                         && path::surface(ctx.world, w.cell.0, w.cell.1, w.cell.2)
                             .is_none_or(|s| (s - w.surface).abs() > 0.01)
                 });
@@ -490,6 +559,71 @@ impl Walker {
         // No update after six seconds: think again, and eventually give up.
         if wait.ticks > 120 {
             self.door_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return true;
+        }
+        true
+    }
+
+    /// Mines the blocks of the next waypoint. Returns true while the walker
+    /// should stand still: it aims at the lowest block that is still there
+    /// and holds the attack button until the server's block update takes it
+    /// away, exactly as the dig example does.
+    fn dig_at(&mut self, ctx: &mut TickContext<'_>, cell: (i32, i32, i32)) -> bool {
+        // Stand still, and do not carry a jump over from the last stretch.
+        self.jump_hold = 0;
+        self.jump_in = None;
+        ctx.set_keys(Keys::default());
+
+        // Feet first, then head: the player fits through a one-high hole.
+        let Some(y) = [cell.1, cell.1 + 1]
+            .into_iter()
+            .find(|y| path::blocks(ctx.world, cell.0, *y, cell.2))
+        else {
+            if self.dig_wait.take().is_some_and(|wait| wait.pressed) {
+                ctx.hold_attack(false);
+            }
+            return false;
+        };
+
+        let wait = match &mut self.dig_wait {
+            Some(wait) if wait.cell == cell => wait,
+            _ => {
+                self.dig_wait = Some(DigWait {
+                    cell,
+                    ticks: 0,
+                    pressed: false,
+                });
+                self.dig_wait.as_mut().expect("just set")
+            }
+        };
+        wait.ticks = wait.ticks.saturating_add(1);
+        ctx.aim_at(
+            Vec3::new(cell.0 as f64 + 0.5, y as f64 + 0.5, cell.2 as f64 + 0.5),
+            3.0,
+        );
+
+        // The crosshair is the pick from before this tick's mouse movement.
+        // Hold the button only once it is actually on the block.
+        let hit = ctx.crosshair;
+        if !hit.miss && hit.pos == (cell.0, y, cell.2) {
+            ctx.hold_attack(true);
+            wait.pressed = true;
+        }
+        let (timed_out, pressed) = (wait.ticks > 400, wait.pressed);
+
+        // Twenty seconds without the block going: think again, and
+        // eventually give up.
+        if timed_out {
+            if pressed {
+                ctx.hold_attack(false);
+            }
+            self.dig_wait = None;
             self.replans += 1;
             if self.replans > 2 {
                 self.give_up(ctx);
@@ -695,6 +829,14 @@ mod tests {
                     let name = Registry::get().blocks[block as usize].name.clone();
                     self.set_door(door.lower.0, door.lower.1, door.lower.2, &name, true);
                 }
+            }
+
+            // Stand in for the server's mining: a held attack on a block
+            // takes it away (at once here, rather than after the break
+            // time).
+            if self.actions.attack == Some(true) && !crosshair.miss {
+                let (x, y, z) = crosshair.pos;
+                self.world.set_block_state(x, y, z, 0);
             }
 
             // No keyboard model here: fingers follow at once.
@@ -1061,5 +1203,59 @@ mod tests {
         assert!(!sim.walker.gave_up());
         assert_eq!(sim.player.pos.y, 64.0);
         assert!(sim.player.pos.z > 14.0);
+    }
+
+    /// A dirt box around the goal is mined into: the walker aims at the
+    /// blocks it has to break and holds the attack button until they go.
+    #[test]
+    fn digs_into_a_walled_goal() {
+        let mut sim = Sim::new();
+        let dirt = state("minecraft:dirt", "");
+        for x in 5..=7 {
+            for z in -1..=1 {
+                if x == 6 && z == 0 {
+                    continue;
+                }
+                for y in 64..=65 {
+                    sim.world.set_block_state(x, y, z, dirt);
+                }
+            }
+        }
+        sim.walker.dig = Some(path::DigPolicy::HAND);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        let mut ticks = 0;
+        while !sim.walker.arrived() && !sim.walker.gave_up() && ticks < 3_000 {
+            sim.step();
+            ticks += 1;
+        }
+        assert!(
+            sim.walker.arrived(),
+            "did not mine in, at {:?}, after {ticks} ticks",
+            sim.player.pos
+        );
+    }
+
+    /// Stone is harder than a hand policy allows, so the same box stays a
+    /// wall and the walker gives up rather than mining it out.
+    #[test]
+    fn does_not_dig_stone_by_hand() {
+        let mut sim = Sim::new();
+        let stone = state("minecraft:stone", "");
+        for x in 5..=7 {
+            for z in -1..=1 {
+                if x == 6 && z == 0 {
+                    continue;
+                }
+                for y in 64..=65 {
+                    sim.world.set_block_state(x, y, z, stone);
+                }
+            }
+        }
+        sim.walker.dig = Some(path::DigPolicy::HAND);
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+        for _ in 0..900 {
+            sim.step();
+        }
+        assert!(sim.walker.gave_up(), "stone should not be mined by hand");
     }
 }

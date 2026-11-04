@@ -180,7 +180,14 @@ land.
   attack button until the server's block update takes them away. Mining is
   costed by hardness, so a route through a wall is only chosen when it beats
   walking around; `DigPolicy::HAND` covers soil, sand, gravel and wood, not
-  stone or ores. Placing blocks to bridge a gap is not supported yet.
+  stone or ores.
+
+  Set `walker.place = Some(path::PlacePolicy::for_item(item)?)` to let it
+  fill a hole in the floor on the way: such a waypoint has a block placed
+  under it, clicked against the face of a block beside the hole, and the
+  click is only made once the crosshair really is on that face. The block
+  has to be the one in hand, in the selected hotbar slot. Bridging out over
+  open air (the sneak-bridge a person does) is not supported yet.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
   approaches, keeps the crosshair on the target and clicks when the attack
   charge is back.

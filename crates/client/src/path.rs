@@ -4,8 +4,10 @@
 //! bot logic, and it only decides *where* to go. [`crate::nav::Walker`]
 //! turns the result into mouse and key input.
 //!
-//! Doors are opened on the way through. Blocks are broken too, when the
-//! search is given a [`DigPolicy`]; placing blocks is not handled yet.
+//! Doors are opened on the way through, and blocks are broken or placed when
+//! the search is given a [`DigPolicy`] or a [`PlacePolicy`]. Placing fills a
+//! hole in the floor a waypoint stands on; bridging out over a void (the
+//! sneak-bridge a person does) is not handled.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -14,7 +16,8 @@ use std::sync::OnceLock;
 use rapidbot_physics::math::Vec3;
 use rapidbot_world::collision::block_collisions;
 use rapidbot_world::fluid::{self, FluidKind};
-use rapidbot_world::{Aabb, Axis, Registry, World};
+use rapidbot_world::raycast::Direction;
+use rapidbot_world::{Aabb, Axis, Registry, StateId, World};
 
 use crate::door::{self, Door};
 
@@ -60,6 +63,58 @@ pub struct DigPolicy {
 impl DigPolicy {
     /// By hand: soil, sand, gravel, wood and plants, but not stone.
     pub const HAND: Self = Self { max_hardness: 1.0 };
+}
+
+/// What placing one block adds to a move's cost: aim at a face, click, wait
+/// for the server's update.
+const PLACE_COST: f64 = 2.0;
+
+/// The block a route may place to make a way through. Without one (the
+/// default) the walker only goes where the ground already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacePolicy {
+    /// The block state to place, such as
+    /// `Registry::block_for_item(item).default_state`.
+    pub block: StateId,
+}
+
+impl PlacePolicy {
+    /// The block a stack of `item` would place, if it is a block item.
+    pub fn for_item(item: u32) -> Option<Self> {
+        Some(Self {
+            block: Registry::get().block_for_item(item)?.default_state,
+        })
+    }
+}
+
+/// The six neighbours of a cell, with the face of that neighbour which looks
+/// back at the cell: the block to the west is clicked on its east face.
+pub(crate) const NEIGHBOURS: [((i32, i32, i32), Direction); 6] = [
+    ((0, -1, 0), Direction::Up),
+    ((0, 1, 0), Direction::Down),
+    ((0, 0, -1), Direction::South),
+    ((0, 0, 1), Direction::North),
+    ((-1, 0, 0), Direction::East),
+    ((1, 0, 0), Direction::West),
+];
+
+/// The face centres a bot can click to place a block into `hole`: one for
+/// each solid neighbour, in [`NEIGHBOURS`] order. Aiming at the first and
+/// clicking only when the crosshair really is on one of these faces means an
+/// unreachable face is never clicked blindly.
+pub(crate) fn place_targets(world: &World, hole: (i32, i32, i32)) -> Vec<Vec3> {
+    NEIGHBOURS
+        .iter()
+        .filter(|((dx, dy, dz), _)| blocks(world, hole.0 + dx, hole.1 + dy, hole.2 + dz))
+        .map(|((dx, dy, dz), _)| {
+            // The face of the neighbour that looks at the hole.
+            Vec3::new(
+                (hole.0 + dx) as f64 + 0.5 - *dx as f64 * 0.5,
+                (hole.1 + dy) as f64 + 0.5 - *dy as f64 * 0.5,
+                (hole.2 + dz) as f64 + 0.5 - *dz as f64 * 0.5,
+            )
+        })
+        .collect()
 }
 
 /// Whether the block at (x, y, z) has a collision shape, so a player cannot
@@ -287,6 +342,39 @@ fn dig_surface(world: &World, cell: (i32, i32, i32), dig: DigPolicy) -> Option<(
     Some((y as f64, cost))
 }
 
+/// Like [`surface`] for a column a bot may fill in: the feet and head cells
+/// must be free, the cell below them a hole with a block beside it to click,
+/// and the state one that can act as a floor. Returns the surface the player
+/// would stand on once the block is there.
+fn place_surface(world: &World, cell: (i32, i32, i32), place: PlacePolicy) -> Option<f64> {
+    let (x, y, z) = cell;
+    if blocks(world, x, y, z) || blocks(world, x, y + 1, z) {
+        return None;
+    }
+    for dy in 0..2 {
+        let state = world.block_state(x, y + dy, z)?;
+        if traits()[state as usize] & (DANGER | WATER) != 0 {
+            return None;
+        }
+    }
+    let (fx, fy, fz) = (x, y - 1, z);
+    let floor = world.block_state(fx, fy, fz)?;
+    if blocks(world, fx, fy, fz) || traits()[floor as usize] & (DANGER | WATER) != 0 {
+        return None;
+    }
+    // Something beside the hole to click a face of.
+    if !NEIGHBOURS
+        .iter()
+        .any(|((dx, dy, dz), _)| blocks(world, fx + dx, fy + dy, fz + dz))
+    {
+        return None;
+    }
+    // The state placed has to be able to act as a floor. Full blocks do; a
+    // torch or a plant would not.
+    Registry::get().collision_shape(place.block)?;
+    Some(y as f64)
+}
+
 /// Where a search is headed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Goal {
@@ -333,6 +421,9 @@ pub struct Waypoint {
     /// Blocks in this cell have to be mined before the player can stand
     /// there.
     pub dig: bool,
+    /// A block has to be placed under this cell before the player can stand
+    /// there.
+    pub place: bool,
 }
 
 impl Waypoint {
@@ -364,6 +455,8 @@ struct Node {
     /// Reached by mining: the cell's blocks have to go before it can be
     /// walked into.
     dig: bool,
+    /// Reached by placing: a block has to go under the cell first.
+    place: bool,
 }
 
 /// An A* search that can be run a bit at a time, so a long search does not
@@ -379,6 +472,30 @@ pub struct Search {
     limit: usize,
     /// What this search is allowed to mine through, if anything.
     dig: Option<DigPolicy>,
+    /// What this search is allowed to place, if anything.
+    place: Option<PlacePolicy>,
+}
+
+/// What a move has to do before its cell can be stood in.
+#[derive(Debug, Clone, Copy, Default)]
+struct DigPlace {
+    dig: bool,
+    place: bool,
+}
+
+impl DigPlace {
+    const NONE: Self = Self {
+        dig: false,
+        place: false,
+    };
+    const DIG: Self = Self {
+        dig: true,
+        place: false,
+    };
+    const PLACE: Self = Self {
+        dig: false,
+        place: true,
+    };
 }
 
 const NO_PARENT: u32 = u32::MAX;
@@ -405,6 +522,7 @@ impl Search {
                 parent: NO_PARENT,
                 closed: false,
                 dig: false,
+                place: false,
             }],
             index: HashMap::from([(cell, 0)]),
             open: BinaryHeap::new(),
@@ -413,6 +531,7 @@ impl Search {
             expanded: 0,
             limit,
             dig: None,
+            place: None,
         };
         search.open.push(Reverse((0, 0)));
         Some(search)
@@ -421,6 +540,12 @@ impl Search {
     /// Lets the search mine through blocks `dig` covers, at a cost.
     pub fn with_digging(mut self, dig: DigPolicy) -> Self {
         self.dig = Some(dig);
+        self
+    }
+
+    /// Lets the search fill a hole in the floor with `place`.
+    pub fn with_placing(mut self, place: PlacePolicy) -> Self {
+        self.place = Some(place);
         self
     }
 
@@ -502,6 +627,22 @@ impl Search {
                     if self.door_step(world, id, (x + dx, ny, z + dz), s, cost) {
                         break;
                     }
+                }
+            }
+            if !stepped && let Some(place) = self.place {
+                // Fill the hole under the next cell with a block, then step
+                // onto it. Like mining, it costs more than walking.
+                for ny in (y - 1..=y + 1).rev() {
+                    let Some(s2) = place_surface(world, (x + dx, ny, z + dz), place) else {
+                        continue;
+                    };
+                    let d = s2 - s;
+                    if d > JUMP || d < -MAX_DROP {
+                        continue;
+                    }
+                    let step_cost = 1.0 + d.abs().max(0.0) + PLACE_COST;
+                    self.relax_place(world, id, (x + dx, ny, z + dz), s2, cost + step_cost);
+                    break;
                 }
             }
             if !stepped && let Some(dig) = self.dig {
@@ -690,7 +831,7 @@ impl Search {
         surface: f64,
         cost: f64,
     ) {
-        self.relax_node(world, parent, cell, surface, cost, false);
+        self.relax_node(world, parent, cell, surface, cost, DigPlace::NONE);
     }
 
     /// A move that has to mine its way in.
@@ -702,7 +843,19 @@ impl Search {
         surface: f64,
         cost: f64,
     ) {
-        self.relax_node(world, parent, cell, surface, cost, true);
+        self.relax_node(world, parent, cell, surface, cost, DigPlace::DIG);
+    }
+
+    /// A move that has to place a block under itself.
+    fn relax_place(
+        &mut self,
+        world: &World,
+        parent: u32,
+        cell: (i32, i32, i32),
+        surface: f64,
+        cost: f64,
+    ) {
+        self.relax_node(world, parent, cell, surface, cost, DigPlace::PLACE);
     }
 
     fn relax_node(
@@ -712,7 +865,7 @@ impl Search {
         cell: (i32, i32, i32),
         surface: f64,
         mut cost: f64,
-        dig: bool,
+        flags: DigPlace,
     ) {
         // Wading is slow.
         if trait_at(world, cell.0, cell.1, cell.2) & WATER != 0 {
@@ -726,7 +879,8 @@ impl Search {
                 }
                 node.cost = cost;
                 node.parent = parent;
-                node.dig = dig;
+                node.dig = flags.dig;
+                node.place = flags.place;
                 id
             }
             None => {
@@ -737,7 +891,8 @@ impl Search {
                     cost,
                     parent,
                     closed: false,
-                    dig,
+                    dig: flags.dig,
+                    place: flags.place,
                 });
                 self.index.insert(cell, id);
                 id
@@ -761,6 +916,7 @@ impl Search {
                 jump: false,
                 door,
                 dig: node.dig,
+                place: node.place,
             });
             id = node.parent;
         }
@@ -1286,6 +1442,56 @@ mod tests {
         // Without a policy it walks around instead, and mines nothing.
         let path = find(&world, start(), goal, 40_000).unwrap();
         assert!(path.points.iter().all(|w| !w.dig));
+    }
+
+    /// The item registry id of a name, for the placing policies.
+    fn item_id(name: &str) -> u32 {
+        rapidbot_world::item::ItemData::get()
+            .items
+            .iter()
+            .position(|item| item.name == name)
+            .unwrap() as u32
+    }
+
+    /// [`find`] with a placing policy.
+    fn find_placing(
+        world: &World,
+        from: Vec3,
+        goal: Goal,
+        limit: usize,
+        place: PlacePolicy,
+    ) -> Option<Path> {
+        let mut search = Search::new(world, from, goal, limit)?.with_placing(place);
+        loop {
+            if let Some(path) = search.step(world, 4096) {
+                return Some(path);
+            }
+        }
+    }
+
+    /// A void gap across the loaded world, with a floor beyond it, can only
+    /// be crossed by placing a block. The ceiling rules out the jump that
+    /// would otherwise clear it.
+    #[test]
+    fn places_a_block_across_a_gap() {
+        let mut world = flat();
+        for z in -32..=47 {
+            world.set_block_state(4, 63, z, 0);
+            world.set_block_state(4, 66, z, 1);
+            world.set_block_state(5, 66, z, 1);
+        }
+        let place = PlacePolicy::for_item(item_id("minecraft:dirt")).unwrap();
+        let goal = Goal::Column { x: 10, z: 0 };
+        let path = find_placing(&world, start(), goal, 40_000, place).unwrap();
+        assert!(path.complete, "did not plan across the gap");
+        let placed: Vec<&Waypoint> = path.points.iter().filter(|w| w.place).collect();
+        assert_eq!(placed.len(), 1, "one block: {placed:?}");
+        assert_eq!(placed[0].cell, (4, 64, 0));
+
+        // Without a policy there is no way across.
+        let path = find(&world, start(), goal, 40_000).unwrap();
+        assert!(!path.complete);
+        assert!(path.points.iter().all(|w| !w.place));
     }
 
     /// Stone is harder than a hand policy allows, so a wall of it right

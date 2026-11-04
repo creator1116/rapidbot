@@ -34,8 +34,8 @@
 
 pub use rapidbot_auth as auth;
 pub use rapidbot_client::{
-    Account, Bot, BotEvent, ClientConfig, ClientError, Controller, DisplaySettings, Idle,
-    InputMode, Keys, MouseSettings, ResourcePackPolicy, TickContext, chat, combat, commands,
+    Account, Bot, BotEvent, ChatKeySource, ClientConfig, ClientError, Controller, DisplaySettings,
+    Idle, InputMode, Keys, MouseSettings, ResourcePackPolicy, TickContext, chat, combat, commands,
     controller, entities, interact, inventory, math, nav, path, run, run_with,
 };
 pub use rapidbot_human as human;

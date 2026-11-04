@@ -206,6 +206,35 @@ aliases, `rapidbot-auth status` shows their cached token state, and
 forgets one. `RAPIDBOT_ACCOUNTS` chooses the directory (default `accounts`,
 which is gitignored).
 
+A session that stays connected should also renew its chat-signing keys, as
+vanilla does: once the announced pair's `refreshed_after` passes (and at most
+once an hour), `chat_session_update` is sent again with a new pair, because
+signatures stop being accepted when the announced one expires. Hand the client
+the authenticator; without one the keys announced at login stay in use:
+
+```rust
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+let store = rapidbot_auth::AccountStore::open("accounts")?;
+let auth = Arc::new(Mutex::new(store.authenticator("main")?));
+let account = {
+    let mut auth = auth.lock().await;
+    auth.login(|code| {
+        println!(
+            "Sign in at {} with code {}",
+            code.verification_uri, code.user_code
+        )
+    })
+    .await?
+};
+let mut config = ClientConfig::new("play.example.net", Account::Microsoft(account));
+config.chat_key_renewer = Some(ChatKeySource::from_authenticator(auth.clone()));
+```
+
+`ChatKeySource::new` takes any async factory that returns `ChatKeys`, so a
+different token store or a token broker works the same way.
+
 Realms worlds use the same account:
 
 ```sh

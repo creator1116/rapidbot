@@ -292,9 +292,23 @@ Player chat packets are checked against the sender's chat session from the
 player list, including the RSA/SHA-256 signature, message index, and the
 per-sender chain. A message that fails validation is not emitted as chat and
 breaks that sender's chain until a new session is announced. Servers without
-secure profiles can still use unsigned chat. The Mojang signature over the
-profile key itself is not verified yet, so the client trusts the key the
-server supplied for that player.
+secure profiles can still use unsigned chat.
+
+A player's profile key is itself signed by Mojang, which is what stops a
+server from announcing a key of its own choosing for a player. Fetch the
+service keys once and hand them to the client:
+
+```rust
+config.profile_keys = Some(authenticator.services_keys().await?);
+```
+
+The session's key is then accepted only when that signature verifies over the
+profile id, the expiry and the key, with the `playerCertificateKeys` from
+`/publickeys` (`SHA1withRSA`, the algorithm Mojang signs profile keys with).
+A session that fails is dropped, as it is in `PlayerInfo.initializeChatSession`.
+Without `profile_keys` there is nothing to check against, so the announced key
+is trusted: a documented approximation, where vanilla fetches the keys at
+startup and drops every announcement it cannot check.
 
 ## Riding
 

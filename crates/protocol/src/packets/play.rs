@@ -523,6 +523,16 @@ pub mod clientbound {
     }
     packet!(SetHealth, play, clientbound, SET_HEALTH);
 
+    /// `ClientboundCooldownPacket`: a cooldown group by name and how long it
+    /// lasts in ticks. A duration of zero clears the group instead.
+    #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+    pub struct Cooldown {
+        pub cooldown_group: Identifier,
+        #[var]
+        pub duration: i32,
+    }
+    packet!(Cooldown, play, clientbound, COOLDOWN);
+
     /// `ClientboundUpdateTagsPacket`, kept raw for `rapidbot_world::tags`.
     #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
     pub struct UpdateTags {

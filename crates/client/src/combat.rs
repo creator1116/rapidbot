@@ -1,6 +1,7 @@
 //! Not vanilla: how a person fights. Keeps the crosshair on a target,
-//! closes the distance, and clicks when the attack charge is back, with a
-//! person's timing rather than a machine's.
+//! closes the distance, clicks when the attack charge is back with a
+//! person's timing rather than a machine's, and holds a shield up between
+//! swings when one is in hand.
 //!
 //! Everything goes through the same hands as any other controller: the
 //! mouse model turns the view, the finger model clicks, and what the click
@@ -49,6 +50,12 @@ pub struct Fighter {
     pub strafe: bool,
     /// Back away when the target is closer than `keep_distance`.
     pub retreat: bool,
+    /// Raise a shield between swings when one is in the main hand: the use
+    /// button is held while the attack charge builds and let go to swing.
+    pub block: bool,
+    /// The fighter has the use button down for a shield, so it knows to let
+    /// go of it (and does not fight the controller for the button).
+    blocking: bool,
     /// Which way to circle: -1 left, 1 right.
     strafe_direction: f32,
     ticks_until_strafe_change: u32,
@@ -68,8 +75,24 @@ impl Fighter {
             sprint: true,
             strafe: true,
             retreat: true,
+            block: true,
+            blocking: false,
             strafe_direction: 1.0,
             ticks_until_strafe_change: 0,
+        }
+    }
+
+    /// Whether a shield should be up: one is in the main hand, the crosshair
+    /// is on the target, and the swing is still charging.
+    fn shield_up(&self, shielded: bool, on_target: bool, charge: f32) -> bool {
+        self.block && shielded && on_target && charge < self.wanted_charge
+    }
+
+    /// Lets go of the use button if the fighter raised a shield with it.
+    fn drop_shield(&mut self, ctx: &mut TickContext<'_>) {
+        if self.blocking {
+            ctx.hold_use(false);
+            self.blocking = false;
         }
     }
 
@@ -120,6 +143,7 @@ impl Fighter {
                 ctx.set_keys(Keys::default());
                 ctx.stop_aiming();
             }
+            self.drop_shield(ctx);
             return FightStatus::Idle;
         };
         let id = entity.id;
@@ -155,6 +179,22 @@ impl Fighter {
         }
 
         let on_target = ctx.target.is_some_and(|hit| hit.id == id);
+        // A shield goes up between swings and comes down to swing. Only while
+        // the crosshair is on the target: a held use button with a block under
+        // the crosshair would right-click that block.
+        let shielded = self.block
+            && ctx
+                .inventory
+                .held()
+                .is_some_and(|stack| stack.name() == "minecraft:shield");
+        if self.shield_up(shielded, on_target, ctx.attack_strength) {
+            if !self.blocking {
+                ctx.hold_use(true);
+                self.blocking = true;
+            }
+        } else {
+            self.drop_shield(ctx);
+        }
         if !on_target {
             self.swing_in = None;
             return if reachable.is_some() {
@@ -174,6 +214,7 @@ impl Fighter {
                 FightStatus::Engaged
             }
             Some(0) => {
+                self.drop_shield(ctx);
                 ctx.click_attack();
                 self.next_swing();
                 FightStatus::Swung
@@ -213,5 +254,30 @@ mod tests {
         let close = fighter.movement_keys(1.0);
         assert!(close.backward && !close.forward);
         assert!(!close.left && !close.right);
+    }
+
+    #[test]
+    fn a_shield_is_up_between_swings_only() {
+        let mut fighter = Fighter::new(1);
+        fighter.wanted_charge = 1.0;
+        assert!(
+            fighter.shield_up(true, true, 0.4),
+            "blocking a charging swing"
+        );
+        assert!(
+            !fighter.shield_up(false, true, 0.4),
+            "nothing to block with"
+        );
+        assert!(
+            !fighter.shield_up(true, false, 0.4),
+            "crosshair off the target"
+        );
+        assert!(
+            !fighter.shield_up(true, true, 1.0),
+            "the bar is back: swing"
+        );
+
+        fighter.block = false;
+        assert!(!fighter.shield_up(true, true, 0.4), "turned off");
     }
 }

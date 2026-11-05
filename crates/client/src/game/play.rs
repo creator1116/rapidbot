@@ -64,6 +64,9 @@ pub(super) struct PlayState {
     /// Size of `minecraft:worldgen/biome`, which fixes the width of global
     /// biome palettes in chunk data.
     biome_count: usize,
+    /// The synced `minecraft:enchantment` ID of `minecraft:riptide`, which
+    /// the riptide use and release prediction reads off the held trident.
+    riptide: Option<u32>,
     load: Option<LoadState>,
     pub client_loaded: bool,
     /// `ClientPacketListener.enforcesSecureChat`: reject messages whose
@@ -154,6 +157,7 @@ impl PlayState {
             entities: Default::default(),
             tags,
             biome_count: registry_len(session, "minecraft:worldgen/biome"),
+            riptide: registry_entry_id(session, "minecraft:enchantment", "minecraft:riptide"),
             load: None,
             client_loaded: false,
             enforces_secure_chat: login.enforces_secure_chat,
@@ -320,6 +324,7 @@ impl PlayState {
         down: bool,
         hit: &crate::interact::Pick,
     ) {
+        let riptide = self.riptide;
         let Self {
             player,
             world,
@@ -331,6 +336,7 @@ impl PlayState {
             game_type,
             ..
         } = self;
+        let riding = player.is_riding();
         let mut hands = crate::interact::Hands {
             player: &mut player.physics,
             world,
@@ -340,6 +346,8 @@ impl PlayState {
             net,
             restricted: matches!(game_type, GameType::Spectator | GameType::Adventure),
             survival: *game_type != GameType::Creative,
+            riptide,
+            riding,
         };
         let selected = inventory.selected;
         game_mode.attack_button(&mut hands, clicks, down, hit, |net| {
@@ -360,6 +368,7 @@ impl PlayState {
         if self.game_type == GameType::Spectator {
             return;
         }
+        let riptide = self.riptide;
         let Self {
             player,
             world,
@@ -370,6 +379,7 @@ impl PlayState {
             game_type,
             ..
         } = self;
+        let riding = player.is_riding();
         let mut hands = crate::interact::Hands {
             player: &mut player.physics,
             world,
@@ -379,6 +389,8 @@ impl PlayState {
             net,
             restricted: matches!(game_type, GameType::Spectator | GameType::Adventure),
             survival: *game_type != GameType::Creative,
+            riptide,
+            riding,
         };
         game_mode.use_item_on(&mut hands, hit);
     }
@@ -400,6 +412,7 @@ impl PlayState {
                 slot: selected as i16,
             });
         }
+        let riptide = self.riptide;
         let Self {
             player,
             world,
@@ -410,6 +423,7 @@ impl PlayState {
             game_type,
             ..
         } = self;
+        let riding = player.is_riding();
         let mut hands = crate::interact::Hands {
             player: &mut player.physics,
             world,
@@ -419,6 +433,8 @@ impl PlayState {
             net,
             restricted: matches!(game_type, GameType::Spectator | GameType::Adventure),
             survival: *game_type != GameType::Creative,
+            riptide,
+            riding,
         };
         game_mode.use_button(&mut hands, hit, down, clicked);
     }
@@ -1190,6 +1206,7 @@ fn apply_own_entity_data(
                     0 => Some(Pose::Standing),
                     1 => Some(Pose::FallFlying),
                     3 => Some(Pose::Swimming),
+                    4 => Some(Pose::SpinAttack),
                     5 => Some(Pose::Crouching),
                     _ => None,
                 };
@@ -1216,6 +1233,20 @@ fn registry_len(session: &SessionData, name: &str) -> usize {
         .filter(|(registry, _)| registry.normalized() == name)
         .map(|(_, entries)| entries.len())
         .sum()
+}
+
+/// The synced ID of a named entry in a registry, which is what an item's
+/// component refers to (an enchantment component holds enchantment IDs).
+fn registry_entry_id(session: &SessionData, registry: &str, entry: &str) -> Option<u32> {
+    let entries = session
+        .registries
+        .iter()
+        .find(|(id, _)| id.normalized() == registry)
+        .map(|(_, entries)| entries)?;
+    entries
+        .iter()
+        .position(|candidate| candidate.id.normalized() == entry)
+        .map(|index| index as u32)
 }
 
 /// Width and height of each synced `minecraft:painting_variant`, in registry

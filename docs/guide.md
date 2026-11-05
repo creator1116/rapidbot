@@ -189,8 +189,10 @@ land.
   has to be the one in hand, in the selected hotbar slot. Bridging out over
   open air (the sneak-bridge a person does) is not supported yet.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
-  approaches, keeps the crosshair on the target and clicks when the attack
-  charge is back.
+  approaches, keeps the crosshair on the target, clicks when the attack charge
+  is back, and holds a shield up between swings when one is in the main hand
+  (`block`, on by default; the fighter owns the use button while it has a
+  target).
 
 ## Accounts
 

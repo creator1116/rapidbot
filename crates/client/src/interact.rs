@@ -351,6 +351,9 @@ struct ServerVerified {
 enum UseOn {
     /// A block placement was predicted, so the click is consumed.
     Predicted,
+    /// `InteractionResult.CONSUME`: the click is consumed without a local
+    /// use, because the held item is on cooldown.
+    Consumed,
     /// `InteractionResult.FAIL`: the block is outside the border.
     Failed,
     /// Nothing local consumed the click.
@@ -421,8 +424,15 @@ impl GameMode {
         } else {
             h.inventory.offhand().cloned()
         };
+        // `MultiPlayerGameMode.useItemOn`: with the item on cooldown the
+        // click is consumed and no use is predicted. The packet below still
+        // goes out, as it does in vanilla.
+        let on_cooldown = item
+            .as_ref()
+            .is_some_and(|stack| h.player.cooldowns.is_on_cooldown(stack));
         let mut predicted = false;
-        if !h.player.spectator
+        if !on_cooldown
+            && !h.player.spectator
             && let Some(item) = &item
             && (!h.restricted || item.can_place_on_block_in_adventure_mode(clicked, h.tags))
             && let Some(changes) = placement::predict(
@@ -453,6 +463,8 @@ impl GameMode {
         });
         if predicted {
             UseOn::Predicted
+        } else if on_cooldown {
+            UseOn::Consumed
         } else {
             UseOn::Pass
         }
@@ -1984,6 +1996,34 @@ mod tests {
             .mode
             .block_changed_ack(1, &mut scene.world, &mut scene.player);
         assert_eq!(scene.world.block_state(1, 65, 0), Some(AIR));
+    }
+
+    /// `MultiPlayerGameMode.useItemOn`: an item on cooldown consumes the
+    /// click without a local placement. `UseItemOn` still goes out, as it
+    /// does in vanilla, and the prediction comes back when the cooldown ends.
+    #[test]
+    fn a_cooldown_stops_the_local_placement() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:stone");
+        let stone = state("minecraft:stone");
+        scene.player.cooldowns.add("minecraft:stone", 20);
+
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID]
+        );
+        assert_eq!(
+            scene.world.block_state(1, 65, 0),
+            Some(AIR),
+            "cooling down: nothing predicted"
+        );
+
+        for _ in 0..20 {
+            scene.player.cooldowns.tick();
+        }
+        scene.tick_use(true, true);
+        assert_eq!(scene.world.block_state(1, 65, 0), Some(stone));
     }
 
     /// `useItemOn` and `startDestroyBlock` refuse a block outside the border

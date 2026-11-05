@@ -809,6 +809,22 @@ impl Game {
                     .world_border
                     .set_warning_blocks(border.warning_blocks);
             }
+            cb::Cooldown::ID => {
+                // `handleItemCooldown`: a zero duration clears the group.
+                let cooldown = packet.decode::<cb::Cooldown>()?;
+                let play = play_mut(&mut self.play)?;
+                if cooldown.duration == 0 {
+                    play.player
+                        .physics
+                        .cooldowns
+                        .remove(&cooldown.cooldown_group.0);
+                } else {
+                    play.player
+                        .physics
+                        .cooldowns
+                        .add(cooldown.cooldown_group.0, cooldown.duration);
+                }
+            }
             cb::SetHealth::ID => {
                 let health = packet.decode::<cb::SetHealth>()?;
                 let play = play_mut(&mut self.play)?;

@@ -23,6 +23,7 @@ use rapidbot_world::collision::{
     EntityCollisionContext, block_collisions_with, collide as shapes_collide,
 };
 use rapidbot_world::fluid::{self, FluidKind};
+use rapidbot_world::item::ItemCooldowns;
 use rapidbot_world::shape::PlacedShape;
 use rapidbot_world::tags::Tags;
 use rapidbot_world::{Aabb, Axis, Registry, World, WorldBorder};
@@ -211,6 +212,9 @@ pub struct Player {
     pub use_item_can_sprint: bool,
     /// `UseEffects.speedMultiplier` of the item being used.
     pub use_item_speed: f32,
+    /// `Player.cooldowns`: item groups the server put on cooldown, ticked
+    /// with the player.
+    pub cooldowns: ItemCooldowns,
     /// `jumpTriggerTime`: ticks left in the window where a second jump
     /// press toggles creative flight.
     jump_trigger_time: i32,
@@ -291,6 +295,7 @@ impl Player {
             using_item_offhand: false,
             use_item_can_sprint: false,
             use_item_speed: 0.2,
+            cooldowns: ItemCooldowns::default(),
             jump_trigger_time: 0,
             abilities_changed: false,
             first_tick: true,
@@ -705,6 +710,8 @@ impl Player {
         if nx != self.pos.x || nz != self.pos.z {
             self.set_pos(Vec3::new(nx, self.pos.y, nz));
         }
+        // `Player.tick` ends with `cooldowns.tick()` then the pose update.
+        self.cooldowns.tick();
         self.update_player_pose(&ctx);
     }
 

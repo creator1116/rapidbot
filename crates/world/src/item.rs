@@ -8,10 +8,11 @@
 //! acts on are parsed. Every item's default components come from the JVM
 //! (`tools/extract_items.py`) in the same encoding.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
-use rapidbot_buf::{Decode, DecodeError, read_var_int, take};
+use rapidbot_buf::{Decode, DecodeError, Identifier, read_var_int, take};
 
 use crate::tags::Tags;
 use crate::{Registry, StateId};
@@ -1108,6 +1109,74 @@ impl ItemData {
     }
 }
 
+/// `ItemCooldowns`: how long each cooldown group still has to run, counted
+/// in player ticks. The server drives it with `ClientboundCooldownPacket`;
+/// its only local effect is that a predicted use or block placement stops
+/// while the held stack's group is cooling (`MultiPlayerGameMode.useItem`
+/// and `useItemOn`).
+#[derive(Debug, Default, Clone)]
+pub struct ItemCooldowns {
+    /// `tickCount`, which keeps counting whenever the player ticks.
+    tick_count: i32,
+    /// Group name to `(startTime, endTime)`, as `CooldownInstance`.
+    cooldowns: HashMap<String, (i32, i32)>,
+}
+
+impl ItemCooldowns {
+    /// `getCooldownGroup`: the group named by the stack's `use_cooldown`
+    /// component, or the item's own name when it has none.
+    pub fn group_of(stack: &ItemStack) -> String {
+        if let Some(value) = stack.component("minecraft:use_cooldown") {
+            let mut buf = value;
+            // `UseCooldown`: seconds, then an optional group identifier.
+            if f32::decode(&mut buf).is_ok()
+                && let Ok(true) = bool::decode(&mut buf)
+                && let Ok(group) = Identifier::decode(&mut buf)
+            {
+                return group.0;
+            }
+        }
+        stack.name().to_string()
+    }
+
+    /// `isOnCooldown`: `getCooldownPercent(stack, 0) > 0`.
+    pub fn is_on_cooldown(&self, stack: &ItemStack) -> bool {
+        let group = Self::group_of(stack);
+        self.cooldowns
+            .get(&group)
+            .is_some_and(|(_, end)| *end > self.tick_count)
+    }
+
+    /// `getCooldownPercent`, the part of the cooldown still to run.
+    pub fn percent(&self, group: &str, partial: f32) -> f32 {
+        match self.cooldowns.get(group) {
+            Some((start, end)) => {
+                let duration = (end - start) as f32;
+                let remaining = *end as f32 - (self.tick_count as f32 + partial);
+                (remaining / duration).clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// `addCooldown`.
+    pub fn add(&mut self, group: impl Into<String>, ticks: i32) {
+        self.cooldowns
+            .insert(group.into(), (self.tick_count, self.tick_count + ticks));
+    }
+
+    /// `removeCooldown`, which a zero-length packet asks for.
+    pub fn remove(&mut self, group: &str) {
+        self.cooldowns.remove(group);
+    }
+
+    /// `tick`, called at the end of `Player.tick`.
+    pub fn tick(&mut self) {
+        self.tick_count += 1;
+        self.cooldowns.retain(|_, (_, end)| *end > self.tick_count);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,5 +1365,57 @@ mod tests {
                 matches!(BlockSet::decode(&mut decode_data), Err(error) if is_expected_error(&error))
             );
         }
+    }
+
+    /// `getCooldownGroup`: the item's own name unless the stack's
+    /// `use_cooldown` component names a group.
+    #[test]
+    fn a_cooldown_group_is_the_item_unless_the_component_names_one() {
+        let data = ItemData::get();
+        let stone = ItemStack::new(data.item_id("minecraft:stone").unwrap(), 1);
+        assert_eq!(ItemCooldowns::group_of(&stone), "minecraft:stone");
+
+        // No vanilla item names a group, but a stack may still carry one.
+        let mut grouped = stone.clone();
+        let ty = data.component_id("minecraft:use_cooldown").unwrap();
+        let mut value = Vec::new();
+        0.5f32.encode(&mut value);
+        true.encode(&mut value);
+        Identifier::new("minecraft:pearls").encode(&mut value);
+        grouped.patch.added.push((ty, value));
+        assert_eq!(ItemCooldowns::group_of(&grouped), "minecraft:pearls");
+    }
+
+    /// `ItemCooldowns`: a cooldown runs down with the player's ticks and can
+    /// be cleared early, which is what a zero-length packet asks for.
+    #[test]
+    fn cooldowns_run_down_with_the_player() {
+        let data = ItemData::get();
+        let pearl = ItemStack::new(data.item_id("minecraft:ender_pearl").unwrap(), 1);
+        let stone = ItemStack::new(data.item_id("minecraft:stone").unwrap(), 1);
+
+        let mut cooldowns = ItemCooldowns::default();
+        assert!(!cooldowns.is_on_cooldown(&pearl));
+        cooldowns.add(ItemCooldowns::group_of(&pearl), 20);
+        assert!(cooldowns.is_on_cooldown(&pearl));
+        assert!(!cooldowns.is_on_cooldown(&stone), "another item is free");
+        assert_eq!(cooldowns.percent("minecraft:ender_pearl", 0.0), 1.0);
+
+        for _ in 0..10 {
+            cooldowns.tick();
+        }
+        assert_eq!(cooldowns.percent("minecraft:ender_pearl", 0.0), 0.5);
+        for _ in 0..10 {
+            cooldowns.tick();
+        }
+        assert!(
+            !cooldowns.is_on_cooldown(&pearl),
+            "the twentieth tick ends a 20-tick cooldown"
+        );
+
+        cooldowns.add("minecraft:ender_pearl", 100);
+        assert!(cooldowns.is_on_cooldown(&pearl));
+        cooldowns.remove("minecraft:ender_pearl");
+        assert!(!cooldowns.is_on_cooldown(&pearl));
     }
 }

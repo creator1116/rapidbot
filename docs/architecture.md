@@ -55,6 +55,19 @@ Like the vanilla client, a bot has network tasks and one main thread.
 
 Tick regularity is visible to servers, so bots are run in release builds.
 
+## Embedding: observing the wire
+
+`ClientConfig::packet_observer` takes a `PacketObserver`, and every packet the
+connection decodes or queues is reported once with its direction, protocol
+state, id, generated name, body and stage. The hooks sit where the traffic
+is: the login handshake runs on the un-split `Connection`, so its packets are
+reported by the login path, while configuration and play — and a
+reconfiguration, which moves the reader back a state — are reported by
+`net.rs`'s reader and by `PacketSender::send`. Inbound packets are reported
+once they are decoded and before anything acts on them; outbound ones when
+they are queued, which is before the writer flushes them. With no observer
+set, nothing is looked up and nothing is allocated.
+
 ## The configuration phase
 
 Between login and play the server runs a configuration phase of its own: it

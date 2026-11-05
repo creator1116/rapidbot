@@ -6,8 +6,10 @@
 //! difference is visible to the server: a keep-alive is answered at once,
 //! while a ping waits for the next frame.
 
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 
+use rapidbot_buf::read_var_int;
 use rapidbot_nbt::Tag;
 use rapidbot_protocol::packets::{configuration, play};
 use rapidbot_protocol::{Direction, Packet, RawPacket, Reader, State, Writer};
@@ -16,19 +18,150 @@ use tracing::{debug, trace, warn};
 
 use crate::{clock, text};
 
+/// When a packet was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketStage {
+    /// Decoded from the socket, before anything acted on it.
+    Received,
+    /// Handed to the writer queue. The writer writes one packet per flush, so
+    /// a queued packet may not be on the wire yet.
+    Queued,
+}
+
+/// One packet seen by a [`PacketObserver`].
+#[derive(Debug)]
+pub struct ObservedPacket<'a> {
+    /// [`ClientConfig::connection_id`](crate::ClientConfig::connection_id) of
+    /// the connection it came from, so an application running several bots
+    /// can tell them apart.
+    pub connection: u64,
+    pub direction: Direction,
+    pub state: State,
+    pub id: i32,
+    /// The name the generated tables give this id, where they have one.
+    pub name: Option<&'static str>,
+    pub stage: PacketStage,
+    /// The decoded (or about-to-be-queued) body without its length prefix, so
+    /// the packet id is **not** in here. Borrowed for the call.
+    pub body: &'a [u8],
+}
+
+/// Called for every packet an observed connection decodes or queues, on the
+/// reader task or on whatever thread sent it. It must not block: an
+/// application that stores or forwards packets should hand them to its own
+/// bounded queue.
+///
+/// Bodies can hold sensitive data — login, cookies and custom payloads in
+/// particular — so redacting or encrypting before persisting them is the
+/// application's job.
+type ObserverFn = dyn Fn(ObservedPacket<'_>) + Send + Sync;
+
+/// An application's packet callback.
+///
+/// ```
+/// use rapidbot_client::PacketObserver;
+///
+/// let observer = PacketObserver::new(|packet| {
+///     let _ = (packet.id, packet.body.len(), packet.stage);
+/// });
+/// ```
+#[derive(Clone)]
+pub struct PacketObserver(Arc<ObserverFn>);
+
+impl PacketObserver {
+    /// Builds an observer from a callback.
+    pub fn new<F>(observe: F) -> Self
+    where
+        F: Fn(ObservedPacket<'_>) + Send + Sync + 'static,
+    {
+        Self(Arc::new(observe))
+    }
+
+    fn call(&self, packet: ObservedPacket<'_>) {
+        (self.0)(packet);
+    }
+}
+
+impl std::fmt::Debug for PacketObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PacketObserver")
+    }
+}
+
+/// The observer of one connection, and the id it reports it under.
+#[derive(Clone, Default)]
+pub struct Observer {
+    connection: u64,
+    callback: Option<PacketObserver>,
+}
+
+impl Observer {
+    pub fn new(connection: u64, callback: Option<PacketObserver>) -> Self {
+        Self {
+            connection,
+            callback,
+        }
+    }
+
+    /// Whether anyone is listening, so a caller can skip the work of
+    /// preparing a body for a callback that will not happen.
+    pub fn is_observing(&self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Reports an outgoing packet as it is queued.
+    pub fn report_queued(&self, state: State, id: i32, body: &[u8]) {
+        self.report(Direction::Serverbound, state, id, PacketStage::Queued, body);
+    }
+
+    /// Reports an incoming packet once it has been decoded.
+    pub fn report_received(&self, state: State, id: i32, body: &[u8]) {
+        self.report(
+            Direction::Clientbound,
+            state,
+            id,
+            PacketStage::Received,
+            body,
+        );
+    }
+
+    /// Reports a packet, if anyone is listening.
+    fn report(&self, direction: Direction, state: State, id: i32, stage: PacketStage, body: &[u8]) {
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        callback.call(ObservedPacket {
+            connection: self.connection,
+            direction,
+            state,
+            id,
+            name: state.packet_name(direction, id),
+            stage,
+            body,
+        });
+    }
+}
+
 /// Serialised packets to write, in order. Senders on any thread go through
 /// this one queue, like `channel.eventLoop().execute(..)`.
 #[derive(Clone)]
 pub struct PacketSender {
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    observer: Observer,
 }
 
 impl PacketSender {
     /// A sender whose frames can be read back, for tests.
     #[cfg(test)]
     pub fn for_test() -> (PacketSender, mpsc::UnboundedReceiver<Vec<u8>>) {
+        Self::for_test_with(Observer::default())
+    }
+
+    /// A test sender that also observes what it queues.
+    #[cfg(test)]
+    pub fn for_test_with(observer: Observer) -> (PacketSender, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (PacketSender { tx }, rx)
+        (PacketSender { tx, observer }, rx)
     }
 
     pub fn send<P: Packet>(&self, packet: &P) {
@@ -37,8 +170,16 @@ impl PacketSender {
             name = P::STATE.packet_name(Direction::Serverbound, P::ID),
             "send"
         );
+        let frame = packet.to_frame_bytes();
+        if self.observer.is_observing() {
+            // The body follows the VarInt id at the front of the frame.
+            let mut body = &frame[..];
+            let _ = read_var_int(&mut body);
+            self.observer
+                .report(P::DIRECTION, P::STATE, P::ID, PacketStage::Queued, body);
+        }
         // A closed channel means the connection is gone; the reader reports it.
-        let _ = self.tx.send(packet.to_frame_bytes());
+        let _ = self.tx.send(frame);
     }
 }
 
@@ -54,7 +195,10 @@ pub enum Inbound {
     Disconnected(String),
 }
 
-pub fn spawn_writer(mut writer: Writer) -> (PacketSender, tokio::task::JoinHandle<()>) {
+pub fn spawn_writer(
+    mut writer: Writer,
+    observer: Observer,
+) -> (PacketSender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let task = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
@@ -65,7 +209,7 @@ pub fn spawn_writer(mut writer: Writer) -> (PacketSender, tokio::task::JoinHandl
         }
         let _ = writer.shutdown().await;
     });
-    (PacketSender { tx }, task)
+    (PacketSender { tx, observer }, task)
 }
 
 /// `ChunkBatchSizeCalculator`: an estimate of how fast this client takes in
@@ -142,6 +286,15 @@ async fn read_loop(
             name = state.packet_name(Direction::Clientbound, packet.id),
             len = packet.body.len(),
             "recv"
+        );
+        // The state here is the one the packet belongs to: the switch to the
+        // next state happens after it has been handled.
+        sender.observer.report(
+            Direction::Clientbound,
+            state,
+            packet.id,
+            PacketStage::Received,
+            &packet.body,
         );
 
         if state == State::Play {
@@ -269,4 +422,84 @@ fn is_brand(channel: &rapidbot_buf::Identifier) -> bool {
 
 fn disconnect_reason(reason: &Tag) -> String {
     text::nbt_to_plain(reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Every queued packet is reported once, with the metadata an
+    /// application needs, and the frame still reaches the writer queue.
+    #[test]
+    fn a_queued_packet_is_observed_once() {
+        type Seen = (u64, State, i32, PacketStage, Vec<u8>);
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let observer = Observer::new(
+            7,
+            Some(PacketObserver::new(move |packet| {
+                sink.lock().unwrap().push((
+                    packet.connection,
+                    packet.state,
+                    packet.id,
+                    packet.stage,
+                    packet.body.to_vec(),
+                ));
+            })),
+        );
+        let (sender, mut frames) = PacketSender::for_test_with(observer);
+        let packet = play::serverbound::ClientTickEnd;
+        sender.send(&packet);
+        sender.send(&packet);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one observation per queued packet");
+        assert_eq!(
+            seen[0],
+            (
+                7,
+                State::Play,
+                play::serverbound::ClientTickEnd::ID,
+                PacketStage::Queued,
+                Vec::new(),
+            )
+        );
+        // The body has no length prefix and no packet id in it.
+        assert_eq!(
+            frames.try_recv().unwrap(),
+            packet.to_frame_bytes(),
+            "the frame is unchanged"
+        );
+        assert_eq!(frames.try_recv().unwrap(), packet.to_frame_bytes());
+    }
+
+    /// A body is borrowed straight out of the frame, so a packet with
+    /// contents reports exactly its encoded payload.
+    #[test]
+    fn an_observed_body_is_the_encoded_payload() {
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let observer = Observer::new(
+            1,
+            Some(PacketObserver::new(move |packet| {
+                sink.lock().unwrap().push(packet.body.to_vec());
+            })),
+        );
+        let (sender, _frames) = PacketSender::for_test_with(observer);
+        let packet = play::serverbound::SetCarriedItem { slot: 300 };
+        sender.send(&packet);
+
+        let mut expected = Vec::new();
+        rapidbot_buf::Encode::encode(&packet, &mut expected);
+        assert_eq!(seen.lock().unwrap().as_slice(), [expected]);
+    }
+
+    /// Nothing is reported without an observer, and the queue still works.
+    #[test]
+    fn observation_is_off_by_default() {
+        let (sender, mut frames) = PacketSender::for_test();
+        sender.send(&play::serverbound::ClientTickEnd);
+        assert!(frames.try_recv().is_ok());
+    }
 }

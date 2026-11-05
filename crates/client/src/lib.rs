@@ -46,6 +46,7 @@ pub use bot::{Bot, BotEvent};
 pub use controller::{Controller, Idle, TickContext};
 pub use game::{DisplaySettings, LocalPlayer};
 pub use mouse::MouseSettings;
+pub use net::{ObservedPacket, PacketObserver, PacketStage};
 pub use proxy::{Proxy, ProxyAuth, ProxyError};
 pub use rapidbot_human as human;
 pub use rapidbot_physics::{Keys, math};
@@ -222,6 +223,15 @@ pub struct ClientConfig {
     /// again on the next join. `None`: every join downloads, like a fresh
     /// installation.
     pub pack_cache: Option<std::path::PathBuf>,
+    /// Called for every packet this connection decodes or queues, in login,
+    /// configuration and play (a reconfiguration included). `None` (the
+    /// default) costs nothing. See [`net::PacketObserver`]: the callback runs
+    /// on the connection's threads, so it must not block, and bodies may
+    /// contain sensitive data.
+    pub packet_observer: Option<net::PacketObserver>,
+    /// What the observer reports as this connection's id, so an application
+    /// running several bots can tell them apart. Defaults to 0.
+    pub connection_id: u64,
 }
 
 impl ClientConfig {
@@ -242,6 +252,8 @@ impl ClientConfig {
             auto_respawn: true,
             code_of_conduct_accepted: false,
             pack_cache: None,
+            packet_observer: None,
+            connection_id: 0,
         }
     }
 }
@@ -356,17 +368,26 @@ async fn run_inner(
             None => Connection::connect(resolved.socket).await?,
         };
 
+        // The login handshake runs on the un-split connection, so its
+        // packets are reported here and by `login` rather than by the
+        // reader and writer tasks.
+        let observer = net::Observer::new(config.connection_id, config.packet_observer.clone());
+
         // Vanilla sends the intention and then Hello, each flushed.
-        connection
-            .send(&Intention {
+        login::send_observed(
+            &mut connection,
+            &observer,
+            &Intention {
                 protocol_version: PROTOCOL_VERSION,
                 host: resolved.handshake_host.as_str().into(),
                 port: resolved.handshake_port,
                 intent: Intent::Login,
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let (profile, session_id) = login::login(&mut connection, &config, &mut session).await?;
+        let (profile, session_id) =
+            login::login(&mut connection, &config, &mut session, &observer).await?;
         info!(name = %profile.name.0, uuid = %profile.id, "logged in");
         link.emit(BotEvent::LoggedIn {
             name: profile.name.0.clone(),
@@ -376,7 +397,7 @@ async fn run_inner(
         session.session_id = Some(session_id);
 
         let (reader, writer) = connection.into_split();
-        let (sender, writer_task) = net::spawn_writer(writer);
+        let (sender, writer_task) = net::spawn_writer(writer, observer);
         let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
         let reader_task = net::spawn_reader(reader, sender.clone(), inbound_tx);
 

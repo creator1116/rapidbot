@@ -55,6 +55,33 @@ Like the vanilla client, a bot has network tasks and one main thread.
 
 Tick regularity is visible to servers, so bots are run in release builds.
 
+## Embedding: world snapshots
+
+`World` hands out immutable views of its chunks, for an application that
+renders or analyses the world from its own thread instead of reading every
+column through `block_state` on the tick thread:
+
+- `generation()` identifies the world. Every `World` takes a fresh identity in
+  the process, and one is built whenever the level is replaced — a dimension
+  change, or a reconfiguration, which drops the play state entirely. A
+  same-dimension respawn keeps the level, as vanilla does; the chunks
+  themselves still move their revisions as the server reloads them.
+- `observation_id()` is a revision that moves whenever anything a consumer can
+  see changes: a chunk loaded or unloaded, a block update, a block entity.
+  Polling it is the cheap "has anything changed?" test.
+- `chunk_snapshot(x, z)` returns `(revision, Arc<Chunk>)` for a loaded chunk,
+  and `None` when it is not loaded, so an unloaded chunk stays
+  distinguishable from one full of air. The `Arc` is immutable and needs no
+  lock: the next update to that chunk copies it out from under the snapshot
+  (`Arc::make_mut`), so a retained snapshot keeps the contents it was taken
+  with and the tick thread is never blocked. A bot that takes no snapshots
+  pays nothing for the copy-on-write storage.
+- `chunk_snapshots_in(from, to)` returns the loaded chunks of a bounded chunk
+  range without walking or copying the rest of the world.
+
+Rendering, serialising and shipping that data are the application's job; the
+world only answers what it has.
+
 ## Embedding: observing the wire
 
 `ClientConfig::packet_observer` takes a `PacketObserver`, and every packet the

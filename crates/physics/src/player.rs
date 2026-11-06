@@ -49,6 +49,9 @@ pub enum Pose {
     Crouching,
     Swimming,
     FallFlying,
+    /// `Pose.SPIN_ATTACK`: a riptide spin, which `Player.getDesiredPose`
+    /// chooses while `isAutoSpinAttack()` (the synced flag bit 4).
+    SpinAttack,
 }
 
 impl Pose {
@@ -57,7 +60,7 @@ impl Pose {
         match self {
             Pose::Standing => (0.6, 1.8),
             Pose::Crouching => (0.6, 1.5),
-            Pose::Swimming | Pose::FallFlying => (0.6, 0.6),
+            Pose::Swimming | Pose::FallFlying | Pose::SpinAttack => (0.6, 0.6),
         }
     }
 
@@ -65,7 +68,7 @@ impl Pose {
         match self {
             Pose::Standing => 1.62,
             Pose::Crouching => 1.27,
-            Pose::Swimming | Pose::FallFlying => 0.4,
+            Pose::Swimming | Pose::FallFlying | Pose::SpinAttack => 0.4,
         }
     }
 }
@@ -216,6 +219,15 @@ pub struct Player {
     pub use_item_can_sprint: bool,
     /// `UseEffects.speedMultiplier` of the item being used.
     pub use_item_speed: f32,
+    /// `LivingEntity.useItemRemaining`: ticks left of the current use, set
+    /// from `getUseDuration`. `releaseUsing` is told how long the use was
+    /// held by subtracting this from the duration.
+    use_item_remaining: i32,
+    /// `LivingEntity.autoSpinAttackTicks`: a riptide spin in progress.
+    auto_spin_attack_ticks: i32,
+    /// A `move(SELF, …)` queued from the input pass, applied at the start of
+    /// the next tick.
+    pending_self_move: Option<Vec3>,
     /// `Player.cooldowns`: item groups the server put on cooldown, ticked
     /// with the player.
     pub cooldowns: ItemCooldowns,
@@ -300,6 +312,9 @@ impl Player {
             using_item_offhand: false,
             use_item_can_sprint: false,
             use_item_speed: 0.2,
+            use_item_remaining: 0,
+            auto_spin_attack_ticks: 0,
+            pending_self_move: None,
             cooldowns: ItemCooldowns::default(),
             jump_trigger_time: 0,
             abilities_changed: false,
@@ -454,11 +469,56 @@ impl Player {
     }
 
     /// `LivingEntity.startUsingItem`, before its use effects are known.
+    /// `getUseDuration` is 72000 for everything that does not override it.
     pub fn start_using_item(&mut self, offhand: bool) {
+        self.start_using_item_for(offhand, 72_000);
+    }
+
+    /// `LivingEntity.startUsingItem` for an item with its own
+    /// `getUseDuration`, such as a bow.
+    pub fn start_using_item_for(&mut self, offhand: bool, duration: i32) {
         self.using_item = true;
         self.using_item_offhand = offhand;
         self.use_item_can_sprint = false;
         self.use_item_speed = 0.2;
+        self.use_item_remaining = duration;
+    }
+
+    /// `getUseDuration(stack) - getUseItemRemainingTicks()`: how long the
+    /// current use has been held, which is what `releaseUsing` is given.
+    pub fn use_ticks_held(&self) -> i32 {
+        if !self.using_item {
+            return 0;
+        }
+        (72_000 - self.use_item_remaining).max(0)
+    }
+
+    /// `Player.startAutoSpinAttack`: a riptide launch spins for this many
+    /// ticks, during which the player's pose is `SPIN_ATTACK`.
+    pub fn start_auto_spin_attack(&mut self, ticks: i32) {
+        self.auto_spin_attack_ticks = ticks;
+    }
+
+    /// `isAutoSpinAttack()` seen from the client's own prediction: the
+    /// synced flag is what `getDesiredPose` reads, but the ticks decide how
+    /// long the local spin and its velocity damping last.
+    pub fn is_auto_spin_attacking(&self) -> bool {
+        self.auto_spin_attack_ticks > 0
+    }
+
+    /// `Entity.push`: the impulse is added to the current movement, which is
+    /// how a riptide, an explosion and a hit all move the player.
+    pub fn push(&mut self, delta: Vec3) {
+        if delta.x.is_finite() && delta.y.is_finite() && delta.z.is_finite() {
+            self.delta_movement = self.delta_movement.plus(delta);
+        }
+    }
+
+    /// `TridentItem.releaseUsing`'s hop on the ground: `move(SELF, (0, y, 0))`
+    /// from the input pass, which needs collision and so lands at the start of
+    /// the next tick.
+    pub fn hop_up(&mut self, height: f32) {
+        self.pending_self_move = Some(Vec3::new(0.0, height as f64, 0.0));
     }
 
     /// The `UseEffects` of the stack in the hand that started the use.
@@ -473,6 +533,7 @@ impl Player {
         self.using_item_offhand = false;
         self.use_item_can_sprint = false;
         self.use_item_speed = 0.2;
+        self.use_item_remaining = 0;
     }
 
     fn is_slow_due_to_using_item(&self) -> bool {
@@ -699,6 +760,12 @@ impl Player {
             entity_colliders: self.entity_colliders.clone(),
         };
 
+        // A `move(SELF, …)` queued by the input pass, such as the hop a
+        // riptide release gives a player on the ground.
+        if let Some(delta) = self.pending_self_move.take() {
+            self.move_self(&ctx, delta);
+        }
+
         // Player.tick
         if self.spectator {
             self.set_on_ground(&ctx, false);
@@ -714,6 +781,20 @@ impl Player {
         let nz = math::clamp_f64(self.pos.z, -2.9999999e7, 2.9999999e7);
         if nx != self.pos.x || nz != self.pos.z {
             self.set_pos(Vec3::new(nx, self.pos.y, nz));
+        }
+        // `LivingEntity.updateUsingItem`: a use in progress counts down. A
+        // count of zero ends the use, which the server's flag echo does here.
+        if self.using_item && self.use_item_remaining > 0 {
+            self.use_item_remaining -= 1;
+        }
+        // `LivingEntity.aiStep`, the push section: a riptide spin runs down
+        // and is cut short against a wall. Striking a living entity also ends
+        // it and damps the movement, which needs the entity list.
+        if self.auto_spin_attack_ticks > 0 {
+            self.auto_spin_attack_ticks -= 1;
+            if self.horizontal_collision {
+                self.auto_spin_attack_ticks = 0;
+            }
         }
         // `Player.tick` ends with `cooldowns.tick()` then the pose update.
         self.cooldowns.tick();
@@ -2426,5 +2507,26 @@ mod tests {
         assert!((bb.get_xsize() - 1.2f32 as f64).abs() < 1e-12);
         assert!((bb.max_y - bb.min_y - 3.6f32 as f64).abs() < 1e-12);
         assert!((player.eye_position().y - (70.0 + 3.24f32 as f64)).abs() < 1e-12);
+    }
+
+    /// The riptide spin: `Pose.SPIN_ATTACK` shrinks the player to 0.6 x 0.6
+    /// with the swimming eye height, a push adds to the movement, and the
+    /// spin knows how long it has left.
+    #[test]
+    fn a_spin_attack_pose_and_push_follow_a_riptide() {
+        let mut player = Player::new();
+        player.set_pos(Vec3::new(2.0, 70.0, 3.0));
+        player.apply_synced_pose(Pose::SpinAttack);
+        let bb = player.bounding_box();
+        assert!((bb.get_xsize() - 0.6f32 as f64).abs() < 1e-12);
+        assert!((bb.max_y - bb.min_y - 0.6f32 as f64).abs() < 1e-12);
+        assert!((player.eye_position().y - (70.0 + 0.4f32 as f64)).abs() < 1e-12);
+
+        player.delta_movement = Vec3::new(0.0, -0.08, 0.0);
+        player.push(Vec3::new(1.0, 0.5, -2.0));
+        assert_eq!(player.delta_movement, Vec3::new(1.0, 0.42, -2.0));
+
+        player.start_auto_spin_attack(20);
+        assert!(player.is_auto_spin_attacking());
     }
 }

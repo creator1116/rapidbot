@@ -177,6 +177,12 @@ impl LocalPlayer {
         self.riding
     }
 
+    /// The last health value the server reported for this player.
+    /// `None` means the server hasn't sent a health update yet.
+    pub fn health(&self) -> Option<f32> {
+        self.physics.health
+    }
+
     /// `Entity.positionRider` for the local player. The vehicle itself is
     /// ticked by the client entity tracker; this only keeps the rider at its
     /// seat and copies the state `sendChanges` reports.

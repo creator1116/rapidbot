@@ -619,6 +619,9 @@ impl Game {
                         play.player.physics.spectator = play.game_type == GameType::Spectator;
                         play.inventory.creative = play.game_type == GameType::Creative;
                     }
+                    cb::GameEvent::WIN_GAME => {
+                        self.link.emit(crate::BotEvent::WinGame);
+                    }
                     _ => {}
                 }
             }
@@ -829,6 +832,7 @@ impl Game {
                 let health = packet.decode::<cb::SetHealth>()?;
                 let play = play_mut(&mut self.play)?;
                 play.player.physics.food_level = health.food;
+                play.player.physics.health = Some(health.health);
                 let dead = health.health <= 0.0;
                 if dead && !play.player.physics.dead {
                     info!("died");

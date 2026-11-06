@@ -296,7 +296,21 @@ pub mod clientbound {
     packet!(GameEvent, play, clientbound, GAME_EVENT);
 
     impl GameEvent {
+        /// `ClientboundGameEventPacket`'s event types, in the order vanilla
+        /// declares them.
+        pub const NO_RESPAWN_BLOCK_AVAILABLE: u8 = 0;
+        pub const START_RAINING: u8 = 1;
+        pub const STOP_RAINING: u8 = 2;
         pub const CHANGE_GAME_MODE: u8 = 3;
+        pub const WIN_GAME: u8 = 4;
+        pub const DEMO_EVENT: u8 = 5;
+        pub const PLAY_ARROW_HIT_SOUND: u8 = 6;
+        pub const RAIN_LEVEL_CHANGE: u8 = 7;
+        pub const THUNDER_LEVEL_CHANGE: u8 = 8;
+        pub const PUFFER_FISH_STING: u8 = 9;
+        pub const GUARDIAN_ELDER_EFFECT: u8 = 10;
+        pub const IMMEDIATE_RESPAWN: u8 = 11;
+        pub const LIMITED_CRAFTING: u8 = 12;
         pub const LEVEL_CHUNKS_LOAD_START: u8 = 13;
     }
 

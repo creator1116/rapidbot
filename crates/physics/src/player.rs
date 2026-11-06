@@ -180,6 +180,10 @@ pub struct Player {
     pub abilities: Abilities,
     pub spectator: bool,
     pub food_level: i32,
+    /// `LivingEntity.getHealth()` as the server last reported it. `None`
+    /// until a health update has arrived, so "unknown" is not the same as
+    /// zero.
+    pub health: Option<f32>,
     /// `isDeadOrDying()`: health at zero. A dead player is immobile.
     pub dead: bool,
     pub effects: Effects,
@@ -289,6 +293,7 @@ impl Player {
             abilities: Abilities::default(),
             spectator: false,
             food_level: 20,
+            health: None,
             dead: false,
             effects: Effects::default(),
             attributes: Attributes::default(),

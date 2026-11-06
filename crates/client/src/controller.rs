@@ -203,6 +203,18 @@ impl TickContext<'_> {
         *self.aim = None;
     }
 
+    /// The view asked for this tick, as `(yaw, pitch)`, or `None` when
+    /// nothing asked. A controller that composes others can read what they
+    /// asked for, before the mouse model has turned to it.
+    pub fn requested_aim(&self) -> Option<(f32, f32)> {
+        self.aim.as_ref().map(|aim| (aim.yaw, aim.pitch))
+    }
+
+    /// The server's tags, which tool, mining and placement decisions need.
+    pub fn tags(&self) -> &rapidbot_world::tags::Tags {
+        self.tags
+    }
+
     /// Sets the view direction instantly. No person turns like this: it is
     /// for tests and debugging, not for servers that watch rotation.
     pub fn snap_look(&mut self, y_rot: f32, x_rot: f32) {

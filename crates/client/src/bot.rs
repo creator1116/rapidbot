@@ -45,6 +45,8 @@ pub enum BotEvent {
     SystemMessage { text: String, overlay: bool },
     /// The connection ended. Always the last event.
     Disconnected(String),
+    /// The player has won the game (credits sequence started).
+    WinGame,
 }
 
 /// Channels the game loop uses to talk to the [`Bot`] handle.

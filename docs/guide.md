@@ -194,6 +194,39 @@ land.
   (`block`, on by default; the fighter owns the use button while it has a
   target).
 
+## Watching the packets
+
+```rust
+use rapidbot_client::{PacketObserver, PacketStage};
+
+config.connection_id = bot_index as u64;
+config.packet_observer = Some(PacketObserver::new(move |packet| {
+    if packet.direction == rapidbot_protocol::Direction::Clientbound {
+        println!("{:?} {} ({} bytes)", packet.state, packet.id, packet.body.len());
+    }
+}));
+```
+
+The observer sees every packet this connection decodes or queues, in login,
+configuration and play, a reconfiguration included:
+
+- `connection` is `ClientConfig::connection_id`, so one observer can serve
+  several bots.
+- `direction` and `state` say which way it went and which state it belonged
+  to; `id` is the packet id within that state, and `name` is the generated
+  name where the tables have one.
+- `stage` is `PacketStage::Received` for a packet just decoded off the socket
+  and `PacketStage::Queued` for one handed to the writer. A queued packet may
+  not be on the wire yet: the writer writes one packet per flush.
+- `body` borrows the decoded payload without its length prefix, so the packet
+  id is not part of it. It is only valid for the call.
+
+The callback runs on the connection's own threads — the reader task for
+inbound packets, the caller's thread for a send — so it must not block: hand
+packets to your own bounded queue. Observation is off by default and costs
+nothing then. Bodies can hold sensitive data (login, cookies and custom
+payloads most of all), so redact or encrypt before persisting them.
+
 ## Accounts
 
 `Account::Offline { name }` works on offline-mode servers. For online-mode

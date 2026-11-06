@@ -8,17 +8,41 @@ use rapidbot_protocol::{Packet, State};
 use tracing::{debug, trace};
 use uuid::Uuid;
 
+use crate::net::Observer;
 use crate::{ClientConfig, ClientError, SessionData, crypto, text};
+
+/// Queues a packet during the login handshake, where the reader and writer
+/// tasks do not exist yet, and reports it to the observer.
+pub(crate) async fn send_observed<P: Packet>(
+    conn: &mut Connection,
+    observer: &Observer,
+    packet: &P,
+) -> Result<(), ClientError> {
+    let frame = packet.to_frame_bytes();
+    if observer.is_observing() {
+        let mut body = &frame[..];
+        let _ = rapidbot_buf::read_var_int(&mut body);
+        observer.report_queued(P::STATE, P::ID, body);
+    }
+    conn.writer.queue_raw(&frame)?;
+    conn.writer.flush().await?;
+    Ok(())
+}
 
 pub(crate) async fn login(
     conn: &mut Connection,
     config: &ClientConfig,
     session: &mut SessionData,
+    observer: &Observer,
 ) -> Result<(GameProfile, Uuid), ClientError> {
-    conn.send(&sb::Hello {
-        name: config.account.name().into(),
-        profile_id: config.account.uuid(),
-    })
+    send_observed(
+        conn,
+        observer,
+        &sb::Hello {
+            name: config.account.name().into(),
+            profile_id: config.account.uuid(),
+        },
+    )
     .await?;
 
     loop {
@@ -28,6 +52,7 @@ pub(crate) async fn login(
             name = State::Login.packet_name(rapidbot_protocol::Direction::Clientbound, packet.id),
             "login packet"
         );
+        observer.report_received(State::Login, packet.id, &packet.body);
         match packet.id {
             cb::Hello::ID => {
                 let hello = packet.decode::<cb::Hello>()?;
@@ -53,7 +78,7 @@ pub(crate) async fn login(
                     encrypted_challenge: encrypt(&hello.challenge.0)?,
                 };
                 // The cipher is installed once the key packet has been written.
-                conn.send(&key).await?;
+                send_observed(conn, observer, &key).await?;
                 conn.enable_encryption(&secret);
                 debug!("encryption enabled");
             }
@@ -65,16 +90,20 @@ pub(crate) async fn login(
             cb::CustomQuery::ID => {
                 let query = packet.decode::<cb::CustomQuery>()?;
                 debug!(channel = %query.channel, "custom query (answering unknown)");
-                conn.send(&sb::CustomQueryAnswer {
-                    transaction_id: query.transaction_id,
-                    payload: None,
-                })
+                send_observed(
+                    conn,
+                    observer,
+                    &sb::CustomQueryAnswer {
+                        transaction_id: query.transaction_id,
+                        payload: None,
+                    },
+                )
                 .await?;
             }
             cb::CookieRequest::ID => {
                 let key = packet.decode::<cb::CookieRequest>()?.key;
                 let payload = session.cookies.get(&key).cloned().map(ByteArray);
-                conn.send(&sb::CookieResponse { key, payload }).await?;
+                send_observed(conn, observer, &sb::CookieResponse { key, payload }).await?;
             }
             cb::LoginDisconnect::ID => {
                 let reason = packet.decode::<cb::LoginDisconnect>()?.reason;
@@ -84,10 +113,14 @@ pub(crate) async fn login(
                 let finished = packet.decode::<cb::LoginFinished>()?;
                 // handleLoginFinished: acknowledge, switch to configuration,
                 // then brand and client information, each flushed.
-                conn.send(&sb::LoginAcknowledged).await?;
-                send_brand(conn).await?;
-                conn.send(&config_sb::ClientInformation(config.information.clone()))
-                    .await?;
+                send_observed(conn, observer, &sb::LoginAcknowledged).await?;
+                send_brand(conn, observer).await?;
+                send_observed(
+                    conn,
+                    observer,
+                    &config_sb::ClientInformation(config.information.clone()),
+                )
+                .await?;
                 return Ok((finished.profile, finished.session_id));
             }
             other => {
@@ -100,13 +133,17 @@ pub(crate) async fn login(
 }
 
 /// `BrandPayload(ClientBrandRetriever.getClientModName())`.
-async fn send_brand(conn: &mut Connection) -> Result<(), ClientError> {
+async fn send_brand(conn: &mut Connection, observer: &Observer) -> Result<(), ClientError> {
     let mut data = Vec::new();
     rapidbot_buf::Encode::encode("vanilla", &mut data);
-    conn.send(&config_sb::CustomPayload {
-        channel: "minecraft:brand".into(),
-        data: rapidbot_buf::RemainingBytes(data),
-    })
+    send_observed(
+        conn,
+        observer,
+        &config_sb::CustomPayload {
+            channel: "minecraft:brand".into(),
+            data: rapidbot_buf::RemainingBytes(data),
+        },
+    )
     .await?;
     Ok(())
 }

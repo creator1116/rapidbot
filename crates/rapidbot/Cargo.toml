@@ -5,11 +5,16 @@ description = "Headless Minecraft bots that behave like the vanilla client and t
 license = "MIT"
 repository = "https://github.com/creator1116/rapidbot"
 readme = "README.md"
-keywords = ["minecraft", "bot", "headless", "game", "automation", "client"]
+# crates.io allows at most five keywords.
+keywords = ["minecraft", "bot", "headless", "client", "automation"]
 categories = ["network-programming", "game-development"]
 
 # Inherit edition and other workspace fields.
 edition.workspace = true
+
+[features]
+# The controller test harness in `rapidbot-client` (`test_support`).
+test-support = ["rapidbot-client/test-support"]
 
 [dependencies]
 rapidbot-auth.workspace = true

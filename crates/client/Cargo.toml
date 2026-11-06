@@ -36,3 +36,8 @@ zip.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+
+[features]
+# A harness for testing a controller outside the game loop
+# (`rapidbot_client::test_support`).
+test-support = []

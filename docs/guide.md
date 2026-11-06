@@ -194,6 +194,37 @@ land.
   (`block`, on by default; the fighter owns the use button while it has a
   target).
 
+## Testing a controller
+
+With the `test-support` feature, `rapidbot_client::test_support` gives a
+controller the same `TickContext` the game loop builds, without any of the
+game loop's internals:
+
+```rust
+use rapidbot_client::test_support::ControllerHarness;
+use rapidbot_client::{Controller, Keys, TickContext};
+
+struct Forward;
+impl Controller for Forward {
+    fn tick(&mut self, ctx: &mut TickContext<'_>) {
+        ctx.set_keys(Keys { forward: true, ..Keys::default() });
+    }
+}
+
+let mut harness = ControllerHarness::new();   // flat floor, player at the origin
+harness.set_item(36, "minecraft:stone", 5);   // hotbar 0
+let asked = harness.tick(&mut Forward);
+assert!(asked.keys.forward);
+```
+
+`Requested` reports what the controller asked for: keys, the view it aimed at
+(`aim`), attack and use actions, the hotbar slot and scroll, container
+actions, and typed chat. `set_block`, `set_item`, `tag`, `player`, `world`,
+`inventory`, `entities`, `set_players`, `set_chat_open`, `set_attack_strength`
+and `set_breaking` set the situation up, and `tick_n` runs several ticks. The
+crosshair and target come from the harness world, so a controller that picks
+blocks or attacks can be tested against real geometry.
+
 ## Watching the packets
 
 ```rust

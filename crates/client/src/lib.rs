@@ -25,6 +25,10 @@ pub mod path;
 mod placement;
 mod proxy;
 pub mod status;
+/// A harness for testing a controller outside the game loop, behind the
+/// `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod text;
 pub mod webshare;
 

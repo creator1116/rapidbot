@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rapidbot_physics::attributes;
-use rapidbot_physics::math::Vec3;
+use rapidbot_physics::math::{self, Vec3};
 use rapidbot_physics::player::Player;
 use rapidbot_protocol::packets::play::LpVec3;
 use rapidbot_protocol::packets::play::serverbound::{
@@ -336,6 +336,45 @@ pub(crate) struct Hands<'a> {
     pub restricted: bool,
     /// `MultiPlayerGameMode.hasMissTime`: not creative.
     pub survival: bool,
+    /// The synced `minecraft:enchantment` id of `minecraft:riptide`, so a
+    /// stack's enchantments can be read. `None` until the registry arrives.
+    pub riptide: Option<u32>,
+    /// `Entity.isPassenger()`: a riding player is not launched by a riptide.
+    pub riding: bool,
+}
+
+/// `EnchantmentHelper.getTridentSpinAttackStrength` for riptide alone: the
+/// enchantment adds 1.5 at level 1 and 0.75 per level after that
+/// (`data/minecraft/enchantment/riptide.json`). `None` when the stack is not
+/// a trident, or has no riptide.
+pub(crate) fn riptide_strength(stack: &ItemStack, riptide: Option<u32>) -> Option<f32> {
+    if stack.name() != "minecraft:trident" {
+        return None;
+    }
+    let riptide = riptide?;
+    let level = stack
+        .enchantments()
+        .into_iter()
+        .find(|(id, _)| *id as u32 == riptide)
+        .map(|(_, level)| level)?;
+    (level > 0).then(|| 1.5 + 0.75 * (level - 1) as f32)
+}
+
+/// The launch `TridentItem.releaseUsing` pushes: the view vector scaled to
+/// the spin attack strength, worked out in float as vanilla does.
+pub(crate) fn riptide_launch(y_rot: f32, x_rot: f32, strength: f32) -> Vec3 {
+    let to_radians = std::f32::consts::PI / 180.0;
+    let yaw = (y_rot * to_radians) as f64;
+    let pitch = (x_rot * to_radians) as f64;
+    let cos_pitch = math::cos(pitch);
+    let mut xd = -math::sin(yaw) * cos_pitch;
+    let mut yd = -math::sin(pitch);
+    let mut zd = math::cos(yaw) * cos_pitch;
+    let dist = math::sqrt_f32(xd * xd + yd * yd + zd * zd);
+    xd *= strength / dist;
+    yd *= strength / dist;
+    zd *= strength / dist;
+    Vec3::new(xd as f64, yd as f64, zd as f64)
 }
 
 struct ServerVerified {
@@ -560,6 +599,7 @@ impl GameMode {
     pub fn use_button(&mut self, h: &mut Hands<'_>, pick: &Pick, down: bool, clicked: bool) {
         // handleKeybinds: letting go while using releases the item.
         if h.player.using_item && !down {
+            Self::release_item(h);
             Self::send_action(
                 h,
                 PlayerActionKind::ReleaseUseItem,
@@ -606,6 +646,32 @@ impl GameMode {
             if Self::likely_uses_item(stack) {
                 break;
             }
+        }
+    }
+
+    /// The client half of `TridentItem.releaseUsing`: a riptide trident held
+    /// for at least ten ticks, in water, with the player not riding, launches
+    /// them and starts the spin. The client predicts this rather than waiting
+    /// for the server's `SetEntityMotion`. Rain would count too, but
+    /// `isRainingAt` needs biome precipitation, which is not tracked.
+    fn release_item(h: &mut Hands<'_>) {
+        let stack = if h.player.using_item_offhand {
+            h.inventory.offhand()
+        } else {
+            h.inventory.held()
+        };
+        let Some(strength) = stack.and_then(|stack| riptide_strength(stack, h.riptide)) else {
+            return;
+        };
+        if !h.player.in_water || h.riding || h.player.use_ticks_held() < 10 {
+            return;
+        }
+        h.player
+            .push(riptide_launch(h.player.y_rot, h.player.x_rot, strength));
+        h.player.start_auto_spin_attack(20);
+        if h.player.on_ground {
+            // `player.move(MoverType.SELF, new Vec3(0.0, 1.1999999F, 0.0))`
+            h.player.hop_up(1.199_999_9);
         }
     }
 
@@ -657,13 +723,26 @@ impl GameMode {
     }
 
     /// `ServerboundUseItemPacket` with the player's current look.
-    fn send_use_item(&mut self, h: &Hands<'_>, hand: i32) {
+    fn send_use_item(&mut self, h: &mut Hands<'_>, hand: i32) {
         h.net.send(&UseItem {
             hand,
             sequence: self.next_sequence(),
             y_rot: h.player.y_rot,
             x_rot: h.player.x_rot,
         });
+        // `ItemStack.use` → `TridentItem.use`: a riptide trident fails out of
+        // water, and in water it starts the use locally, which is what the
+        // release prediction measures. (Rain is not tracked.)
+        let stack = if hand == 0 {
+            h.inventory.held()
+        } else {
+            h.inventory.offhand()
+        };
+        if stack.is_some_and(|stack| riptide_strength(stack, h.riptide).is_some())
+            && h.player.in_water
+        {
+            h.player.start_using_item(hand == 1);
+        }
     }
 
     /// Whether an item looks like it starts a use in progress. The server
@@ -1226,6 +1305,8 @@ mod tests {
         dirt: StateId,
         /// `Hands.restricted`: adventure or spectator.
         restricted: bool,
+        /// `Hands.riptide`: the enchantment id the scene treats as riptide.
+        riptide: Option<u32>,
     }
 
     fn state(name: &str) -> StateId {
@@ -1278,7 +1359,31 @@ mod tests {
                 mode: GameMode::new(),
                 dirt,
                 restricted: false,
+                riptide: None,
             }
+        }
+
+        /// Puts a trident with `level` riptide in the player's slot `slot`,
+        /// built the way the server sends it: a component patch holding the
+        /// enchantment registry id.
+        fn set_riptide_trident(&mut self, slot: i16, riptide: u32, level: i32) {
+            use rapidbot_buf::{Encode, VarInt};
+            let data = rapidbot_world::item::ItemData::get();
+            let item = data.item_id("minecraft:trident").unwrap();
+            let enchants = data.component_id("minecraft:enchantments").unwrap();
+            let mut body = vec![0, 0]; // container 0 (the player's own), state 0
+            body.extend_from_slice(&slot.to_be_bytes());
+            VarInt(1).encode(&mut body); // one item
+            VarInt(item as i32).encode(&mut body);
+            // `DataComponentPatch`: both counts first, then the values.
+            VarInt(1).encode(&mut body); // one component added
+            VarInt(0).encode(&mut body); // none removed
+            VarInt(enchants as i32).encode(&mut body);
+            VarInt(1).encode(&mut body); // one enchantment
+            VarInt(riptide as i32).encode(&mut body);
+            VarInt(level).encode(&mut body);
+            self.inventory.set_slot(&body).unwrap();
+            self.riptide = Some(riptide);
         }
 
         /// One tick of the attack button; returns the packets it sent as
@@ -1294,6 +1399,8 @@ mod tests {
                 net: &self.net,
                 restricted: self.restricted,
                 survival: true,
+                riptide: self.riptide,
+                riding: false,
             };
             self.mode
                 .attack_button(&mut hands, clicks, down, &hit, |_| {});
@@ -1313,6 +1420,8 @@ mod tests {
                 net: &self.net,
                 restricted: self.restricted,
                 survival: true,
+                riptide: self.riptide,
+                riding: false,
             };
             self.mode.use_button(&mut hands, &hit, down, clicked);
             self.take_packets()
@@ -1334,6 +1443,8 @@ mod tests {
                     net: &self.net,
                     restricted: self.restricted,
                     survival: false,
+                    riptide: self.riptide,
+                    riding: false,
                 };
                 self.mode.continue_destroy_block(&mut hands, pos, direction)
             };
@@ -1352,6 +1463,8 @@ mod tests {
                 net: &self.net,
                 restricted: self.restricted,
                 survival: true,
+                riptide: self.riptide,
+                riding: false,
             };
             self.mode.destroy_block(&mut hands, pos)
         }
@@ -1996,6 +2109,140 @@ mod tests {
             .mode
             .block_changed_ack(1, &mut scene.world, &mut scene.player);
         assert_eq!(scene.world.block_state(1, 65, 0), Some(AIR));
+    }
+
+    /// `EnchantmentHelper.getTridentSpinAttackStrength`: riptide adds 1.5 at
+    /// level 1 and 0.75 per level after that, and nothing else counts.
+    #[test]
+    fn riptide_strength_comes_from_the_level() {
+        let data = rapidbot_world::item::ItemData::get();
+        let trident = data.item_id("minecraft:trident").unwrap();
+        let mut scene = Scene::new();
+        scene.set_riptide_trident(36, 7, 1);
+        let stack = scene.inventory.held().unwrap().clone();
+        assert_eq!(riptide_strength(&stack, Some(7)), Some(1.5));
+        assert_eq!(riptide_strength(&stack, None), None, "no registry yet");
+
+        scene.set_riptide_trident(36, 7, 3);
+        let stack = scene.inventory.held().unwrap().clone();
+        assert_eq!(riptide_strength(&stack, Some(7)), Some(3.0));
+        assert_eq!(
+            riptide_strength(&stack, Some(9)),
+            None,
+            "a different enchantment id is not riptide"
+        );
+
+        // A stack without the enchantment, and one that is not a trident.
+        let plain = crate::inventory::Inventory::default();
+        assert!(plain.held().is_none());
+        let mut other = Scene::new();
+        other.set_item(36, "minecraft:stone");
+        let stone = other.inventory.held().unwrap().clone();
+        assert_eq!(riptide_strength(&stone, Some(7)), None);
+        let _ = trident;
+    }
+
+    /// The launch vector: the look direction scaled to the strength, in
+    /// float, as `TridentItem.releaseUsing` pushes it.
+    #[test]
+    fn a_riptide_launch_follows_the_look() {
+        let straight = riptide_launch(0.0, 0.0, 1.5);
+        assert!((straight.x).abs() < 1.0e-6, "{straight:?}");
+        assert!((straight.y).abs() < 1.0e-6, "{straight:?}");
+        assert!((straight.z - 1.5).abs() < 1.0e-6, "{straight:?}");
+
+        // Yaw 90 is west: the launch goes that way, level with the horizon.
+        let west = riptide_launch(90.0, 0.0, 3.0);
+        assert!((west.x + 3.0).abs() < 1.0e-5, "{west:?}");
+        assert!(west.z.abs() < 1.0e-5, "{west:?}");
+
+        // Straight down is the whole vector, and its length is the strength.
+        let down = riptide_launch(0.0, 90.0, 2.25);
+        let length = (down.x * down.x + down.y * down.y + down.z * down.z).sqrt();
+        assert!((length - 2.25).abs() < 1.0e-5, "{down:?}");
+    }
+
+    /// A riptide trident held in water launches the player on release, and
+    /// does not when it was held for less than ten ticks or out of water.
+    #[test]
+    fn a_riptide_release_launches_in_water() {
+        let mut scene = Scene::new();
+        scene.set_riptide_trident(36, 7, 3);
+        // Water in the player's own cell, so every tick recomputes
+        // `isInWaterOrRain` as true rather than only the first one.
+        scene
+            .world
+            .set_block_state(0, 64, 0, state("minecraft:water"));
+        scene.player.in_water = true;
+        scene.player.y_rot = 0.0;
+        scene.player.x_rot = 0.0;
+
+        // A fresh press starts the use locally (`TridentItem.use`).
+        scene.tick_use(true, true);
+        assert!(scene.player.using_item, "the use starts in water");
+
+        // Holding the button for ten ticks is what `releaseUsing` counts.
+        for _ in 0..10 {
+            {
+                let Scene {
+                    player,
+                    world,
+                    tags,
+                    ..
+                } = &mut scene;
+                player.tick(world, tags);
+            }
+            scene.tick_use(true, false);
+        }
+        assert!(scene.player.use_ticks_held() >= 10);
+
+        // Letting go launches: level 3 pushes three blocks a tick along the
+        // look, which is due south here, and starts the spin.
+        let before = scene.player.delta_movement;
+        scene.tick_use(false, false);
+        assert!(scene.player.is_auto_spin_attacking(), "the spin starts");
+        assert!(
+            scene.player.delta_movement.z - before.z > 1.0,
+            "pushed along the look: {:?}",
+            scene.player.delta_movement
+        );
+    }
+
+    /// Releasing a riptide trident too early, or out of water, does nothing.
+    #[test]
+    fn a_short_riptide_hold_does_not_launch() {
+        let mut scene = Scene::new();
+        scene.set_riptide_trident(36, 7, 3);
+        scene.player.in_water = true;
+        scene.tick_use(true, true);
+        let before = scene.player.delta_movement;
+        scene.tick_use(false, false);
+        assert!(
+            !scene.player.is_auto_spin_attacking(),
+            "held under ten ticks"
+        );
+        assert!((scene.player.delta_movement.z - before.z).abs() < 1.0e-9);
+
+        // In water for long enough, but not in water: still nothing.
+        let mut dry = Scene::new();
+        dry.set_riptide_trident(36, 7, 3);
+        dry.tick_use(true, true);
+        for _ in 0..10 {
+            {
+                let Scene {
+                    player,
+                    world,
+                    tags,
+                    ..
+                } = &mut dry;
+                player.tick(world, tags);
+            }
+            dry.tick_use(true, false);
+        }
+        let before = dry.player.delta_movement;
+        dry.tick_use(false, false);
+        assert!(!dry.player.is_auto_spin_attacking(), "out of water");
+        assert!((dry.player.delta_movement.z - before.z).abs() < 1.0e-9);
     }
 
     /// `MultiPlayerGameMode.useItemOn`: an item on cooldown consumes the

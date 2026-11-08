@@ -9,6 +9,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rapidbot_buf::{ByteArray, Identifier};
 use rapidbot_client::{Account, ClientConfig, ClientError, Idle};
 use rapidbot_client::{PacketObserver, PacketStage};
 use rapidbot_protocol::packets::configuration::{
@@ -18,6 +19,7 @@ use rapidbot_protocol::packets::handshake::{Intent, Intention};
 use rapidbot_protocol::packets::login::{
     GameProfile, clientbound as login_cb, serverbound as login_sb,
 };
+use rapidbot_protocol::packets::play::{clientbound as play_cb, serverbound as play_sb};
 use rapidbot_protocol::{Connection, Direction, Packet, State};
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -204,6 +206,169 @@ async fn both_directions_are_observed_across_login_and_configuration() {
         ),
         1,
         "no duplicate observations"
+    );
+
+    server_task.abort();
+}
+
+/// The handshake and configuration as above, then a play packet in each
+/// direction and a reconfiguration back to Configuration.
+async fn server_through_play(listener: TcpListener) -> TestResult {
+    let (stream, _) = listener.accept().await?;
+    let mut connection = Connection::from_stream(stream)?;
+
+    let intention = connection.recv().await?;
+    let intention = Intention::from_body(&intention.body)?;
+    assert_eq!(intention.intent, Intent::Login);
+    let _hello = connection.recv().await?;
+    send(
+        &mut connection,
+        &login_cb::LoginFinished {
+            profile: GameProfile {
+                id: Uuid::from_u128(1),
+                name: "Tester".into(),
+                properties: Vec::new(),
+            },
+            session_id: Uuid::from_u128(2),
+        },
+    )
+    .await?;
+
+    for _ in 0..4 {
+        let packet = tokio::time::timeout(Duration::from_secs(5), connection.recv()).await??;
+        if packet.id == config_sb::ClientInformation::ID {
+            break;
+        }
+    }
+    send(&mut connection, &config_cb::FinishConfiguration).await?;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(5), connection.recv()).await {
+            Ok(Ok(packet)) if packet.id == config_sb::FinishConfiguration::ID => break,
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Play: a keep-alive, which the client answers on the network thread.
+    send(&mut connection, &play_cb::KeepAlive { id: 42 }).await?;
+    let mut answered = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(5), connection.recv()).await {
+            Ok(Ok(packet)) if packet.id == play_sb::KeepAlive::ID => {
+                answered = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(answered, "the client answers a keep-alive");
+
+    // Then a reconfiguration, which the client acknowledges on the play
+    // connection before the reader goes back to Configuration.
+    send(&mut connection, &play_cb::StartConfiguration).await?;
+    let mut acknowledged = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(5), connection.recv()).await {
+            Ok(Ok(packet)) if packet.id == play_sb::ConfigurationAcknowledged::ID => {
+                acknowledged = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(acknowledged, "the client acknowledges the reconfiguration");
+    send(
+        &mut connection,
+        &config_cb::StoreCookie {
+            key: Identifier::from("test:cookie"),
+            payload: ByteArray(b"x".to_vec()),
+        },
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn play_and_a_reconfiguration_are_observed_too() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(server_through_play(listener));
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let mut config = ClientConfig::new(
+        format!("127.0.0.1:{port}"),
+        Account::Offline {
+            name: "Tester".into(),
+        },
+    );
+    config.connection_id = 11;
+    config.packet_observer = Some(PacketObserver::new(move |packet| {
+        sink.lock().unwrap().push(Seen {
+            connection: packet.connection,
+            direction: packet.direction,
+            state: packet.state,
+            id: packet.id,
+            name: packet.name.map(str::to_string),
+            stage: packet.stage,
+            body: packet.body.to_vec(),
+        });
+    }));
+
+    let reason = tokio::time::timeout(
+        Duration::from_secs(15),
+        rapidbot_client::run_with(config, Idle),
+    )
+    .await
+    .expect("the client did not finish");
+    assert!(matches!(reason, ClientError::Disconnected(_)), "{reason:?}");
+
+    let seen = seen.lock().unwrap().clone();
+    let count = |state: State, direction: Direction, id: i32| {
+        seen.iter()
+            .filter(|p| (p.state, p.direction, p.id) == (state, direction, id))
+            .count()
+    };
+    let has = |state: State, direction: Direction, id: i32| count(state, direction, id) > 0;
+
+    // Play, both directions.
+    assert!(
+        has(State::Play, Direction::Clientbound, play_cb::KeepAlive::ID),
+        "the server's keep-alive"
+    );
+    assert!(
+        has(State::Play, Direction::Serverbound, play_sb::KeepAlive::ID),
+        "the client's answer, queued"
+    );
+    // The reconfiguration itself, and the state it moves to.
+    assert!(has(
+        State::Play,
+        Direction::Clientbound,
+        play_cb::StartConfiguration::ID
+    ));
+    assert_eq!(
+        count(
+            State::Play,
+            Direction::Serverbound,
+            play_sb::ConfigurationAcknowledged::ID
+        ),
+        1,
+        "acknowledged once"
+    );
+    assert!(
+        has(
+            State::Configuration,
+            Direction::Clientbound,
+            config_cb::StoreCookie::ID
+        ),
+        "after the acknowledgement the reader is back in configuration"
+    );
+    assert!(
+        seen.iter().all(|packet| packet.connection == 11),
+        "every observation carries the connection id"
     );
 
     server_task.abort();

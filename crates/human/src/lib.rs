@@ -8,6 +8,7 @@
 //! and tests are reproducible.
 
 pub mod fatigue;
+pub mod idle;
 pub mod keyboard;
 pub mod mouse;
 pub mod typing;
@@ -16,6 +17,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 pub use fatigue::Fatigue;
+pub use idle::{IdleAction, Idler};
 pub use keyboard::Keyboard;
 pub use mouse::{Aim, MouseModel, MouseProfile};
 pub use typing::Typist;

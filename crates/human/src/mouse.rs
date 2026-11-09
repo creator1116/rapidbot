@@ -122,6 +122,9 @@ struct Stroke {
     /// Skews the speed peak earlier (<1) or later (>1).
     skew: f64,
     corrections: u8,
+    /// The stroke was cut short at the pad limit: the hand comes off the
+    /// mouse to push again before the aim can be finished.
+    lift_after: bool,
 }
 
 impl Stroke {
@@ -178,6 +181,12 @@ pub struct MouseModel {
     replan_in: Option<f64>,
     /// Aim the current stroke was planned for.
     planned_for: Option<Aim>,
+    /// How far the mouse can be pushed in one stroke, in counts, before a
+    /// person lifts it and pushes again. A guess until a recording is
+    /// fitted; see [`MouseModel::push_limit`].
+    pub push_limit: f64,
+    /// Seconds left with the mouse off the pad, reporting nothing.
+    lift: f64,
 }
 
 fn wrap_degrees(mut a: f64) -> f64 {
@@ -212,6 +221,10 @@ impl MouseModel {
             next_fidget,
             replan_in: None,
             planned_for: None,
+            // About 60 degrees at the default sensitivity: longer turns are
+            // done in more than one push.
+            push_limit: 1200.0,
+            lift: 0.0,
         }
     }
 
@@ -279,6 +292,15 @@ impl MouseModel {
         let duration =
             (fitts / self.fatigue.speed_factor() * self.noise.lognormal(1.0, 0.12)).max(0.06);
         let length = plan_x.hypot(plan_y);
+        // The pad is finite: a stroke longer than one comfortable push is cut
+        // at the limit, and the rest is done after the hand comes back.
+        let lift_after = length > self.push_limit;
+        let (plan_x, plan_y, length) = if lift_after {
+            let scale = self.push_limit / length;
+            (plan_x * scale, plan_y * scale, self.push_limit)
+        } else {
+            (plan_x, plan_y, length)
+        };
         Stroke {
             plan_x,
             plan_y,
@@ -289,6 +311,7 @@ impl MouseModel {
             bow: self.noise.gaussian(0.0, self.profile.curvature_sd) * length,
             skew: self.noise.gaussian(1.0, 0.07).clamp(0.8, 1.25),
             corrections,
+            lift_after,
         }
     }
 
@@ -306,7 +329,13 @@ impl MouseModel {
             bow: 0.0,
             skew: 1.0,
             corrections: 0,
+            lift_after: false,
         }
+    }
+
+    /// Whether the hand is off the mouse right now (a long turn, mid-push).
+    pub fn is_lifting(&self) -> bool {
+        self.lift > 0.0
     }
 
     fn advance(&mut self, stroke: &mut Stroke, dt: f64) -> (f64, f64) {
@@ -336,6 +365,11 @@ impl MouseModel {
     /// `deg_per_count` what one count turns the view by at the current
     /// sensitivity.
     pub fn frame(&mut self, dt: f64, yaw: f32, pitch: f32, deg_per_count: f64) -> (i32, i32) {
+        // The mouse is off the pad: nothing is reported while it is put back.
+        if self.lift > 0.0 {
+            self.lift -= dt;
+            return (0, 0);
+        }
         let error = self.target.map(|t| {
             (
                 wrap_degrees((t.yaw - yaw) as f64) / deg_per_count,
@@ -397,6 +431,11 @@ impl MouseModel {
             Phase::Moving(mut stroke) => {
                 let step = self.advance(&mut stroke, dt);
                 self.phase = if stroke.elapsed >= stroke.duration {
+                    if stroke.lift_after {
+                        // The push ran out of pad: the hand comes off the
+                        // mouse before the rest of the turn.
+                        self.lift = self.noise.uniform(0.05, 0.18);
+                    }
                     let pause = self.noise.lognormal(self.profile.settle_median, 0.3)
                         * (1.0 + 0.3 * self.fatigue.level());
                     Phase::Settling {
@@ -646,5 +685,61 @@ mod tests {
             max_step < 12,
             "pursuit should have no flicks, saw {max_step} counts"
         );
+    }
+
+    /// A turn further than one push of the mouse is done in more than one:
+    /// the hand comes off the pad, reports nothing for a few frames, and
+    /// pushes again. Each push is capped at the pad limit.
+    #[test]
+    fn a_long_turn_is_pushed_more_than_once() {
+        let drive = |target: f32, push_limit: f64| {
+            let mut m = MouseModel::new(3);
+            m.next_fidget = f64::MAX;
+            m.push_limit = push_limit;
+            m.set_target(Some(Aim {
+                yaw: target,
+                pitch: 0.0,
+                tolerance: 1.0,
+            }));
+            let (mut yaw, mut pitch) = (0.0f32, 0.0f32);
+            let (mut lifting, mut idle_while_moving, mut biggest_push) = (0, 0, 0);
+            for _ in 0..(20.0 / DT) as usize {
+                let (dx, dy) = m.frame(DT, yaw, pitch, DPC);
+                if m.is_lifting() {
+                    lifting += 1;
+                }
+                if m.is_moving() && (dx, dy) == (0, 0) {
+                    idle_while_moving += 1;
+                }
+                biggest_push = biggest_push.max(dx.abs());
+                apply(&mut yaw, &mut pitch, dx, dy);
+            }
+            // How far the view is from the target, the way the model's own
+            // error wraps.
+            let mut off = (yaw - target) % 360.0;
+            if off >= 180.0 {
+                off -= 360.0;
+            }
+            if off < -180.0 {
+                off += 360.0;
+            }
+            (lifting, idle_while_moving, biggest_push, off)
+        };
+
+        // 180 degrees at 0.15 degrees a count is 1200 counts, so a 600-count
+        // limit needs at least one lift.
+        let (lifting, idle, biggest, off) = drive(180.0, 600.0);
+        assert!(lifting > 0, "the hand lifted at least once");
+        assert!(idle > 0, "and reported nothing while it was off the pad");
+        assert!(
+            biggest <= 600 + 20,
+            "one push stays near the limit, saw {biggest}"
+        );
+        assert!(off.abs() < 10.0, "it still got there: off by {off}");
+
+        // A short turn is one push and never lifts. 30 degrees is 200 counts.
+        let (lifting, _, _, off) = drive(30.0, 600.0);
+        assert_eq!(lifting, 0, "one push is enough");
+        assert!(off.abs() < 5.0, "off by {off}");
     }
 }

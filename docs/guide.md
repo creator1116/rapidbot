@@ -193,6 +193,15 @@ land.
   is back, and holds a shield up between swings when one is in the main hand
   (`block`, on by default; the fighter owns the use button while it has a
   target).
+- `HumanIdle`: the long-session counterpart of `Idle`, which never does
+  anything. It stands the way a person does: nothing at all for the first few
+  seconds, then an occasional glance, weight shift or nod, each returning to
+  where it started and further apart the longer the wait goes on. Call
+  `activity()` whenever the bot does something of its own, so the idle clock
+  restarts and no look-back pulls the view somewhere that no longer applies.
+  The underlying `human::Idler` is a plain state machine if you would rather
+  apply the gestures yourself; its timings are a guess until a recording is
+  fitted.
 
 ## Testing a controller
 

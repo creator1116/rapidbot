@@ -2,7 +2,7 @@
 
 use rand::Rng;
 use rapidbot_auth::ChatKeys;
-use rapidbot_buf::{ByteArray, Decode, VarInt};
+use rapidbot_buf::{ByteArray, Decode, Identifier, VarInt};
 use rapidbot_physics::attributes::Operation;
 use rapidbot_physics::math::Vec3;
 use rapidbot_protocol::ids::play::clientbound as ids;
@@ -67,6 +67,10 @@ pub(super) struct PlayState {
     /// The synced `minecraft:enchantment` ID of `minecraft:riptide`, which
     /// the riptide use and release prediction reads off the held trident.
     riptide: Option<u32>,
+    /// `ClientPacketListener.enabledFeatures`: the feature flags the server
+    /// announced at configuration. A block requiring anything else cannot be
+    /// used.
+    features: Vec<Identifier>,
     load: Option<LoadState>,
     pub client_loaded: bool,
     /// `ClientPacketListener.enforcesSecureChat`: reject messages whose
@@ -158,6 +162,7 @@ impl PlayState {
             tags,
             biome_count: registry_len(session, "minecraft:worldgen/biome"),
             riptide: registry_entry_id(session, "minecraft:enchantment", "minecraft:riptide"),
+            features: session.enabled_features.clone(),
             load: None,
             client_loaded: false,
             enforces_secure_chat: login.enforces_secure_chat,
@@ -325,6 +330,7 @@ impl PlayState {
         hit: &crate::interact::Pick,
     ) {
         let riptide = self.riptide;
+        let features = self.features.clone();
         let Self {
             player,
             world,
@@ -348,6 +354,7 @@ impl PlayState {
             survival: *game_type != GameType::Creative,
             riptide,
             riding,
+            features: &features,
         };
         let selected = inventory.selected;
         game_mode.attack_button(&mut hands, clicks, down, hit, |net| {
@@ -369,6 +376,7 @@ impl PlayState {
             return;
         }
         let riptide = self.riptide;
+        let features = self.features.clone();
         let Self {
             player,
             world,
@@ -391,6 +399,7 @@ impl PlayState {
             survival: *game_type != GameType::Creative,
             riptide,
             riding,
+            features: &features,
         };
         game_mode.use_item_on(&mut hands, hit);
     }
@@ -413,6 +422,7 @@ impl PlayState {
             });
         }
         let riptide = self.riptide;
+        let features = self.features.clone();
         let Self {
             player,
             world,
@@ -435,6 +445,7 @@ impl PlayState {
             survival: *game_type != GameType::Creative,
             riptide,
             riding,
+            features: &features,
         };
         game_mode.use_button(&mut hands, hit, down, clicked);
     }

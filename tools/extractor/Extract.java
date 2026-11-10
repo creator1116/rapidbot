@@ -19,7 +19,10 @@ import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockBehaviour;
@@ -120,6 +123,10 @@ public class Extract {
                 .append(",\"jump_factor\":").append(Float.toString(block.getJumpFactor()))
                 .append(",\"bounce\":").append(Float.toString(block.getBounceRestitution()))
                 .append(",\"dynamic_shape\":").append(block.hasDynamicShape())
+                // Feature flags beyond `minecraft:vanilla`, which every server
+                // enables: `MultiPlayerGameMode.useItemOn` refuses a click on
+                // a block whose flags the connection has not enabled.
+                .append(",\"features\":").append(featureNames(block.requiredFeatures()))
                 .append(",\"default_state\":").append(Block.getId(block.defaultBlockState()))
                 .append(",\"interactive\":").append(hasCustomUse(block))
                 .append("}");
@@ -316,6 +323,24 @@ public class Extract {
             }
         }
         return false;
+    }
+
+    /**
+     * The feature flags a set requires, in a stable order. `minecraft:vanilla`
+     * is kept: nearly every block requires it, and a server that enables
+     * nothing at all makes vanilla refuse those interactions.
+     */
+    private static String featureNames(FeatureFlagSet set) {
+        java.util.TreeSet<String> names = new java.util.TreeSet<>();
+        for (Identifier id : FeatureFlags.REGISTRY.toNames(set)) {
+            names.add(id.toString());
+        }
+        StringBuilder sb = new StringBuilder("[");
+        for (String name : names) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append(quote(name));
+        }
+        return sb.append(']').toString();
     }
 
     /** Registry entry names in ID order. */

@@ -341,6 +341,21 @@ pub(crate) struct Hands<'a> {
     pub riptide: Option<u32>,
     /// `Entity.isPassenger()`: a riding player is not launched by a riptide.
     pub riding: bool,
+    /// `ClientPacketListener.enabledFeatures`: the feature flags the server
+    /// announced. A block that requires any other flag cannot be used.
+    pub features: &'a [rapidbot_buf::Identifier],
+}
+
+/// `ClientPacketListener.isFeatureEnabled`: every flag the block requires is
+/// one the connection has enabled. Every block in 26.3 requires
+/// `minecraft:vanilla`, which a normal server always enables, so this only
+/// refuses anything on a server that announced no flags at all.
+pub(crate) fn features_enabled(required: &[String], enabled: &[rapidbot_buf::Identifier]) -> bool {
+    required.iter().all(|name| {
+        enabled
+            .iter()
+            .any(|flag| flag.normalized() == name.as_str())
+    })
 }
 
 /// `EnchantmentHelper.getTridentSpinAttackStrength` for riptide alone: the
@@ -469,8 +484,12 @@ impl GameMode {
         let on_cooldown = item
             .as_ref()
             .is_some_and(|stack| h.player.cooldowns.is_on_cooldown(stack));
+        // `MultiPlayerGameMode.useItemOn`: a block whose feature flags the
+        // connection has not enabled is a FAIL, before its own interaction.
+        let features_ok = features_enabled(Registry::get().required_features(clicked), h.features);
         let mut predicted = false;
-        if !on_cooldown
+        if features_ok
+            && !on_cooldown
             && !h.player.spectator
             && let Some(item) = &item
             && (!h.restricted || item.can_place_on_block_in_adventure_mode(clicked, h.tags))
@@ -500,7 +519,9 @@ impl GameMode {
             world_border: false,
             sequence,
         });
-        if predicted {
+        if !features_ok {
+            UseOn::Failed
+        } else if predicted {
             UseOn::Predicted
         } else if on_cooldown {
             UseOn::Consumed
@@ -1307,6 +1328,8 @@ mod tests {
         restricted: bool,
         /// `Hands.riptide`: the enchantment id the scene treats as riptide.
         riptide: Option<u32>,
+        /// `Hands.features`: what the server announced as enabled.
+        features: Vec<rapidbot_buf::Identifier>,
     }
 
     fn state(name: &str) -> StateId {
@@ -1360,7 +1383,14 @@ mod tests {
                 dirt,
                 restricted: false,
                 riptide: None,
+                features: vec!["minecraft:vanilla".into()],
             }
+        }
+
+        /// Sets the feature flags the server has announced.
+        fn set_features(&mut self, names: &[&str]) -> &mut Self {
+            self.features = names.iter().map(|name| (*name).into()).collect();
+            self
         }
 
         /// Puts a trident with `level` riptide in the player's slot `slot`,
@@ -1401,6 +1431,7 @@ mod tests {
                 survival: true,
                 riptide: self.riptide,
                 riding: false,
+                features: &self.features,
             };
             self.mode
                 .attack_button(&mut hands, clicks, down, &hit, |_| {});
@@ -1422,6 +1453,7 @@ mod tests {
                 survival: true,
                 riptide: self.riptide,
                 riding: false,
+                features: &self.features,
             };
             self.mode.use_button(&mut hands, &hit, down, clicked);
             self.take_packets()
@@ -1445,6 +1477,7 @@ mod tests {
                     survival: false,
                     riptide: self.riptide,
                     riding: false,
+                    features: &self.features,
                 };
                 self.mode.continue_destroy_block(&mut hands, pos, direction)
             };
@@ -1465,6 +1498,7 @@ mod tests {
                 survival: true,
                 riptide: self.riptide,
                 riding: false,
+                features: &self.features,
             };
             self.mode.destroy_block(&mut hands, pos)
         }
@@ -2271,6 +2305,53 @@ mod tests {
         }
         scene.tick_use(true, true);
         assert_eq!(scene.world.block_state(1, 65, 0), Some(stone));
+    }
+
+    /// `ClientPacketListener.isFeatureEnabled`: every flag a block requires
+    /// has to be among those the server announced.
+    #[test]
+    fn a_block_needs_the_servers_feature_flags() {
+        let vanilla = rapidbot_buf::Identifier::from("minecraft:vanilla");
+        let needs_vanilla = vec!["minecraft:vanilla".to_string()];
+        assert!(features_enabled(
+            &needs_vanilla,
+            std::slice::from_ref(&vanilla)
+        ));
+        assert!(!features_enabled(&needs_vanilla, &[]));
+        assert!(!features_enabled(
+            &["minecraft:redstone_experiments".to_string()],
+            &[vanilla]
+        ));
+        assert!(features_enabled(&[], &[]), "a block needing nothing");
+    }
+
+    /// A server that announced no feature flags at all: vanilla refuses the
+    /// click, so nothing is predicted even though the packet still goes out.
+    #[test]
+    fn a_block_is_refused_without_the_servers_feature_flags() {
+        let mut scene = Scene::new();
+        scene.set_item(36, "minecraft:stone");
+        scene.set_features(&[]);
+
+        let packets = scene.tick_use(true, true);
+        assert_eq!(
+            packets.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [UseItemOn::ID],
+            "the packet is still sent, as vanilla sends it first"
+        );
+        assert_eq!(
+            scene.world.block_state(1, 65, 0),
+            Some(AIR),
+            "but nothing is predicted"
+        );
+
+        // With the flag enabled the placement is predicted as usual.
+        scene.set_features(&["minecraft:vanilla"]);
+        scene.tick_use(true, true);
+        assert_eq!(
+            scene.world.block_state(1, 65, 0),
+            Some(state("minecraft:stone"))
+        );
     }
 
     /// `useItemOn` and `startDestroyBlock` refuse a block outside the border

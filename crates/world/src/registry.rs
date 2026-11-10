@@ -1,6 +1,7 @@
 //! Block states and their collision/movement data, extracted from the
 //! vanilla jar by tools/extract_blocks.py.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
@@ -25,6 +26,9 @@ pub struct BlockInfo {
     /// `Block.getBounceRestitution` (slime blocks bounce at 1.0).
     pub bounce: f32,
     pub dynamic_shape: bool,
+    /// Index into [`Registry::feature_sets`]: the feature flags the server
+    /// must have enabled for this block to be usable.
+    pub features: u16,
     /// `Block.defaultBlockState()`: not the first state for most blocks.
     pub default_state: StateId,
     /// The block declares its own `useItemOn`/`useWithoutItem`, so a
@@ -158,6 +162,9 @@ pub struct Registry {
     /// ordinal when `item_wall_blocks` is not -1.
     pub item_wall_directions: Vec<i8>,
     pub shapes: Vec<Shape>,
+    /// The distinct `Block.requiredFeatures` sets, indexed by
+    /// [`BlockInfo::features`].
+    pub feature_sets: Vec<Vec<String>>,
     pub blocks: Vec<BlockInfo>,
     pub states: Vec<StateInfo>,
 }
@@ -192,19 +199,36 @@ impl Registry {
                 ),
             })
             .collect();
+        // Feature-flag sets are interned: nearly every block requires exactly
+        // `minecraft:vanilla`, so there is one set for almost all of them.
+        let mut feature_sets: Vec<Vec<String>> = vec![Vec::new()];
+        let mut feature_index: HashMap<Vec<String>, u16> = HashMap::new();
+        feature_index.insert(Vec::new(), 0);
         let mut blocks: Vec<BlockInfo> = raw
             .blocks
             .into_iter()
-            .map(|b| BlockInfo {
-                id: b.id,
-                name: b.name,
-                friction: b.friction,
-                speed_factor: b.speed_factor,
-                jump_factor: b.jump_factor,
-                bounce: b.bounce,
-                dynamic_shape: b.dynamic_shape,
-                default_state: b.default_state,
-                interactive: b.interactive,
+            .map(|b| {
+                let features = match feature_index.get(&b.features) {
+                    Some(index) => *index,
+                    None => {
+                        let index = feature_sets.len() as u16;
+                        feature_sets.push(b.features.clone());
+                        feature_index.insert(b.features, index);
+                        index
+                    }
+                };
+                BlockInfo {
+                    id: b.id,
+                    name: b.name,
+                    friction: b.friction,
+                    speed_factor: b.speed_factor,
+                    jump_factor: b.jump_factor,
+                    bounce: b.bounce,
+                    dynamic_shape: b.dynamic_shape,
+                    features,
+                    default_state: b.default_state,
+                    interactive: b.interactive,
+                }
             })
             .collect();
         blocks.sort_by_key(|b| b.id);
@@ -262,6 +286,7 @@ impl Registry {
             item_wall_blocks: raw.item_wall_blocks,
             item_wall_directions: raw.item_wall_directions,
             shapes,
+            feature_sets,
             blocks,
             states,
         }
@@ -269,6 +294,17 @@ impl Registry {
 
     pub fn state(&self, id: StateId) -> &StateInfo {
         &self.states[id as usize]
+    }
+
+    /// `Block.requiredFeatures`: the feature flags the server has to have
+    /// enabled for this block to be usable at all. Nearly everything is just
+    /// `minecraft:vanilla`.
+    pub fn required_features(&self, id: StateId) -> &[String] {
+        let block = self.state(id).block;
+        self.blocks
+            .get(block as usize)
+            .and_then(|info| self.feature_sets.get(info.features as usize))
+            .map_or(&[], |set| set.as_slice())
     }
 
     pub fn block_of(&self, id: StateId) -> &BlockInfo {
@@ -458,6 +494,8 @@ struct RawBlock {
     jump_factor: f32,
     bounce: f32,
     dynamic_shape: bool,
+    /// `Block.requiredFeatures`: `minecraft:vanilla` for nearly everything.
+    features: Vec<String>,
     default_state: StateId,
     interactive: bool,
 }
@@ -465,6 +503,19 @@ struct RawBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Block.requiredFeatures`: in 26.3 every block asks for
+    /// `minecraft:vanilla` and nothing else, which is the set the client's
+    /// use gate compares against the server's announced flags.
+    #[test]
+    fn blocks_require_the_vanilla_flag() {
+        let r = Registry::get();
+        let vanilla = vec!["minecraft:vanilla".to_string()];
+        for name in ["minecraft:stone", "minecraft:air", "minecraft:crafter"] {
+            let state = r.block_by_name(name).unwrap().default_state;
+            assert_eq!(r.required_features(state), vanilla, "{name}");
+        }
+    }
 
     #[test]
     fn loads() {

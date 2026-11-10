@@ -279,11 +279,29 @@ pub fn box_entry(
 impl Shape {
     /// `VoxelShape.clip` for this shape at block `pos`.
     pub fn clip(&self, from: [f64; 3], to: [f64; 3], pos: (i32, i32, i32)) -> Option<BlockHit> {
+        self.clip_shifted(from, to, pos, [0.0; 3])
+    }
+
+    /// `VoxelShape.clip` for this shape at block `pos`, shifted inside the
+    /// cell by `shift`. A block with an `OffsetType` moves its own shape by a
+    /// hash of its position, and the extracted shape was taken at the origin,
+    /// so the caller passes the difference here.
+    pub fn clip_shifted(
+        &self,
+        from: [f64; 3],
+        to: [f64; 3],
+        pos: (i32, i32, i32),
+        shift: [f64; 3],
+    ) -> Option<BlockHit> {
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
             return None;
         }
-        let offset = [pos.0 as f64, pos.1 as f64, pos.2 as f64];
+        let offset = [
+            pos.0 as f64 + shift[0],
+            pos.1 as f64 + shift[1],
+            pos.2 as f64 + shift[2],
+        ];
         let test = [
             from[0] + d[0] * 0.001,
             from[1] + d[1] * 0.001,
@@ -442,14 +460,18 @@ pub fn traverse_blocks<T>(
     None
 }
 
-/// `BlockGetter.clip` for block outlines. Blocks whose outline is offset
-/// by their position (`BlockBehaviour.OffsetType`: bamboo, small flowers)
-/// are tested at their unshifted place.
+/// `BlockGetter.clip` for block outlines. A block whose outline moves with
+/// its position (`BlockBehaviour.OffsetType`: flowers, bamboo, dripstone) is
+/// tested where it really is; grass and ferns, whose offset only moves how
+/// they are drawn, are tested where they stand.
 pub fn clip(world: &World, from: [f64; 3], to: [f64; 3]) -> BlockHit {
     let registry = Registry::get();
     let hit = traverse_blocks(from, to, |pos| {
         let state = world.block_state_or_air(pos.0, pos.1, pos.2);
-        let mut hit = registry.outline_shape(state)?.clip(from, to, pos)?;
+        let shift = registry.shape_offset(state, pos.0, pos.1, pos.2);
+        let mut hit = registry
+            .outline_shape(state)?
+            .clip_shifted(from, to, pos, shift)?;
         // clipWithInteractionOverride
         if let Some(inner) = registry
             .interaction_shape(state)

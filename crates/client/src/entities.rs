@@ -332,6 +332,9 @@ pub struct Entity {
     pub uuid: Uuid,
     /// Registry name, e.g. `minecraft:player`.
     pub kind: &'static str,
+    /// The order the client learned of this entity, which is the order it
+    /// sits in vanilla's entity section and so decides a crosshair tie.
+    spawn_order: u64,
     type_id: usize,
     /// Where the client has it this tick: the server's position reaches
     /// here a few ticks late, through the interpolation.
@@ -500,6 +503,7 @@ impl Entity {
         Entity {
             id,
             uuid: Uuid::from_u128(id as u128),
+            spawn_order: 0,
             kind: registry.entity_types[type_id].as_str(),
             type_id,
             pos,
@@ -1411,6 +1415,9 @@ pub struct EntityPick<'a> {
 #[derive(Default)]
 pub struct Entities {
     by_id: HashMap<i32, Entity>,
+    /// Handed out in the order entities are added, for [`Entities::pick`]'s
+    /// tie-break.
+    next_spawn_order: u64,
     players: HashMap<Uuid, PlayerInfo>,
     /// `minecraft:painting_variant` dimensions by registry ID.
     painting_variants: Vec<(i32, i32)>,
@@ -1455,7 +1462,9 @@ impl Entities {
 
     /// Insert a bare entity without an `AddEntity` packet, for tests.
     #[cfg(test)]
-    pub(crate) fn insert_for_test(&mut self, entity: Entity) {
+    pub(crate) fn insert_for_test(&mut self, mut entity: Entity) {
+        entity.spawn_order = self.next_spawn_order;
+        self.next_spawn_order += 1;
         self.by_id.insert(entity.id, entity);
     }
 
@@ -1573,14 +1582,25 @@ impl Entities {
     pub fn pick(&self, query: EntityPick<'_>) -> Option<EntityHit> {
         let mut nearest = query.max_distance_sq;
         let mut hovered: Option<EntityHit> = None;
-        // Vanilla walks its entity sections; the order only matters between
-        // entities hit at exactly the same distance. IDs make ours stable.
+        // Vanilla walks its entity sections in x, then z, then y order
+        // (`EntitySectionStorage.forEachAccessibleNonEmptySection` packs the
+        // section key as x, z, y), and each section's entities in the order
+        // they were added. The order only matters between entities the ray
+        // hits at exactly the same distance, but then it decides which one a
+        // click reports.
         let mut candidates: Vec<&Entity> = self
             .by_id
             .values()
             .filter(|e| e.id != query.except)
             .collect();
-        candidates.sort_by_key(|e| e.id);
+        candidates.sort_by_key(|e| {
+            let (x, y, z) = (
+                crate::math::floor(e.pos.x),
+                crate::math::floor(e.pos.y),
+                crate::math::floor(e.pos.z),
+            );
+            (x >> 4, z >> 4, y >> 4, e.spawn_order)
+        });
         for entity in candidates {
             let (min, max) = entity.bounding_box();
             let from = query.from;
@@ -1735,6 +1755,7 @@ impl Entities {
             id,
             uuid,
             kind: kind.as_str(),
+            spawn_order: 0,
             type_id,
             pos,
             y_rot,
@@ -1784,6 +1805,8 @@ impl Entities {
         if dragon {
             entity.flight = Some(Box::default());
         }
+        entity.spawn_order = self.next_spawn_order;
+        self.next_spawn_order += 1;
         self.by_id.insert(id, entity);
         if dragon {
             // `EnderDragon`'s constructor creates the parts; they are placed
@@ -2997,5 +3020,43 @@ mod tests {
         // Body slot 6 with one item: hasBodyItem, so not pickable from inside.
         e.set_equipment(&[7, 6, 1, 5, 0, 0]).unwrap();
         assert!(pick(&e).is_none());
+    }
+
+    /// Two entities the ray hits at exactly the same distance: vanilla keeps
+    /// the one its section holds first, which is the one the client heard of
+    /// first. Sorting by ID would report 7 here.
+    #[test]
+    fn a_tie_is_broken_by_the_order_entities_arrived() {
+        let mut e = Entities::default();
+        let tags = Tags::default();
+        add(&mut e, 9, "minecraft:zombie", [0.0, 64.0, 2.0]);
+        add(&mut e, 7, "minecraft:zombie", [0.0, 64.0, 2.0]);
+        let hit = e.pick(EntityPick {
+            except: 1,
+            from: [0.0, 64.5, 0.0],
+            to: [0.0, 64.5, 4.0],
+            search: ([-1.0, 63.0, -1.0], [1.0, 66.0, 5.0]),
+            max_distance_sq: 25.0,
+            tags: &tags,
+            root_vehicle: None,
+        });
+        assert_eq!(
+            hit.map(|hit| hit.id),
+            Some(9),
+            "the one the client learned of first, not the lower ID"
+        );
+
+        // The nearer one still wins, whatever the order.
+        add(&mut e, 5, "minecraft:zombie", [0.0, 64.0, 1.0]);
+        let hit = e.pick(EntityPick {
+            except: 1,
+            from: [0.0, 64.5, 0.0],
+            to: [0.0, 64.5, 4.0],
+            search: ([-1.0, 63.0, -1.0], [1.0, 66.0, 5.0]),
+            max_distance_sq: 25.0,
+            tags: &tags,
+            root_vehicle: None,
+        });
+        assert_eq!(hit.map(|hit| hit.id), Some(5));
     }
 }

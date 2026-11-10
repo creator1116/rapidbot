@@ -29,6 +29,18 @@ pub struct BlockInfo {
     /// Index into [`Registry::feature_sets`]: the feature flags the server
     /// must have enabled for this block to be usable.
     pub features: u16,
+    /// `BlockBehaviour.OffsetType`: 0 none, 1 XZ, 2 XYZ.
+    pub offset_type: u8,
+    /// Whether the block's shapes are exactly `base.move(state.getOffset(pos))`.
+    /// Grass and ferns have an offset type that only moves how they are
+    /// *drawn*; flowers, bamboo and dripstone move their crosshair shapes with
+    /// it, and bamboo, dripstone and sulfur spikes move their collision boxes.
+    pub offset_shape: bool,
+    /// `getMaxHorizontalOffset`: 0.25 unless the block overrides it.
+    pub max_h_offset: f32,
+    /// `getMaxVerticalOffset`: 0.2 unless the block overrides it (small
+    /// dripleaf is 0.1, but its shape does not follow the offset).
+    pub max_v_offset: f32,
     /// `Block.defaultBlockState()`: not the first state for most blocks.
     pub default_state: StateId,
     /// The block declares its own `useItemOn`/`useWithoutItem`, so a
@@ -226,6 +238,10 @@ impl Registry {
                     bounce: b.bounce,
                     dynamic_shape: b.dynamic_shape,
                     features,
+                    offset_type: b.offset_type,
+                    offset_shape: b.offset_shape,
+                    max_h_offset: b.max_h_offset,
+                    max_v_offset: b.max_v_offset,
                     default_state: b.default_state,
                     interactive: b.interactive,
                 }
@@ -309,6 +325,35 @@ impl Registry {
 
     pub fn block_of(&self, id: StateId) -> &BlockInfo {
         &self.blocks[self.states[id as usize].block as usize]
+    }
+
+    /// `BlockState.getOffset(pos)`: where inside its cell the block sits. The
+    /// hash reads the height as zero, so `y` is only here to mirror vanilla's
+    /// signature.
+    pub fn block_offset(&self, id: StateId, x: i32, _y: i32, z: i32) -> [f64; 3] {
+        offset_at(self.block_of(id), x, z)
+    }
+
+    /// What has to be added to this block's extracted shape, which was taken
+    /// at `BlockPos.ZERO`, to get the shape it really has at `(x, y, z)`.
+    /// Zero for everything whose shape does not follow its offset.
+    ///
+    /// The subtraction re-associates vanilla's `base + offset(pos)` into
+    /// `(base + offset(0,0)) + (offset(pos) - offset(0,0))`, which can move a
+    /// coordinate by one bit at the end; the ray cast and collision epsilons
+    /// are far wider than that.
+    pub fn shape_offset(&self, id: StateId, x: i32, _y: i32, z: i32) -> [f64; 3] {
+        let block = self.block_of(id);
+        if !block.offset_shape || block.offset_type == 0 {
+            return [0.0; 3];
+        }
+        let here = offset_at(block, x, z);
+        let origin = offset_at(block, 0, 0);
+        [
+            here[0] - origin[0],
+            here[1] - origin[1],
+            here[2] - origin[2],
+        ]
     }
 
     /// The collision shape with an empty collision context. Index 0 is the
@@ -442,6 +487,42 @@ fn same_properties_except(candidate: &str, base: &str, key: &str, value: &str) -
             .all(|(k, v)| k == key || property_in(candidate, k) == Some(v))
 }
 
+/// `Mth.getSeed(x, y, z)`: the hash a position-based block offset uses.
+pub fn get_seed(x: i32, y: i32, z: i32) -> i64 {
+    // Java: `x * 3129871 ^ z * 116129781L ^ y`, the first product in int.
+    let mut seed =
+        (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781) ^ (y as i64);
+    seed = seed
+        .wrapping_mul(seed)
+        .wrapping_mul(42317861)
+        .wrapping_add(seed.wrapping_mul(11));
+    seed >> 16
+}
+
+/// `BlockBehaviour.Properties.offsetType`'s function: where inside its cell
+/// the block sits. The horizontal step divides in float and is widened
+/// afterwards, exactly as vanilla writes it.
+fn offset_at(block: &BlockInfo, x: i32, z: i32) -> [f64; 3] {
+    if block.offset_type == 0 {
+        return [0.0; 3];
+    }
+    let seed = get_seed(x, 0, z);
+    let max_h = block.max_h_offset as f64;
+    let step = |bits: i64| ((bits & 15) as f32 / 15.0f32) as f64 - 0.5;
+    let clamp = |value: f64| value.clamp(-max_h, max_h);
+    let y_offset = if block.offset_type == 2 {
+        let step_y = ((seed >> 4 & 15) as f32 / 15.0f32) as f64 - 1.0;
+        step_y * block.max_v_offset as f64
+    } else {
+        0.0
+    };
+    [
+        clamp(step(seed) * 0.5),
+        y_offset,
+        clamp(step(seed >> 8) * 0.5),
+    ]
+}
+
 type RawState = (
     u32,
     u16,
@@ -496,6 +577,10 @@ struct RawBlock {
     dynamic_shape: bool,
     /// `Block.requiredFeatures`: `minecraft:vanilla` for nearly everything.
     features: Vec<String>,
+    offset_type: u8,
+    offset_shape: bool,
+    max_h_offset: f32,
+    max_v_offset: f32,
     default_state: StateId,
     interactive: bool,
 }
@@ -503,6 +588,108 @@ struct RawBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Mth.getSeed` and the offset it drives, against what the JVM returns
+    /// for these blocks and positions (`BlockState.getOffset`, printed by a
+    /// throwaway probe run through `tools/extract_blocks.py`'s classpath).
+    #[test]
+    fn block_offsets_match_the_jvm() {
+        let r = Registry::get();
+        let cases: [(&str, i32, i32, [f64; 3]); 7] = [
+            (
+                "minecraft:short_grass",
+                10,
+                20,
+                [0.116_666_674_613_952_64, -0.200_000_002_980_232_24, -0.25],
+            ),
+            (
+                "minecraft:short_grass",
+                0,
+                0,
+                [-0.25, -0.200_000_002_980_232_24, -0.25],
+            ),
+            (
+                "minecraft:short_grass",
+                -12,
+                5,
+                [
+                    -0.216_666_664_928_197_86,
+                    -0.093_333_329_161_008_12,
+                    -0.216_666_664_928_197_86,
+                ],
+            ),
+            (
+                "minecraft:tall_dry_grass",
+                7,
+                -3,
+                [
+                    -0.083_333_328_366_279_6,
+                    -0.200_000_002_980_232_24,
+                    -0.183_333_329_856_395_72,
+                ],
+            ),
+            (
+                "minecraft:dandelion",
+                3,
+                -7,
+                [-0.149_999_998_509_883_88, 0.0, -0.183_333_329_856_395_72],
+            ),
+            (
+                "minecraft:small_dripleaf",
+                1,
+                1,
+                [
+                    -0.083_333_328_366_279_6,
+                    -0.026_666_665_474_573_747,
+                    -0.083_333_328_366_279_6,
+                ],
+            ),
+            (
+                "minecraft:fern",
+                20,
+                20,
+                [
+                    -0.049_999_997_019_767_76,
+                    -0.053_333_330_949_147_495,
+                    -0.216_666_664_928_197_86,
+                ],
+            ),
+        ];
+        for (name, x, z, expected) in cases {
+            let state = r.block_by_name(name).unwrap().default_state;
+            let got = r.block_offset(state, x, 64, z);
+            for axis in 0..3 {
+                assert!(
+                    (got[axis] - expected[axis]).abs() < 1.0e-12,
+                    "{name} at ({x}, 64, {z}): {got:?} != {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// Only the blocks whose shapes move with the offset get a shift; grass is
+    /// drawn shifted but hit where it stands.
+    #[test]
+    fn only_shifting_shapes_get_an_offset() {
+        let r = Registry::get();
+        let dandelion = r
+            .block_by_name("minecraft:dandelion")
+            .unwrap()
+            .default_state;
+        let shifted = r.shape_offset(dandelion, 10, 64, 20);
+        assert!(
+            shifted.iter().any(|v| v.abs() > 1.0e-6),
+            "a flower's shape follows its offset: {shifted:?}"
+        );
+        let grass = r
+            .block_by_name("minecraft:short_grass")
+            .unwrap()
+            .default_state;
+        assert_eq!(r.shape_offset(grass, 10, 64, 20), [0.0; 3]);
+        let stone = r.block_by_name("minecraft:stone").unwrap().default_state;
+        assert_eq!(r.shape_offset(stone, 10, 64, 20), [0.0; 3]);
+        assert_eq!(r.block_offset(stone, 10, 64, 20), [0.0; 3]);
+    }
 
     /// `Block.requiredFeatures`: in 26.3 every block asks for
     /// `minecraft:vanilla` and nothing else, which is the set the client's

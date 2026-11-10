@@ -147,11 +147,21 @@ impl Shape {
         )
     }
 
-    pub fn at(&self, x: i32, y: i32, z: i32) -> PlacedShape<'_> {
+    /// [`Shape::at`], shifted inside the cell: a block whose shape follows
+    /// its position-based `OffsetType` sits where the hash puts it.
+    pub fn at_shifted(&self, x: i32, y: i32, z: i32, shift: [f64; 3]) -> PlacedShape<'_> {
         PlacedShape {
             shape: self,
-            offset: [x as f64, y as f64, z as f64],
+            offset: [
+                x as f64 + shift[0],
+                y as f64 + shift[1],
+                z as f64 + shift[2],
+            ],
         }
+    }
+
+    pub fn at(&self, x: i32, y: i32, z: i32) -> PlacedShape<'_> {
+        self.at_shifted(x, y, z, [0.0; 3])
     }
 }
 

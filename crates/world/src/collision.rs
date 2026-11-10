@@ -205,8 +205,9 @@ pub fn block_collisions_with<'r>(
                     };
                     shape
                 };
-                let placed = shape.at(x, y, z);
-                if shape.is_block {
+                let shift = registry.shape_offset(state, x, y, z);
+                let placed = shape.at_shifted(x, y, z, shift);
+                if shape.is_block && shift == [0.0; 3] {
                     if bbox.intersects(
                         x as f64,
                         y as f64,

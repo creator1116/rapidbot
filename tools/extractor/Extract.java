@@ -29,6 +29,8 @@ import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.DiscreteVoxelShape;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
@@ -129,6 +131,13 @@ public class Extract {
                 .append(",\"features\":").append(featureNames(block.requiredFeatures()))
                 .append(",\"default_state\":").append(Block.getId(block.defaultBlockState()))
                 .append(",\"interactive\":").append(hasCustomUse(block))
+                // Grass, flowers, saplings and bamboo are drawn, hit and
+                // collided with where their offset type puts them: a hash of
+                // the block's position (BlockBehaviour.Properties.offsetType).
+                .append(",\"offset_type\":").append(offsetType(block))
+                .append(",\"offset_shape\":").append(shapeFollowsOffset(block))
+                .append(",\"max_h_offset\":").append(Float.toString(maxHorizontalOffset(block)))
+                .append(",\"max_v_offset\":").append(Float.toString(maxVerticalOffset(block)))
                 .append("}");
         }
 
@@ -341,6 +350,91 @@ public class Extract {
             sb.append(quote(name));
         }
         return sb.append(']').toString();
+    }
+
+    /**
+     * `BlockBehaviour.OffsetType`, as 0 for none, 1 for XZ and 2 for XYZ.
+     *
+     * The type is not readable (the properties turn it into a private
+     * lambda), so it is probed: only XYZ ever moves a block vertically.
+     */
+    private static int offsetType(Block block) {
+        BlockState state = block.defaultBlockState();
+        if (!state.hasOffsetFunction()) return 0;
+        for (int i = 0; i < 64; i++) {
+            if (state.getOffset(new BlockPos(i * 7, 0, i * 13)).y != 0.0) return 2;
+        }
+        return 1;
+    }
+
+    /**
+     * Whether this block's shapes are exactly `base.move(state.getOffset(pos))`,
+     * which is how flowers, bamboo and dripstone are written: shifting the
+     * shape taken at the origin by the change in the offset then gives the
+     * shape anywhere else.
+     *
+     * The comparison allows a nanometre: shifting a shape that already has the
+     * origin's offset baked in re-associates the addition, which moves the
+     * last bits of a coordinate.
+     */
+    private static boolean shapeFollowsOffset(Block block) {
+        if (!block.defaultBlockState().hasOffsetFunction()) return true;
+        // Every state, not just the default. `PointedDripstoneBlock` builds
+        // its shape from the tip state's offset rather than this state's, and
+        // asking about each state is what decides whether that still reduces
+        // to a per-position shift.
+        for (BlockState state : block.getStateDefinition().getPossibleStates()) {
+            BlockPos origin = BlockPos.ZERO;
+            BlockPos other = new BlockPos(7, 0, 3);
+            Vec3 atOrigin = state.getOffset(origin);
+            Vec3 elsewhere = state.getOffset(other);
+            if (!sameWhenShifted(
+                    state.getCollisionShape(EmptyBlockGetter.INSTANCE, origin),
+                    state.getCollisionShape(EmptyBlockGetter.INSTANCE, other),
+                    atOrigin,
+                    elsewhere)
+                || !sameWhenShifted(
+                    state.getShape(EmptyBlockGetter.INSTANCE, origin),
+                    state.getShape(EmptyBlockGetter.INSTANCE, other),
+                    atOrigin,
+                    elsewhere)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean sameWhenShifted(VoxelShape at, VoxelShape other, Vec3 atOffset, Vec3 otherOffset) {
+        if (at.isEmpty() || other.isEmpty()) return at.isEmpty() && other.isEmpty();
+        VoxelShape shifted = at.move(
+            otherOffset.x - atOffset.x, otherOffset.y - atOffset.y, otherOffset.z - atOffset.z);
+        List<AABB> shiftedBoxes = shifted.toAabbs();
+        List<AABB> otherBoxes = other.toAabbs();
+        if (shiftedBoxes.size() != otherBoxes.size()) return false;
+        for (int i = 0; i < shiftedBoxes.size(); i++) {
+            AABB one = shiftedBoxes.get(i);
+            AABB two = otherBoxes.get(i);
+            if (Math.abs(one.minX - two.minX) > 1e-9 || Math.abs(one.minY - two.minY) > 1e-9
+                || Math.abs(one.minZ - two.minZ) > 1e-9 || Math.abs(one.maxX - two.maxX) > 1e-9
+                || Math.abs(one.maxY - two.maxY) > 1e-9 || Math.abs(one.maxZ - two.maxZ) > 1e-9) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** `getMaxHorizontalOffset`: protected, 0.25 unless the block says otherwise. */
+    private static float maxHorizontalOffset(Block block) throws Exception {
+        Method method = BlockBehaviour.class.getDeclaredMethod("getMaxHorizontalOffset");
+        method.setAccessible(true);
+        return (float) method.invoke(block);
+    }
+
+    /** `getMaxVerticalOffset`: protected, 0.2 unless the block says otherwise. */
+    private static float maxVerticalOffset(Block block) throws Exception {
+        Method method = BlockBehaviour.class.getDeclaredMethod("getMaxVerticalOffset");
+        method.setAccessible(true);
+        return (float) method.invoke(block);
     }
 
     /** Registry entry names in ID order. */

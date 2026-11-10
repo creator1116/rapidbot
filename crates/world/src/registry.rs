@@ -327,7 +327,9 @@ impl Registry {
         &self.blocks[self.states[id as usize].block as usize]
     }
 
-    /// `BlockState.getOffset(pos)`: where inside its cell the block sits.
+    /// `BlockState.getOffset(pos)`: where inside its cell the block sits. The
+    /// hash reads the height as zero, so `y` is only here to mirror vanilla's
+    /// signature.
     pub fn block_offset(&self, id: StateId, x: i32, _y: i32, z: i32) -> [f64; 3] {
         offset_at(self.block_of(id), x, z)
     }

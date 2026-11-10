@@ -369,10 +369,9 @@ public class Extract {
 
     /**
      * Whether this block's shapes are exactly `base.move(state.getOffset(pos))`,
-     * which is true of flowers, grass, saplings and bamboo: shifting the shape
-     * taken at the origin by the change in the offset gives the shape
-     * anywhere else. Pointed dripstone moves by the offset of the *tip's*
-     * state instead, which a per-position shift cannot express.
+     * which is how flowers, bamboo and dripstone are written: shifting the
+     * shape taken at the origin by the change in the offset then gives the
+     * shape anywhere else.
      *
      * The comparison allows a nanometre: shifting a shape that already has the
      * origin's offset baked in re-associates the addition, which moves the
@@ -380,8 +379,10 @@ public class Extract {
      */
     private static boolean shapeFollowsOffset(Block block) {
         if (!block.defaultBlockState().hasOffsetFunction()) return true;
-        // Every state, not just the default: pointed dripstone moves by the
-        // offset of the tip's own state in some of them.
+        // Every state, not just the default. `PointedDripstoneBlock` builds
+        // its shape from the tip state's offset rather than this state's, and
+        // asking about each state is what decides whether that still reduces
+        // to a per-position shift.
         for (BlockState state : block.getStateDefinition().getPossibleStates()) {
             BlockPos origin = BlockPos.ZERO;
             BlockPos other = new BlockPos(7, 0, 3);
@@ -407,15 +408,15 @@ public class Extract {
         if (at.isEmpty() || other.isEmpty()) return at.isEmpty() && other.isEmpty();
         VoxelShape shifted = at.move(
             otherOffset.x - atOffset.x, otherOffset.y - atOffset.y, otherOffset.z - atOffset.z);
-        List<AABB> a = shifted.toAabbs();
-        List<AABB> b = other.toAabbs();
-        if (a.size() != b.size()) return false;
-        for (int i = 0; i < a.size(); i++) {
-            AABB x = a.get(i);
-            AABB y = b.get(i);
-            if (Math.abs(x.minX - y.minX) > 1e-9 || Math.abs(x.minY - y.minY) > 1e-9
-                || Math.abs(x.minZ - y.minZ) > 1e-9 || Math.abs(x.maxX - y.maxX) > 1e-9
-                || Math.abs(x.maxY - y.maxY) > 1e-9 || Math.abs(x.maxZ - y.maxZ) > 1e-9) {
+        List<AABB> shiftedBoxes = shifted.toAabbs();
+        List<AABB> otherBoxes = other.toAabbs();
+        if (shiftedBoxes.size() != otherBoxes.size()) return false;
+        for (int i = 0; i < shiftedBoxes.size(); i++) {
+            AABB one = shiftedBoxes.get(i);
+            AABB two = otherBoxes.get(i);
+            if (Math.abs(one.minX - two.minX) > 1e-9 || Math.abs(one.minY - two.minY) > 1e-9
+                || Math.abs(one.minZ - two.minZ) > 1e-9 || Math.abs(one.maxX - two.maxX) > 1e-9
+                || Math.abs(one.maxY - two.maxY) > 1e-9 || Math.abs(one.maxZ - two.maxZ) > 1e-9) {
                 return false;
             }
         }

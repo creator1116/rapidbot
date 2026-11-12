@@ -12,7 +12,7 @@ Targets **Minecraft 26.3** (protocol 777).
 The tables that only the game has — block shapes, item components, the `en_us`
 strings, the `Mth` lookup tables and the vectors the ports are tested against —
 are generated from your own copy of Minecraft and are not in this repository.
-See [docs/data.md](docs/data.md) for the five commands. Without them the build
+See [docs/data.md](docs/data.md) for the commands. Without them the build
 stops and names the one you are missing.
 
 ## Layout

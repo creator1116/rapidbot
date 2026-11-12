@@ -38,6 +38,7 @@ jobs:
         python tools/extract_items.py 26.3
         python tools/extract_lang.py 26.3
         python tools/gen_clip_vectors.py 26.3
+        python tools/gen_packet_ids.py 26.3
     - name: Check formatting
       run: cargo fmt --all -- --check
     # `--all-features` so the opt-in `test-support` harness is linted and

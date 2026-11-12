@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Generated from your own copy of the game, never published: docs/data.md.
+exclude = ["src/ids.rs"]
+
 [dependencies]
 rapidbot-buf.workspace = true
 aes.workspace = true

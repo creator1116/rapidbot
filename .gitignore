@@ -9,6 +9,7 @@
 /crates/world/tests/data/
 /crates/client/data/
 /crates/physics/src/mth_tables.rs
+/crates/protocol/src/ids.rs
 
 # Cached Microsoft/Minecraft credentials.
 /accounts

@@ -23,7 +23,7 @@ fn main() {
     for file in ["tests/data/clip_vectors.txt", "tests/data/item_vectors.txt"] {
         if !root.join(file).exists() {
             println!(
-                "cargo:warning={file} is missing, so the vector tests will not compile: \
+                "cargo:warning={file} is missing, so the tests that read it will fail: \
                  run `python tools/gen_clip_vectors.py 26.3` and \
                  `python tools/extract_items.py 26.3`"
             );

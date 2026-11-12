@@ -1281,9 +1281,17 @@ mod tests {
         assert!(!predicate.test(state("y"), &Tags::default()));
     }
 
+    /// The generated vectors, with a failure that says how to make them.
+    fn item_vector_text() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/item_vectors.txt");
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|_| panic!("missing {path}: run `python tools/extract_items.py 26.3`"))
+    }
+
     #[test]
     fn can_break_decodes_the_vanilla_vector() {
-        let line = include_str!("../tests/data/item_vectors.txt")
+        let text = item_vector_text();
+        let line = text
             .lines()
             .find(|line| line.contains("'minecraft:can_break'"))
             .unwrap();

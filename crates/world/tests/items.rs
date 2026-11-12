@@ -9,9 +9,19 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The generated vectors, with a failure that says how to make them.
+fn vector_text() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/item_vectors.txt");
+    std::fs::read_to_string(path).unwrap_or_else(|_| {
+        panic!(
+            "missing {path}: run `python tools/extract_items.py 26.3`              (after `python tools/fetch_vanilla.py 26.3 --no-decompile`)"
+        )
+    })
+}
+
 fn vectors() -> Vec<(String, Vec<u8>)> {
-    include_str!("data/item_vectors.txt")
-        .lines()
+    let text = vector_text();
+    text.lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
         .map(|l| {
             let (snbt, hex) = l.split_once('\t').unwrap();

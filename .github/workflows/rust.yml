@@ -19,6 +19,25 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - name: Install Java 26
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '26'
+    # The extractors read the game's own files; their output is not committed
+    # (docs/data.md), so every run regenerates it.
+    - name: Cache the game files
+      uses: actions/cache@v4
+      with:
+        path: vanilla
+        key: vanilla-26.3-${{ runner.os }}
+    - name: Generate the game-derived data
+      run: |
+        python tools/fetch_vanilla.py 26.3 --no-decompile
+        python tools/extract_blocks.py 26.3
+        python tools/extract_items.py 26.3
+        python tools/extract_lang.py 26.3
+        python tools/gen_clip_vectors.py 26.3
     - name: Check formatting
       run: cargo fmt --all -- --check
     # `--all-features` so the opt-in `test-support` harness is linted and
@@ -37,6 +56,25 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - name: Install Java 26
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '26'
+    # The extractors read the game's own files; their output is not committed
+    # (docs/data.md), so every run regenerates it.
+    - name: Cache the game files
+      uses: actions/cache@v4
+      with:
+        path: vanilla
+        key: vanilla-26.3-${{ runner.os }}
+    - name: Generate the game-derived data
+      run: |
+        python tools/fetch_vanilla.py 26.3 --no-decompile
+        python tools/extract_blocks.py 26.3
+        python tools/extract_items.py 26.3
+        python tools/extract_lang.py 26.3
+        python tools/gen_clip_vectors.py 26.3
     - name: Clippy
       run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     - name: Build

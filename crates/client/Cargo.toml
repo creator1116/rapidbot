@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Generated from your own copy of the game, never published: docs/data.md.
+exclude = ["data/"]
+
 [dependencies]
 rapidbot-auth.workspace = true
 rapidbot-buf.workspace = true

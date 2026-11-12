@@ -2,6 +2,14 @@
 # Mojang jars, generated reports and decompiled source: reference only, never commit.
 /vanilla
 
+# Data generated from your own copy of the game by `tools/fetch_vanilla.py` and the
+# `tools/extract_*.py` / `tools/gen_*.py` scripts. Mojang's content is not ours to
+# redistribute, so these stay local: see docs/data.md.
+/crates/world/data/
+/crates/world/tests/data/
+/crates/client/data/
+/crates/physics/src/mth_tables.rs
+
 # Cached Microsoft/Minecraft credentials.
 /accounts
 

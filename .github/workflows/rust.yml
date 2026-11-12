@@ -32,12 +32,14 @@ jobs:
         path: vanilla
         key: vanilla-26.3-${{ runner.os }}
     - name: Generate the game-derived data
+      shell: bash
       run: |
         python tools/fetch_vanilla.py 26.3 --no-decompile
         python tools/extract_blocks.py 26.3
         python tools/extract_items.py 26.3
         python tools/extract_lang.py 26.3
         python tools/gen_clip_vectors.py 26.3
+        python tools/gen_packet_ids.py 26.3
         python tools/gen_packet_ids.py 26.3
     - name: Check formatting
       run: cargo fmt --all -- --check
@@ -70,12 +72,14 @@ jobs:
         path: vanilla
         key: vanilla-26.3-${{ runner.os }}
     - name: Generate the game-derived data
+      shell: bash
       run: |
         python tools/fetch_vanilla.py 26.3 --no-decompile
         python tools/extract_blocks.py 26.3
         python tools/extract_items.py 26.3
         python tools/extract_lang.py 26.3
         python tools/gen_clip_vectors.py 26.3
+        python tools/gen_packet_ids.py 26.3
     - name: Clippy
       run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     - name: Build

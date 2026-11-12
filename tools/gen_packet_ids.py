@@ -46,10 +46,20 @@ def main() -> None:
             for name, v in ordered:
                 const = name.removeprefix("minecraft:").replace("/", "_").upper()
                 out.append(f"        pub const {const}: i32 = {v['protocol_id']};")
-            names = ", ".join(f'"{n.removeprefix("minecraft:")}"' for n, _ in ordered)
             out.append("")
             out.append("        /// Packet names indexed by ID, for logging.")
-            out.append(f"        pub const NAMES: &[&str] = &[{names}];")
+            # The shape `cargo fmt` leaves the slice in — inline while the
+            # elements fit `array_width` (60), one per line otherwise — so
+            # regenerating reproduces the file byte for byte.
+            names = [name.removeprefix("minecraft:") for name, _ in ordered]
+            inline = ", ".join(f'"{name}"' for name in names)
+            if len(inline) <= 60:
+                out.append(f"        pub const NAMES: &[&str] = &[{inline}];")
+            else:
+                out.append("        pub const NAMES: &[&str] = &[")
+                for name in names:
+                    out.append(f'            "{name}",')
+                out.append("        ];")
             out.append("    }")
         out.append("}")
         out.append("")

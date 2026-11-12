@@ -4,15 +4,24 @@
 use rapidbot_world::raycast::{self, Direction};
 use rapidbot_world::{DimensionHeight, World};
 
+/// The generated vectors, with a failure that says how to make them.
+fn vectors() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/clip_vectors.txt");
+    std::fs::read_to_string(path).unwrap_or_else(|_| {
+        panic!(
+            "missing {path}: run `python tools/gen_clip_vectors.py 26.3`              (after `python tools/fetch_vanilla.py 26.3 --no-decompile`)"
+        )
+    })
+}
+
 fn bits(s: &str) -> f64 {
     f64::from_bits(u64::from_str_radix(s, 16).unwrap())
 }
 
 #[test]
 fn matches_vanilla_bit_for_bit() {
-    let mut lines = include_str!("data/clip_vectors.txt")
-        .lines()
-        .filter(|l| !l.starts_with('#'));
+    let text = vectors();
+    let mut lines = text.lines().filter(|l| !l.starts_with('#'));
     let palette: Vec<u32> = lines
         .next()
         .unwrap()

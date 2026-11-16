@@ -26,7 +26,7 @@ cfb8 = "0.8"
 # Stock zlib rather than miniz_oxide: vanilla compresses with java.util.zip
 # (zlib, default level), and the compressed bytes are visible to the server.
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 md-5 = "0.10"
 percent-encoding = "2"
 proc-macro2 = "1"

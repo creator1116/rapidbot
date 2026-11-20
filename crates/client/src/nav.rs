@@ -627,13 +627,15 @@ impl Walker {
         if *retarget_in == 0 || *target < *next {
             *target = *next;
             if ctx.player.on_ground {
-                for j in *next..(*next + 8).min(path.points.len()).min(limit) {
-                    let w = path.points[j];
+                for (offset, w) in path.points[*next..(*next + 8).min(path.points.len()).min(limit)]
+                    .iter()
+                    .enumerate()
+                {
                     if (w.surface - pos.y).abs() > 0.01 {
                         break;
                     }
                     if path::line_walkable(ctx.world, pos, w.pos()) {
-                        *target = j;
+                        *target = *next + offset;
                     }
                 }
             }

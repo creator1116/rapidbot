@@ -8,7 +8,6 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-rapidbot = { path = "crates/rapidbot" }
 rapidbot-auth = { path = "crates/auth" }
 rapidbot-buf = { path = "crates/buf" }
 rapidbot-client = { path = "crates/client" }

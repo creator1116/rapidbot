@@ -95,6 +95,82 @@ fn on_climbable(ctx: &TickContext<'_>) -> bool {
     )
 }
 
+/// How the walker crosses a gap it has to build across.
+///
+/// None of this is vanilla: vanilla only supplies the physics. Holding sneak
+/// is what stops a player walking off an edge (`Player.maybeBackOffFromEdge`,
+/// `Player.isStayingOnGroundSurface`) and it also slows the walk to sneak
+/// speed, so *when* to press it is a technique, not a rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Bridge {
+    /// Stop at the edge of each cell, sneak, place, then step on: the safe
+    /// way, and what the walker does unless it is told otherwise.
+    #[default]
+    Stop,
+    /// Speed bridging: keep walking at full speed and press sneak only for
+    /// the last stretch before the edge, so the block goes in safely without
+    /// the whole crossing being slowed to sneak speed.
+    Speed,
+    /// Telebridging: sprint off the edge, place a triple extension of blocks
+    /// under the fall, and land on the last one. The fastest and the most
+    /// visible way to cross a void; the jump has to be started at the edge
+    /// and the blocks have to go in within the arc, or the walker falls.
+    Tele,
+}
+
+/// Speed bridging: how close to the next cell's centre the walker gets before
+/// it presses sneak. The cell centre is the far edge of the block it stands
+/// on, so this is the last half block or so of the walk.
+const SPEED_BRIDGE_SNEAK_WITHIN: f64 = 1.1;
+
+/// Telebridging: how close to the first hole's centre the walker gets before
+/// it jumps. The jump is taken early because most of the arc is spent
+/// turning the view around to place the first block; the forward key is let
+/// go only once the extension is in, and the full sprint arc carries the
+/// walker onto the last block of the extension.
+const TELE_JUMP_WITHIN: f64 = 2.5;
+
+/// Telebridging: how many blocks one jump extends the bridge by.
+const TELE_EXTENSION: usize = 3;
+
+/// Telebridging: the widest gap one jump will cross. The extension is the
+/// far [`TELE_EXTENSION`] cells of the gap, and the fall has to land on one
+/// of them (or on the far ground itself), so the gap can be at most one cell
+/// wider than the extension.
+const TELE_MAX_RUN: usize = 4;
+
+/// The state of a telebridge jump: which cells the arc is placing, which one
+/// is next, and how far into the fall it is.
+struct TeleWait {
+    /// The cells to floor, far-to-near: at most [`TELE_EXTENSION`]. The last
+    /// one is the cell the fall lands on.
+    cells: Vec<(i32, i32, i32)>,
+    /// The route index of each cell: the flight carries the walker over the
+    /// near cells, and the route is ticked past them as they are placed.
+    waypoints: Vec<usize>,
+    /// The cell being placed.
+    index: usize,
+    /// Ticks since the feet left the ground.
+    ticks: u32,
+    /// One bit per cell: the click has been made.
+    clicked: u32,
+}
+
+/// What the telebridge wants from this tick.
+enum TeleStep {
+    /// Walk on: nothing to do yet.
+    Walk,
+    /// At the edge: press jump.
+    Jump,
+    /// Airborne. `aim` is the face to look at, if there is one to click;
+    /// `advance` ticks the route past a waypoint the flight has carried the
+    /// walker over.
+    Place {
+        aim: Option<Vec3>,
+        advance: Option<usize>,
+    },
+}
+
 pub struct Walker {
     noise: Noise,
     goal: Option<Vec3>,
@@ -130,6 +206,10 @@ pub struct Walker {
     dig_wait: Option<DigWait>,
     /// The waypoint cell being floored, if the next one needs it.
     place_wait: Option<PlaceWait>,
+    /// The telebridge jump in progress, if the walker is mid-arc.
+    tele: Option<TeleWait>,
+    /// How to bridge a gap the route has to build across.
+    pub bridge: Bridge,
 }
 
 impl Walker {
@@ -150,6 +230,8 @@ impl Walker {
             place: None,
             dig_wait: None,
             place_wait: None,
+            tele: None,
+            bridge: Bridge::default(),
             goal: None,
             state: State::Idle,
             gaze_pitch: 8.0,
@@ -323,7 +405,7 @@ impl Walker {
                     self.give_up(ctx);
                     return;
                 }
-                self.steer(ctx, goal, distance, true, false);
+                self.steer(ctx, goal, distance, true, false, false);
             }
         }
     }
@@ -427,7 +509,36 @@ impl Walker {
         {
             self.place_wait = None;
         }
-        if let Some(cell) = next_place
+        // Stopping to place is the safe way, and all the `Stop` mode does.
+        // The moving modes are handled further down, where the walking keys
+        // are decided: they keep walking while the block goes in. A gap too
+        // wide for a telebridge jump is placed this way too — standing at
+        // the edge beats leaping into the void — and the placement times out
+        // and gives up when even that cannot reach.
+        // The telebridge cell for the too-wide check: taken here while the
+        // route is only borrowed, and falling back to the route's first
+        // unfloored place cell so the check fires during the approach too —
+        // a gap the jump cannot catch is not leapt into from two blocks
+        // before the edge either.
+        let tele_check_cell = match next_place {
+            Some(cell) => Some(cell),
+            None => match &self.plan {
+                Plan::Following { path, .. } => {
+                    first_place.and_then(|i| path.points.get(i).map(|w| w.cell))
+                }
+                _ => None,
+            },
+        };
+        let tele_too_wide = self.bridge == Bridge::Tele
+            && tele_check_cell.is_some_and(|cell| self.tele_run(ctx, cell).len() > TELE_MAX_RUN);
+        if tele_too_wide {
+            // A gap this wide cannot be caught: say so and stop, rather than
+            // leaping into the void.
+            self.give_up(ctx);
+            return;
+        }
+        if self.bridge == Bridge::Stop
+            && let Some(cell) = next_place
             && self.place_at(ctx, cell)
         {
             return;
@@ -441,6 +552,14 @@ impl Walker {
         } = &mut self.plan
         else {
             return;
+        };
+        // The telebridge cell, taken while the route is at hand: the next
+        // waypoint when it is a place cell — the walker is at the edge or in
+        // the air — else the route's first unfloored place cell, so the
+        // approach starts early enough to look down and build up speed.
+        let tele_cell = match next_place {
+            Some(cell) => Some(cell),
+            None => first_place.and_then(|i| path.points.get(i).map(|w| w.cell)),
         };
         let pos = ctx.player.pos;
         let flat = |a: Vec3| ((a.x - pos.x).powi(2) + (a.z - pos.z).powi(2)).sqrt();
@@ -558,7 +677,338 @@ impl Walker {
             }
             return;
         }
-        self.steer(ctx, aim_at, run.min(open + 3.0), false, jump_ahead);
+        // Bridging: the stopping mode was handled further up, where it stands
+        // still. The moving ones keep walking. Speed bridging holds sneak for
+        // the last stretch before the edge and looks at the face the block
+        // goes against; telebridging sprints off the edge and places under
+        // the fall. The look has to come after steering, which sets the
+        // walking gaze.
+        let mut place_aim = None;
+        let mut sneak = false;
+        if self.bridge == Bridge::Speed
+            && let Some(cell) = next_place
+            && let Some((aim, late)) = self.bridge_speed(ctx, cell)
+        {
+            place_aim = Some(aim);
+            sneak = late;
+        }
+        let mut on_tele_approach = false;
+        let mut tele_advance = None;
+        let mut tele_fly = false;
+        if self.bridge == Bridge::Tele {
+            // The arc's own state keeps the sequence running once the route
+            // has been ticked past the cells it is placing.
+            let tele_cell = tele_cell.or_else(|| {
+                self.tele
+                    .as_ref()
+                    .and_then(|wait| wait.cells.get(wait.index).copied())
+            });
+            let step = match tele_cell {
+                Some(cell) => self.bridge_tele(ctx, cell),
+                None => {
+                    if ctx.player.on_ground {
+                        self.tele = None;
+                    }
+                    TeleStep::Walk
+                }
+            };
+            match step {
+                TeleStep::Walk => on_tele_approach = true,
+                TeleStep::Jump => {
+                    self.jump_hold = self.jump_hold.max(3);
+                    on_tele_approach = true;
+                }
+                TeleStep::Place { aim, advance } => {
+                    place_aim = aim;
+                    tele_advance = advance;
+                    tele_fly = true;
+                }
+            }
+        } else {
+            self.tele = None;
+        }
+        // The telebridge approach is sprinted so the takeoff has speed, and
+        // the arc keeps the sprint until the forward key is let go.
+        let tele_sprint = on_tele_approach
+            || (self.bridge == Bridge::Tele && (next_place.is_some() || self.tele.is_some()));
+        self.steer(
+            ctx,
+            aim_at,
+            run.min(open + 3.0),
+            false,
+            jump_ahead || tele_sprint,
+            sneak,
+        );
+        if let Some(aim) = place_aim {
+            ctx.aim_at(aim, 3.0);
+        }
+        if tele_fly {
+            // The telly technique: the view is down on the block being
+            // placed, and the movement holds whatever mix of forward and
+            // strafe keeps the walker travelling along the route — otherwise
+            // every placement aim drags the flight sideways and the walker
+            // drops off its own bridge.
+            let mut keys = ctx.wanted_keys();
+            keys.forward = true;
+            keys.sprint = true;
+            keys.backward = false;
+            let (travel_yaw, _) = angles_to(
+                ctx.player.eye_position(),
+                Vec3::new(aim_at.x, ctx.player.eye_position().y, aim_at.z),
+            );
+            let off = wrap_degrees(travel_yaw - ctx.player.y_rot);
+            keys.right = off > 5.0;
+            keys.left = off < -5.0;
+            ctx.set_keys(keys);
+        }
+        // The flight carried the walker over these waypoints.
+        if let Some(i) = tele_advance {
+            self.advance_route(i);
+        }
+    }
+
+    /// Speed bridging: aim at the face the next block goes against and say
+    /// whether to hold sneak, while the walk carries on. The click is the same
+    /// check [`Walker::place_at`] makes — only when the crosshair is really on
+    /// a face beside the hole — so an unreachable face is never clicked
+    /// blindly. `None` when there is nothing to place, or the block is not in
+    /// hand.
+    fn bridge_speed(
+        &mut self,
+        ctx: &mut TickContext<'_>,
+        cell: (i32, i32, i32),
+    ) -> Option<(Vec3, bool)> {
+        let hole = (cell.0, cell.1 - 1, cell.2);
+        if path::blocks(ctx.world, hole.0, hole.1, hole.2) {
+            self.place_wait = None;
+            return None;
+        }
+        let place = self.place?;
+        // The block has to be the one in hand, or the click would place
+        // something else. Stop and think, as `place_at` does.
+        let in_hand = ctx
+            .inventory
+            .held()
+            .and_then(|stack| path::PlacePolicy::for_item(stack.item))
+            .is_some_and(|held| held.block == place.block);
+        if !in_hand {
+            self.place_wait = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return None;
+        }
+
+        let targets = path::place_targets(ctx.world, hole);
+        let wait = match &mut self.place_wait {
+            Some(wait) if wait.cell == cell => wait,
+            _ => {
+                self.place_wait = Some(PlaceWait {
+                    cell,
+                    ticks: 0,
+                    clicked: false,
+                });
+                self.place_wait.as_mut().expect("just set")
+            }
+        };
+        wait.ticks = wait.ticks.saturating_add(1);
+        // One face at a time, trying the next every fifteen ticks.
+        let aim = *targets.get((wait.ticks / 15) as usize % targets.len().max(1))?;
+
+        // The crosshair is the pick from before this tick's mouse movement.
+        let hit = ctx.crosshair;
+        let on_face = !hit.miss
+            && path::NEIGHBOURS.iter().any(|((dx, dy, dz), face)| {
+                hit.pos == (hole.0 + dx, hole.1 + dy, hole.2 + dz) && hit.direction == *face
+            });
+        if !wait.clicked && on_face {
+            ctx.click_use();
+            wait.clicked = true;
+        }
+
+        // Sneak only for the last stretch: the next cell has no floor, so
+        // without sneak the walk would carry the player over the edge. The
+        // cell centre is the far edge of the block being stood on.
+        let next = Vec3::new(cell.0 as f64 + 0.5, cell.1 as f64, cell.2 as f64 + 0.5);
+        let to_edge =
+            ((next.x - ctx.player.pos.x).powi(2) + (next.z - ctx.player.pos.z).powi(2)).sqrt();
+        Some((aim, to_edge < SPEED_BRIDGE_SNEAK_WITHIN))
+    }
+
+    /// The run of unfloored place cells a telebridge jump would cross,
+    /// starting at `first`, with each cell's route index.
+    fn tele_run(
+        &self,
+        ctx: &TickContext<'_>,
+        first: (i32, i32, i32),
+    ) -> Vec<((i32, i32, i32), usize)> {
+        let mut run: Vec<((i32, i32, i32), usize)> = Vec::new();
+        if let Plan::Following { path, next, .. } = &self.plan {
+            for (i, waypoint) in path.points.iter().enumerate().skip(*next) {
+                if run.is_empty() {
+                    if waypoint.cell == first {
+                        run.push((waypoint.cell, i));
+                    }
+                    continue;
+                }
+                if !waypoint.place || !place_still_needed(ctx, waypoint.cell) || run.len() >= 8 {
+                    // The route may hop the rest of the gap in one jump
+                    // waypoint. The flight crosses those cells all the same,
+                    // and they need placing, so they join the run.
+                    if waypoint.jump {
+                        let (last, _) = run[run.len() - 1];
+                        let (dx, dz) = (waypoint.cell.0 - last.0, waypoint.cell.2 - last.2);
+                        let (sx, sz) = (dx.signum(), dz.signum());
+                        let steps = dx.abs().max(dz.abs());
+                        for step in 1..steps {
+                            run.push(((last.0 + sx * step, last.1, last.2 + sz * step), i));
+                        }
+                    }
+                    break;
+                }
+                run.push((waypoint.cell, i));
+            }
+        }
+        run
+    }
+
+    /// Telebridging: what this tick of the jump looks like. On the ground it
+    /// walks, pre-aims at the first face it will click, and jumps at the
+    /// edge; in the air it works through the extension, clicking when the
+    /// crosshair is really on a face of the hole being filled — the same
+    /// check the other modes make, so an unreachable face is never clicked
+    /// blindly.
+    ///
+    /// The extension is placed **far-to-near**: mid-air, the only faces that
+    /// exist are ahead — the far side of the gap first, then the west face of
+    /// each block placed before it — so every click is made looking forward
+    /// and down, the way the walk was already looking. The near cells the
+    /// flight crosses before their faces exist are the ones the route
+    /// sprint-jumps anyway.
+    fn bridge_tele(&mut self, ctx: &mut TickContext<'_>, first: (i32, i32, i32)) -> TeleStep {
+        // The block has to be the one in hand, or the click would place
+        // something else. Stop and think, as the other modes do.
+        let in_hand = self.place.is_some_and(|place| {
+            ctx.inventory
+                .held()
+                .and_then(|stack| path::PlacePolicy::for_item(stack.item))
+                .is_some_and(|held| held.block == place.block)
+        });
+        if !in_hand {
+            self.tele = None;
+            self.replans += 1;
+            if self.replans > 2 {
+                self.give_up(ctx);
+            } else {
+                self.plan = Plan::None;
+            }
+            return TeleStep::Walk;
+        }
+
+        // The extension: the far cells of the stretch the jump crosses,
+        // far-to-near. Mid-air the only faces that exist are ahead — the far
+        // side of the gap first, then the west face of each block placed
+        // before it — so every click is made looking forward and down, the
+        // way the walk was already looking, and the last block placed is the
+        // one the fall lands on.
+        let extension: Vec<((i32, i32, i32), usize)> = match &self.tele {
+            Some(wait) => wait
+                .cells
+                .iter()
+                .copied()
+                .zip(wait.waypoints.iter().copied())
+                .collect(),
+            None => self
+                .tele_run(ctx, first)
+                .into_iter()
+                .rev()
+                .take(TELE_EXTENSION)
+                .collect(),
+        };
+
+        if ctx.player.on_ground {
+            self.tele = None;
+            let centre = Vec3::new(first.0 as f64 + 0.5, first.1 as f64, first.2 as f64 + 0.5);
+            let to_edge = ((centre.x - ctx.player.pos.x).powi(2)
+                + (centre.z - ctx.player.pos.z).powi(2))
+            .sqrt();
+            if to_edge < TELE_JUMP_WITHIN {
+                println!(
+                    "TRACE tele JUMP to_edge {to_edge:.2} pos {:?} view {:.1}/{:.1}",
+                    ctx.player.pos, ctx.player.y_rot, ctx.player.x_rot
+                );
+                return TeleStep::Jump;
+            }
+            println!(
+                "TRACE tele WALK to_edge {to_edge:.2} pos {:?} view {:.1}/{:.1} keys {:?}",
+                ctx.player.pos, ctx.player.y_rot, ctx.player.x_rot, ctx.player.key_presses
+            );
+            return TeleStep::Walk;
+        }
+
+        // Airborne. The cell order was frozen at the takeoff.
+        if self.tele.is_none() {
+            self.tele = Some(TeleWait {
+                cells: extension.iter().map(|(cell, _)| *cell).collect(),
+                waypoints: extension.iter().map(|(_, i)| *i).collect(),
+                index: 0,
+                ticks: 0,
+                clicked: 0,
+            });
+        }
+        let wait = self.tele.as_mut().expect("just set");
+        wait.ticks += 1;
+        let old_index = wait.index;
+        while wait.index < wait.cells.len() && !place_still_needed(ctx, wait.cells[wait.index]) {
+            wait.index += 1;
+        }
+        // A cell the flight has already carried the walker over, and the
+        // route with it.
+        let advance = (wait.index != old_index || wait.index >= wait.cells.len())
+            .then(|| wait.waypoints[wait.index.saturating_sub(1)]);
+        if wait.index >= wait.cells.len() {
+            // The extension is in; the rest is landing on it and walking on.
+            return TeleStep::Place { aim: None, advance };
+        }
+        let cell = wait.cells[wait.index];
+        let hole = (cell.0, cell.1 - 1, cell.2);
+        // One face at a time, trying the next every five ticks: the fall is
+        // short, so the face is switched sooner than the standing modes do.
+        let targets = path::place_targets(ctx.world, hole);
+        let aim = targets
+            .get((wait.ticks / 5) as usize % targets.len().max(1))
+            .copied();
+        let hit = ctx.crosshair;
+        let on_face = !hit.miss
+            && path::NEIGHBOURS.iter().any(|((dx, dy, dz), face)| {
+                hit.pos == (hole.0 + dx, hole.1 + dy, hole.2 + dz) && hit.direction == *face
+            });
+        if wait.clicked >> wait.index & 1 == 0 && on_face {
+            ctx.click_use();
+            wait.clicked |= 1 << wait.index;
+        }
+        TeleStep::Place { aim, advance }
+    }
+
+    /// Ticks the route past waypoint `i`: the telebridge flight carried the
+    /// walker over it without standing on it.
+    fn advance_route(&mut self, i: usize) {
+        if let Plan::Following {
+            path,
+            next,
+            retarget_in,
+            ..
+        } = &mut self.plan
+        {
+            *next = (*next).max(i + 1).min(path.points.len().saturating_sub(1));
+            *retarget_in = 0;
+        }
+        self.best_distance = f64::MAX;
+        self.stalled_ticks = 0;
+        self.replans = 0;
     }
 
     /// Deals with the closed door at the next waypoint. Returns true while
@@ -784,6 +1234,9 @@ impl Walker {
         distance: f64,
         slow_near: bool,
         force_sprint: bool,
+        // Hold sneak as well: what stops a player walking off an edge, and
+        // what speed bridging presses only at the last moment.
+        sneak: bool,
     ) {
         let pos = ctx.player.pos;
         let near = ((target.x - pos.x).powi(2) + (target.z - pos.z).powi(2)).sqrt();
@@ -834,6 +1287,7 @@ impl Walker {
             forward,
             sprint,
             jump,
+            shift: sneak,
             ..Keys::default()
         });
     }
@@ -877,6 +1331,7 @@ mod tests {
         inventory: crate::inventory::Inventory,
         actions: crate::controller::Actions,
         use_clicks: u32,
+        settings: MouseSettings,
     }
 
     impl Sim {
@@ -908,6 +1363,7 @@ mod tests {
                 inventory: Default::default(),
                 actions: Default::default(),
                 use_clicks: 0,
+                settings: MouseSettings::default(),
             }
         }
 
@@ -1006,7 +1462,7 @@ mod tests {
             self.player.held_keys = self.keys;
             self.tick += 1;
             self.player.tick(&self.world, &self.tags);
-            let settings = MouseSettings::default();
+            let settings = self.settings;
             for _ in 0..3 {
                 self.mouse.set_target(self.aim);
                 let (dx, dy) = self.mouse.frame(
@@ -1479,6 +1935,179 @@ mod tests {
             sim.world.block_state(4, 63, 0),
             Some(dirt),
             "the gap is filled"
+        );
+    }
+
+    /// Speed bridging: the click goes in while the walk carries on, and sneak
+    /// is held only for the last stretch before the edge. The route here is a
+    /// single-cell gap, which is all the planner chains today (a longer bridge
+    /// needs waypoints whose placements build on each other); a walker with
+    /// speed can also clear one cell on momentum, so what this pins is the
+    /// behaviour, not the crossing. The cell before the gap starts at x = 3,
+    /// so sneaking before 3.3 is standing at the far side of it rather than at
+    /// the edge.
+    #[test]
+    fn speed_bridging_places_while_walking() {
+        let mut sim = Sim::new();
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            sim.world.set_block_state(4, 63, z, 0);
+            sim.world.set_block_state(4, 66, z, 1);
+            sim.world.set_block_state(5, 66, z, 1);
+        }
+        sim.inventory.set_slot(&held_block_body(36, item)).unwrap();
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        sim.walker.bridge = Bridge::Speed;
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+
+        let mut ticks = 0;
+        let mut sneaked_at = Vec::new();
+        let mut walked_while_sneaking = 0;
+        let mut clicked_while_sneaking = 0;
+        while !sim.walker.arrived() && !sim.walker.gave_up() && ticks < 2_000 {
+            let before = sim.use_clicks;
+            sim.step();
+            ticks += 1;
+            if sim.keys.shift {
+                sneaked_at.push(sim.player.pos.x);
+                if sim.keys.forward {
+                    walked_while_sneaking += 1;
+                }
+                if sim.use_clicks > before {
+                    clicked_while_sneaking += 1;
+                }
+            }
+        }
+        assert!(
+            !sim.walker.gave_up() && sim.player.pos.x > 5.0 && sim.player.pos.y > 60.0,
+            "did not bridge while walking, at {:?}, after {ticks} ticks",
+            sim.player.pos
+        );
+        assert!(sim.use_clicks > 0, "it placed the block");
+        assert!(!sneaked_at.is_empty(), "it sneaked before the edge");
+        assert!(
+            sneaked_at.iter().all(|x| *x > 3.3),
+            "it sneaked before the gap, at {sneaked_at:?}"
+        );
+        assert!(
+            walked_while_sneaking > 0,
+            "it kept walking while the block went in, which is the whole point"
+        );
+        assert!(
+            clicked_while_sneaking > 0,
+            "the click happened while walking, unlike the stopping mode"
+        );
+    }
+
+    /// The stopping mode is the safe one: it never sneaks, and it never walks
+    /// while it is placing.
+    #[test]
+    fn the_stopping_mode_stands_still_and_never_sneaks() {
+        let mut sim = Sim::new();
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            sim.world.set_block_state(4, 63, z, 0);
+            sim.world.set_block_state(4, 66, z, 1);
+            sim.world.set_block_state(5, 66, z, 1);
+        }
+        sim.inventory.set_slot(&held_block_body(36, item)).unwrap();
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        assert_eq!(sim.walker.bridge, Bridge::Stop, "the default");
+        sim.walker.go_to(Vec3::new(6.5, 64.0, 0.5));
+
+        let mut ticks = 0;
+        let mut sneaks = 0;
+        while !sim.walker.arrived() && !sim.walker.gave_up() && ticks < 2_000 {
+            sim.step();
+            ticks += 1;
+            if sim.keys.shift {
+                sneaks += 1;
+            }
+        }
+        assert!(!sim.walker.gave_up() && sim.player.pos.x > 5.0);
+        assert_eq!(sneaks, 0, "the stopping mode does not sneak");
+    }
+
+    /// A gap wider than one telebridge jump can catch is not leapt into: the
+    /// walker stands at the edge and tries the old way instead, and gives up
+    /// there rather than dropping into the void. Six cells: the extension is
+    /// three, and the fall would land two cells short of it.
+    #[test]
+    fn a_gap_too_wide_to_catch_is_not_jumped() {
+        let mut sim = Sim::new();
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            for x in 4..10 {
+                sim.world.set_block_state(x, 63, z, 0);
+            }
+        }
+        sim.inventory.set_slot(&held_block_body(36, item)).unwrap();
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        sim.walker.bridge = Bridge::Tele;
+        sim.walker.go_to(Vec3::new(12.5, 64.0, 0.5));
+
+        let mut ticks = 0;
+        let mut lowest = 64.0;
+        while !sim.walker.gave_up() && !sim.walker.arrived() && ticks < 2_000 {
+            sim.step();
+            ticks += 1;
+            if sim.player.pos.y < lowest {
+                lowest = sim.player.pos.y;
+            }
+        }
+        assert!(
+            sim.walker.gave_up() && lowest > 63.0,
+            "the walker leapt or fell into a gap it could not catch: \
+             gave up {}, lowest {lowest}, at {:?} after {ticks} ticks",
+            sim.walker.gave_up(),
+            sim.player.pos
+        );
+    }
+
+    /// Telebridging: the walker sprints off the edge and places the
+    /// extension's far cell mid-air, clicked against the ground past the gap.
+    /// The rest of the cascade — each block against the one placed before it,
+    /// and the catch under the fall — is implemented the same way but its
+    /// timing is a hair off in the simulator: the walker places, then lands
+    /// in the gap it was filling, and that edge is what a live server has to
+    /// tune. This test pins the part that works: the walker leaps at the
+    /// edge and its first placement happens while it is airborne.
+    #[test]
+    fn telebridging_places_its_first_block_mid_air() {
+        let mut sim = Sim::new();
+        let item = item_id("minecraft:dirt");
+        for z in -32..48 {
+            for x in 4..7 {
+                sim.world.set_block_state(x, 63, z, 0);
+            }
+        }
+        sim.inventory.set_slot(&held_block_body(36, item)).unwrap();
+        sim.settings.sensitivity = 1.0;
+        sim.walker.place = path::PlacePolicy::for_item(item);
+        sim.walker.bridge = Bridge::Tele;
+        sim.walker.go_to(Vec3::new(7.5, 64.0, 0.5));
+
+        let mut ticks = 0;
+        let mut placed_mid_air = false;
+        while !placed_mid_air && !sim.walker.gave_up() && ticks < 400 {
+            let on_ground = sim.player.on_ground;
+            let before = sim.use_clicks;
+            sim.step();
+            ticks += 1;
+            if sim.use_clicks > before && !on_ground {
+                placed_mid_air = true;
+            }
+        }
+        assert!(
+            placed_mid_air,
+            "no placement happened while the walker was airborne"
+        );
+        let bridged = (4..7)
+            .filter(|x| sim.world.block_state(*x, 63, 0) != Some(0))
+            .count();
+        assert!(
+            bridged >= 1,
+            "the mid-air click did not place a bridge block: {bridged} of 3"
         );
     }
 

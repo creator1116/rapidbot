@@ -346,7 +346,12 @@ fn dig_surface(world: &World, cell: (i32, i32, i32), dig: DigPolicy) -> Option<(
 /// must be free, the cell below them a hole with a block beside it to click,
 /// and the state one that can act as a floor. Returns the surface the player
 /// would stand on once the block is there.
-fn place_surface(world: &World, cell: (i32, i32, i32), place: PlacePolicy) -> Option<f64> {
+fn place_surface(
+    world: &World,
+    cell: (i32, i32, i32),
+    place: PlacePolicy,
+    beside: Option<(i32, i32, i32)>,
+) -> Option<f64> {
     let (x, y, z) = cell;
     if blocks(world, x, y, z) || blocks(world, x, y + 1, z) {
         return None;
@@ -362,11 +367,12 @@ fn place_surface(world: &World, cell: (i32, i32, i32), place: PlacePolicy) -> Op
     if blocks(world, fx, fy, fz) || traits()[floor as usize] & (DANGER | WATER) != 0 {
         return None;
     }
-    // Something beside the hole to click a face of.
-    if !NEIGHBOURS
-        .iter()
-        .any(|((dx, dy, dz), _)| blocks(world, fx + dx, fy + dy, fz + dz))
-    {
+    // Something beside the hole to click a face of: a real block, or one
+    // this search has already placed under the node it stands on — that is
+    // how a bridge longer than one block is planned.
+    if !NEIGHBOURS.iter().any(|((dx, dy, dz), _)| {
+        beside == Some((fx + dx, fy + dy, fz + dz)) || blocks(world, fx + dx, fy + dy, fz + dz)
+    }) {
         return None;
     }
     // The state placed has to be able to act as a floor. Full blocks do; a
@@ -631,9 +637,12 @@ impl Search {
             }
             if !stepped && let Some(place) = self.place {
                 // Fill the hole under the next cell with a block, then step
-                // onto it. Like mining, it costs more than walking.
+                // onto it. Like mining, it costs more than walking. The floor
+                // this node stands on counts as real when the search placed
+                // it, so a bridge chains block by block.
+                let beside = self.nodes[id as usize].place.then_some((x, y - 1, z));
                 for ny in (y - 1..=y + 1).rev() {
-                    let Some(s2) = place_surface(world, (x + dx, ny, z + dz), place) else {
+                    let Some(s2) = place_surface(world, (x + dx, ny, z + dz), place, beside) else {
                         continue;
                     };
                     let d = s2 - s;

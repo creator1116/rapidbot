@@ -6,17 +6,21 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/creator1116/rapidbot"
 
+# Every internal dependency carries a version beside its path: crates.io
+# refuses a publish whose dependencies have no version, and the version is
+# what turns these entries into a publish order (see docs/publishing.md).
 [workspace.dependencies]
-rapidbot-auth = { path = "crates/auth" }
-rapidbot-buf = { path = "crates/buf" }
-rapidbot-client = { path = "crates/client" }
-rapidbot-human = { path = "crates/human" }
-rapidbot-buf-derive = { path = "crates/buf-derive" }
-rapidbot-nbt = { path = "crates/nbt" }
-rapidbot-physics = { path = "crates/physics" }
-rapidbot-protocol = { path = "crates/protocol" }
-rapidbot-world = { path = "crates/world" }
+rapidbot-auth = { path = "crates/auth", version = "0.1.0" }
+rapidbot-buf = { path = "crates/buf", version = "0.1.0" }
+rapidbot-client = { path = "crates/client", version = "0.1.0" }
+rapidbot-human = { path = "crates/human", version = "0.1.0" }
+rapidbot-buf-derive = { path = "crates/buf-derive", version = "0.1.0" }
+rapidbot-nbt = { path = "crates/nbt", version = "0.1.0" }
+rapidbot-physics = { path = "crates/physics", version = "0.1.0" }
+rapidbot-protocol = { path = "crates/protocol", version = "0.1.0" }
+rapidbot-world = { path = "crates/world", version = "0.1.0" }
 
 aes = "0.8"
 aes-gcm = "0.10"

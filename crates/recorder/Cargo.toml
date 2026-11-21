@@ -4,6 +4,9 @@ description = "Records your own mouse and movement-key input while playing Minec
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+# Windows raw-input recorder; not for crates.io.
+publish = false
 
 [dependencies]
 rapidbot-human.workspace = true

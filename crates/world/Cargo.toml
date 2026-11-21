@@ -4,6 +4,10 @@ description = "Block data, chunks and vanilla-exact block collision"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+# Needs the game-derived data (docs/data.md) to build, which cannot
+# ship on crates.io; consumers use the git dependency instead.
+publish = false
 
 # Generated from your own copy of the game, never published: docs/data.md.
 exclude = ["data/", "tests/data/"]

@@ -4,6 +4,7 @@ description = "Minecraft wire types: VarInt, strings, UUIDs and the Encode/Decod
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 rapidbot-buf-derive.workspace = true

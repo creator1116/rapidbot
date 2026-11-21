@@ -5,6 +5,9 @@ description = "Headless Minecraft bots that behave like the vanilla client and t
 license = "MIT"
 repository = "https://github.com/creator1116/rapidbot"
 readme = "README.md"
+# Pulls in rapidbot-client, which needs the game-derived data
+# (docs/data.md) to build; consumers use the git dependency instead.
+publish = false
 # crates.io allows at most five keywords.
 keywords = ["minecraft", "bot", "headless", "client", "automation"]
 categories = ["network-programming", "game-development"]

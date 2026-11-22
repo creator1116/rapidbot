@@ -186,8 +186,18 @@ land.
   fill a hole in the floor on the way: such a waypoint has a block placed
   under it, clicked against the face of a block beside the hole, and the
   click is only made once the crosshair really is on that face. The block
-  has to be the one in hand, in the selected hotbar slot. Bridging out over
-  open air (the sneak-bridge a person does) is not supported yet.
+  has to be the one in hand, in the selected hotbar slot.
+
+  Set `walker.bridge = Bridge::Speed` to cross a hole without stopping:
+  the walker keeps walking and holds sneak only for the last stretch before
+  the edge, so the block goes in at walking speed. The default,
+  `Bridge::Stop`, stands at the edge of each cell instead — slower, and
+  safer. `Bridge::Tele` sprints off the edge and places the gap's far cells
+  mid-air, clicked against the ground past the gap and then each other,
+  while holding forward and sprint — the telly technique. It only leaps
+  when the fall can land on the blocks it places (a gap of at most four
+  cells), and the mid-air catch itself wants tuning against a live server
+  before you trust it over anything deep.
 - `combat::Fighter`: `set_target(Some(entity_id))`, then `tick(ctx)`. It
   approaches, keeps the crosshair on the target, clicks when the attack charge
   is back, and holds a shield up between swings when one is in the main hand

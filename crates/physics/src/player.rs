@@ -258,6 +258,10 @@ pub struct Player {
     /// Bounding boxes of entities that collide with the player (boats,
     /// shulkers, happy ghasts), refreshed from the entity tracker.
     pub entity_colliders: Vec<Aabb>,
+    /// Bounding boxes of living entities, refreshed from the entity tracker:
+    /// what a riptide spin can strike (`Level.getEntities` filtered to
+    /// `LivingEntity`), which is broader than what blocks movement.
+    pub living_entity_boxes: Vec<Aabb>,
 }
 
 impl Player {
@@ -327,6 +331,7 @@ impl Player {
             fast_lava: false,
             world_border: WorldBorder::default(),
             entity_colliders: Vec::new(),
+            living_entity_boxes: Vec::new(),
         }
     }
 
@@ -758,6 +763,7 @@ impl Player {
             tags,
             world_border: self.world_border,
             entity_colliders: self.entity_colliders.clone(),
+            living_entity_boxes: self.living_entity_boxes.clone(),
         };
 
         // A `move(SELF, …)` queued by the input pass, such as the hop a
@@ -1766,6 +1772,9 @@ impl Player {
         }
 
         let mut delta = delta;
+        // `Entity.move` carries the box it started with through to
+        // `checkAutoSpinAttack`, which looks at the swept union.
+        let old_bb = self.bb;
         if self.stuck_speed_multiplier.length_sqr() > 1.0e-7 {
             let m = self.stuck_speed_multiplier;
             delta = delta.multiply(m.x, m.y, m.z);
@@ -1829,8 +1838,34 @@ impl Player {
             );
         }
 
+        // `LivingEntity.checkAutoSpinAttack`, reached from the move: a
+        // riptide spin that sweeps through a living entity ends early and
+        // reverses the movement to −0.2×, so the player bounces off what it
+        // struck. The touch attack itself is the server's to resolve.
+        self.check_auto_spin_attack(old_bb, &ctx.living_entity_boxes);
         let factor = self.block_speed_factor(ctx) as f64;
         self.delta_movement = self.delta_movement.multiply(factor, 1.0, factor);
+    }
+
+    /// `LivingEntity.checkAutoSpinAttack`, the touch part: the swept union of
+    /// the move's old and new boxes against the living entities. The wall-hit
+    /// part runs in the tick's spin section.
+    fn check_auto_spin_attack(&mut self, old_bb: Aabb, living: &[Aabb]) {
+        if self.auto_spin_attack_ticks <= 0 {
+            return;
+        }
+        let swept = Aabb::new(
+            old_bb.min_x.min(self.bb.min_x),
+            old_bb.min_y.min(self.bb.min_y),
+            old_bb.min_z.min(self.bb.min_z),
+            old_bb.max_x.max(self.bb.max_x),
+            old_bb.max_y.max(self.bb.max_y),
+            old_bb.max_z.max(self.bb.max_z),
+        );
+        if living.iter().any(|b| b.intersects_aabb(&swept)) {
+            self.auto_spin_attack_ticks = 0;
+            self.delta_movement = self.delta_movement.scale(-0.2);
+        }
     }
 
     /// `Entity.checkFallDamage`, the fall-distance part.
@@ -2247,6 +2282,7 @@ pub struct Ctx<'a> {
     pub tags: &'a Tags,
     world_border: WorldBorder,
     entity_colliders: Vec<Aabb>,
+    living_entity_boxes: Vec<Aabb>,
 }
 
 impl Ctx<'_> {
@@ -2424,6 +2460,36 @@ fn collect_candidate_step_up_heights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touching_a_living_entity_ends_the_spin_and_reverses_the_movement() {
+        let mut player = Player::new();
+        player.set_pos(Vec3::new(0.0, 64.0, 0.0));
+        player.start_auto_spin_attack(20);
+        player.delta_movement = Vec3::new(0.5, 0.0, 0.0);
+        // A living entity just past where the move will carry the player:
+        // the swept union of the move's boxes reaches into it.
+        let ahead = Aabb::new(1.2, 64.0, -0.3, 2.0, 66.0, 0.3);
+        let old_bb = player.bb;
+        player.set_pos(Vec3::new(1.0, 64.0, 0.0));
+        player.check_auto_spin_attack(old_bb, &[ahead]);
+        assert_eq!(player.auto_spin_attack_ticks, 0);
+        assert_eq!(player.delta_movement, Vec3::new(-0.1, 0.0, 0.0));
+    }
+
+    #[test]
+    fn missing_every_living_entity_keeps_the_spin_running() {
+        let mut player = Player::new();
+        player.set_pos(Vec3::new(0.0, 64.0, 0.0));
+        player.start_auto_spin_attack(20);
+        player.delta_movement = Vec3::new(0.5, 0.0, 0.0);
+        let far = Aabb::new(10.0, 64.0, -0.3, 11.0, 66.0, 0.3);
+        let old_bb = player.bb;
+        player.set_pos(Vec3::new(1.0, 64.0, 0.0));
+        player.check_auto_spin_attack(old_bb, &[far]);
+        assert_eq!(player.auto_spin_attack_ticks, 20);
+        assert_eq!(player.delta_movement, Vec3::new(0.5, 0.0, 0.0));
+    }
 
     #[test]
     fn item_use_scales_input_and_blocks_sprint() {

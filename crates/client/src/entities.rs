@@ -1516,6 +1516,23 @@ impl Entities {
             .collect()
     }
 
+    /// `Level.getEntities(player, box)` filtered to the living ones, for the
+    /// riptide spin's touch check: a spin that sweeps through a living
+    /// entity's box ends early and bounces off it. The boxes are handed to
+    /// the physics tick whole, which narrows them to the swept union. The
+    /// local player is not among the tracked entities, so it is excluded the
+    /// way `getEntities` excludes its source.
+    pub fn living_boxes(&self) -> Vec<Aabb> {
+        self.by_id
+            .values()
+            .filter(|entity| entity.is_living() && entity.health.is_none_or(|h| h > 0.0))
+            .map(|entity| {
+                let (min, max) = entity.bounding_box();
+                Aabb::new(min[0], min[1], min[2], max[0], max[1], max[2])
+            })
+            .collect()
+    }
+
     /// All currently tracked player entities, independent of tab-list
     /// membership or distance from the local player.
     pub fn players(&self) -> impl Iterator<Item = &Entity> {

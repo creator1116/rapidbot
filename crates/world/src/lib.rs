@@ -15,7 +15,7 @@ pub mod world;
 pub use aabb::{Aabb, Axis};
 pub use border::WorldBorder;
 pub use registry::{AIR, Registry, StateId};
-pub use world::{DimensionHeight, World};
+pub use world::{BiomeWeather, DimensionHeight, World};
 
 /// `BlockPos.asLong` unpacking: 26 bits x, 12 bits y, 26 bits z.
 pub fn unpack_block_pos(packed: i64) -> (i32, i32, i32) {

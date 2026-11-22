@@ -2192,7 +2192,8 @@ impl Player {
         main
     }
 
-    fn block_position(&self) -> (i32, i32, i32) {
+    /// `Entity.blockPosition`: the position as a block coordinate.
+    pub fn block_position(&self) -> (i32, i32, i32) {
         (
             math::floor(self.pos.x),
             math::floor(self.pos.y),

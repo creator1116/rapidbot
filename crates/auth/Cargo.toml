@@ -4,6 +4,7 @@ description = "Microsoft account login, Minecraft session join and chat signing 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 aes-gcm.workspace = true

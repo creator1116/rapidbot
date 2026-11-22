@@ -4,6 +4,7 @@ description = "Human input models: mouse movement, reaction times, fatigue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 rand.workspace = true

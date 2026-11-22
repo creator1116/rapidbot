@@ -811,6 +811,7 @@ impl Game {
             } else {
                 play.player.physics.entity_colliders =
                     play.entities.collision_boxes(play.player.physics.pos.y);
+                play.player.physics.living_entity_boxes = play.entities.living_boxes();
                 play.player.physics.tick(&play.world, &play.tags);
             }
             // The end of Player.tick: the attack charge.

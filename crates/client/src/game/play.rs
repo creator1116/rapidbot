@@ -12,7 +12,7 @@ use rapidbot_protocol::packets::play::{
 use rapidbot_protocol::{Packet, RawPacket, State};
 use rapidbot_world::chunk::Chunk;
 use rapidbot_world::tags::Tags;
-use rapidbot_world::{DimensionHeight, Registry, World};
+use rapidbot_world::{BiomeWeather, DimensionHeight, Registry, World};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -185,6 +185,13 @@ impl PlayState {
             .entities
             .set_painting_variants(painting_variant_sizes(session));
         state.inventory.creative = state.game_type == GameType::Creative;
+        // The precipitation half of `ClientLevel`: the biome registry's
+        // climate fields, whether the dimension can have weather at all,
+        // and the level's sea level for the snow line.
+        state.world.biomes = biome_weather(session);
+        state.world.can_have_weather =
+            can_have_weather(session, login.spawn.dimension_type, &state.dimension);
+        state.world.sea_level = login.spawn.sea_level;
         state.start_waiting_for_new_level();
         state
     }
@@ -648,6 +655,11 @@ impl Game {
                     }
                     cb::GameEvent::WIN_GAME => {
                         self.link.emit(crate::BotEvent::WinGame);
+                    }
+                    cb::GameEvent::RAIN_LEVEL_CHANGE => {
+                        // `ClientPacketListener.handleGameEvent`: the level's
+                        // rain level, which `isRainingAt` compares to 0.2.
+                        play.world.rain_level = event.param;
                     }
                     _ => {}
                 }
@@ -1137,6 +1149,10 @@ impl Game {
                 info!(%dimension, keep = respawn.data_to_keep, changed, "respawn");
                 play.player.physics.fast_lava =
                     fast_lava(&self.session, respawn.spawn.dimension_type);
+                play.world.biomes = biome_weather(&self.session);
+                play.world.can_have_weather =
+                    can_have_weather(&self.session, respawn.spawn.dimension_type, &dimension);
+                play.world.sea_level = respawn.spawn.sea_level;
                 self.slot_press = None;
                 self.close_press = None;
                 self.aim = None;
@@ -1369,6 +1385,71 @@ fn fast_lava(session: &SessionData, id: i32) -> bool {
         };
     }
     entry.id.normalized() == "minecraft:the_nether"
+}
+
+/// `Level.canHaveWeather`: the dimension type has skylight, no ceiling, and
+/// the dimension is not the End. From the synced dimension type when the
+/// server sent the entry, else "any dimension but the Nether and the End".
+fn can_have_weather(session: &SessionData, id: i32, dimension: &str) -> bool {
+    if dimension == "minecraft:the_end" {
+        return false;
+    }
+    let entry = session
+        .registries
+        .iter()
+        .filter(|(registry, _)| registry.normalized() == "minecraft:dimension_type")
+        .flat_map(|(_, entries)| entries.iter())
+        .nth(id as usize);
+    let Some(entry) = entry else {
+        return dimension != "minecraft:the_nether";
+    };
+    let Some(rapidbot_nbt::Tag::Compound(c)) = &entry.data else {
+        return false;
+    };
+    let has_skylight = c
+        .get("has_skylight")
+        .and_then(rapidbot_nbt::Tag::as_i64)
+        .is_some_and(|v| v != 0);
+    let has_ceiling = c
+        .get("has_ceiling")
+        .and_then(rapidbot_nbt::Tag::as_i64)
+        .is_some_and(|v| v != 0);
+    has_skylight && !has_ceiling
+}
+
+/// The biome registry's precipitation fields, by biome id: what
+/// `World::is_raining_at` reads out of `Biome.climateSettings`. The registry
+/// order is the biome id order, which is what chunk biome containers index.
+fn biome_weather(session: &SessionData) -> Vec<BiomeWeather> {
+    session
+        .registries
+        .iter()
+        .filter(|(registry, _)| registry.normalized() == "minecraft:worldgen/biome")
+        .flat_map(|(_, entries)| entries.iter())
+        .map(|entry| {
+            let Some(rapidbot_nbt::Tag::Compound(c)) = &entry.data else {
+                return BiomeWeather::default();
+            };
+            BiomeWeather {
+                has_precipitation: c
+                    .get("has_precipitation")
+                    .and_then(rapidbot_nbt::Tag::as_i64)
+                    .is_some_and(|v| v != 0),
+                temperature: c
+                    .get("temperature")
+                    .and_then(|tag| match tag {
+                        rapidbot_nbt::Tag::Float(v) => Some(*v),
+                        rapidbot_nbt::Tag::Double(v) => Some(*v as f32),
+                        _ => None,
+                    })
+                    .unwrap_or(0.5),
+                frozen: c
+                    .get("temperature_modifier")
+                    .and_then(rapidbot_nbt::Tag::as_str)
+                    .is_some_and(|v| v == "frozen"),
+            }
+        })
+        .collect()
 }
 
 /// Height range of the dimension type with registry ID `id`: from the

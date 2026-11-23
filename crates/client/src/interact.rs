@@ -671,10 +671,12 @@ impl GameMode {
     }
 
     /// The client half of `TridentItem.releaseUsing`: a riptide trident held
-    /// for at least ten ticks, in water, with the player not riding, launches
-    /// them and starts the spin. The client predicts this rather than waiting
-    /// for the server's `SetEntityMotion`. Rain would count too, but
-    /// `isRainingAt` needs biome precipitation, which is not tracked.
+    /// for at least ten ticks, in water or under rain reaching the position,
+    /// with the player not riding, launches them and starts the spin. The
+    /// client predicts this rather than waiting for the server's
+    /// `SetEntityMotion`. The rain half is `World::is_raining_at`, which
+    /// reads the level's rain level, the biome registry's climate fields and
+    /// the sky above the position.
     fn release_item(h: &mut Hands<'_>) {
         let stack = if h.player.using_item_offhand {
             h.inventory.offhand()
@@ -684,7 +686,9 @@ impl GameMode {
         let Some(strength) = stack.and_then(|stack| riptide_strength(stack, h.riptide)) else {
             return;
         };
-        if !h.player.in_water || h.riding || h.player.use_ticks_held() < 10 {
+        let in_water_or_rain =
+            h.player.in_water || h.world.is_raining_at(h.player.block_position());
+        if !in_water_or_rain || h.riding || h.player.use_ticks_held() < 10 {
             return;
         }
         h.player

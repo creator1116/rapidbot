@@ -156,27 +156,12 @@ fn read_longs_for(buf: &mut &[u8], bits: u32, entries: usize) -> Result<Vec<u64>
         .collect())
 }
 
-/// Skips a biome container (`Strategy.createForBiomes`, 64 entries).
-fn skip_biomes(buf: &mut &[u8], global_bits: u32) -> Result<(), DecodeError> {
-    let bits = u8::decode(buf)? as u32;
-    match bits {
-        0 => {
-            VarInt::decode(buf)?;
-        }
-        1..=3 => {
-            read_palette(buf)?;
-            read_longs_for(buf, bits, 64)?;
-        }
-        _ => {
-            read_longs_for(buf, global_bits, 64)?;
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub struct Section {
     states: Container,
+    /// Biome ids of the section's 4×4×4 `QuartPos` cells, in the same
+    /// palette-and-packed-longs format as the block states.
+    biomes: Container,
 }
 
 impl Section {
@@ -186,6 +171,13 @@ impl Section {
 
     pub fn set(&mut self, x: usize, y: usize, z: usize, state: StateId) {
         self.states.set((y << 4 | z) << 4 | x, state);
+    }
+
+    /// `Level.getBiome`: the biome cell of a block position, as the worldgen
+    /// registry index the chunk's global palette refers to. Each axis is
+    /// quartered inside the section, packed y, z, x like vanilla's index.
+    pub fn biome_at(&self, x: usize, y: usize, z: usize) -> u32 {
+        self.biomes.get(((y & 3) << 4) | ((z & 3) << 2) | (x & 3))
     }
 }
 
@@ -212,6 +204,7 @@ impl Chunk {
             sections: (0..sections)
                 .map(|_| Section {
                     states: Container::Single(AIR),
+                    biomes: Container::Single(0),
                 })
                 .collect(),
             block_entities: HashMap::new(),
@@ -233,8 +226,10 @@ impl Chunk {
             let _non_empty = i16::decode(&mut buf)?;
             let _fluids = i16::decode(&mut buf)?;
             let states = Container::read_block_states(&mut buf, state_bits, state_count)?;
-            skip_biomes(&mut buf, biome_bits)?;
-            sections.push(Section { states });
+            // The biome containers share the block containers' palette and
+            // packed-longs format over their 64 cells.
+            let biomes = Container::read_block_states(&mut buf, biome_bits, biome_count)?;
+            sections.push(Section { states, biomes });
         }
         Ok(Chunk {
             sections,

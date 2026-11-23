@@ -55,6 +55,39 @@ pub struct World {
     revision: u64,
     /// This world's identity, unique among the worlds of one process.
     generation: u64,
+    /// The level's rain level, set by the `rain_level` game event. Vanilla
+    /// also lerps it for rendering, which a headless client does not do.
+    pub rain_level: f32,
+    /// `Level.canHaveWeather`: the dimension type has skylight, no ceiling,
+    /// and the dimension is not the End. Without weather `isRainingAt` is
+    /// always false, whatever the rain level says.
+    pub can_have_weather: bool,
+    /// The level's sea level, from the spawn packet; it anchors the snow
+    /// line in `Biome.coldEnoughToSnow`.
+    pub sea_level: i32,
+    /// The biome registry's precipitation fields, by biome id.
+    pub biomes: Vec<BiomeWeather>,
+}
+
+/// The precipitation fields of one biome, as `Biome.climateSettings` and the
+/// frozen temperature modifier read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BiomeWeather {
+    pub has_precipitation: bool,
+    pub temperature: f32,
+    pub frozen: bool,
+}
+
+impl Default for BiomeWeather {
+    /// The conservative read of an unknown biome: no precipitation, so the
+    /// rain check fails and nothing rides on the missing data.
+    fn default() -> Self {
+        Self {
+            has_precipitation: false,
+            temperature: 0.5,
+            frozen: false,
+        }
+    }
 }
 
 /// One loaded chunk and the revision of its contents.
@@ -71,6 +104,10 @@ impl World {
             chunks: HashMap::new(),
             revision: 0,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            rain_level: 0.0,
+            can_have_weather: true,
+            sea_level: 63,
+            biomes: Vec::new(),
         }
     }
 
@@ -226,6 +263,77 @@ impl World {
         self.block_state(x, y, z).unwrap_or(AIR)
     }
 
+    /// `Level.getBiome`: the biome id at the block position, or `None` when
+    /// the chunk is not loaded.
+    pub fn biome_at(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let chunk = &self.chunks.get(&(x >> 4, z >> 4))?.chunk;
+        if y < self.height.min_y || y > self.height.max_y() {
+            return None;
+        }
+        let section = ((y - self.height.min_y) >> 4) as usize;
+        let s = chunk.sections.get(section)?;
+        Some(s.biome_at((x & 15) as usize, (y & 15) as usize, (z & 15) as usize))
+    }
+
+    /// `Level.isRainingAt`: weather is possible here, the level is raining,
+    /// the sky reaches the position, and the biome is warm enough for rain
+    /// rather than snow.
+    pub fn is_raining_at(&self, pos: (i32, i32, i32)) -> bool {
+        if !(self.can_have_weather && self.rain_level > 0.2) {
+            return false;
+        }
+        if !self.sky_visible(pos) {
+            return false;
+        }
+        let Some(id) = self.biome_at(pos.0, pos.1, pos.2) else {
+            return false;
+        };
+        let Some(weather) = self.biomes.get(id as usize) else {
+            return false;
+        };
+        // `Biome.getPrecipitationAt`: a biome with precipitation, warm
+        // enough for rain rather than snow.
+        weather.has_precipitation && !self.cold_enough_to_snow(weather, pos)
+    }
+
+    /// The two sky checks of `Level.precipitationAt` in one column scan:
+    /// `canSeeSky` and the `MOTION_BLOCKING` heightmap both fail exactly
+    /// when something at or above the position blocks motion or is a fluid.
+    /// Vanilla reads a stored heightmap and the sky-light engine; the light
+    /// engine is not modelled, and for real blocks nothing passes skylight
+    /// without also passing this scan.
+    fn sky_visible(&self, pos: (i32, i32, i32)) -> bool {
+        for y in pos.1..=self.height.max_y() {
+            let Some(state) = self.block_state(pos.0, y, pos.2) else {
+                continue;
+            };
+            if blocks_motion_or_fluid(state) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `Biome.coldEnoughToSnow`: the temperature falling below 0.15, with
+    /// the height adjustment above `seaLevel + 17` dropping it further.
+    /// Vanilla also subtracts a temperature-noise term there, and its frozen
+    /// temperature modifier decides ice patches against open water with two
+    /// more noise fields; both are worldgen noise this client does not
+    /// model, so a frozen biome is treated as snowing — the conservative
+    /// direction, where the riptide waits for the server instead of
+    /// predicting a launch the server would not make.
+    fn cold_enough_to_snow(&self, weather: &BiomeWeather, pos: (i32, i32, i32)) -> bool {
+        if weather.frozen {
+            return true;
+        }
+        let mut temperature = weather.temperature;
+        let snow_level = self.sea_level + 17;
+        if pos.1 > snow_level {
+            temperature -= (pos.1 - snow_level) as f32 * 0.05 / 40.0;
+        }
+        temperature < 0.15
+    }
+
     pub fn set_block_state(&mut self, x: i32, y: i32, z: i32, state: StateId) {
         if y < self.height.min_y || y > self.height.max_y() {
             return;
@@ -278,6 +386,13 @@ impl World {
             entry.revision = self.revision;
         }
     }
+}
+
+/// The `MOTION_BLOCKING` heightmap's test: a state counts when its collision
+/// shape is not empty or its fluid is not empty.
+fn blocks_motion_or_fluid(state: StateId) -> bool {
+    let registry = Registry::get();
+    registry.collision_shape(state).is_some() || !registry.state(state).fluid.is_empty()
 }
 
 /// `BlockBehaviour.shouldChangedStateKeepBlockEntity` overrides in 26.3:
@@ -336,6 +451,75 @@ mod tests {
             "minecraft:copper_chest",
             "minecraft:stone"
         ));
+    }
+
+    /// One chunk under an open sky, raining, whose only biome is a warm one
+    /// with precipitation — the shape the riptide's rain check needs.
+    fn raining_world() -> World {
+        let mut world = World::new(DimensionHeight::OVERWORLD);
+        world.insert_chunk(0, 0, Chunk::empty(24));
+        world.rain_level = 1.0;
+        world.biomes = vec![BiomeWeather {
+            has_precipitation: true,
+            temperature: 0.8,
+            frozen: false,
+        }];
+        world
+    }
+
+    #[test]
+    fn rain_reaches_an_open_sky_block_in_a_warm_biome() {
+        let world = raining_world();
+        assert!(world.is_raining_at((1, 70, 1)));
+    }
+
+    #[test]
+    fn rain_needs_the_rain_level_above_vanillas_threshold() {
+        let mut world = raining_world();
+        world.rain_level = 0.2;
+        assert!(!world.is_raining_at((1, 70, 1)));
+        world.rain_level = 0.21;
+        assert!(world.is_raining_at((1, 70, 1)));
+    }
+
+    #[test]
+    fn dimensions_without_weather_never_rain() {
+        let mut world = raining_world();
+        world.can_have_weather = false;
+        assert!(!world.is_raining_at((1, 70, 1)));
+    }
+
+    #[test]
+    fn rain_stops_under_a_roof() {
+        let mut world = raining_world();
+        world.set_block_state(1, 72, 1, states_of("minecraft:stone")[0]);
+        assert!(!world.is_raining_at((1, 70, 1)));
+    }
+
+    /// The `MOTION_BLOCKING` heightmap counts a fluid at the position itself,
+    /// so standing in ankle-deep water is not rain either.
+    #[test]
+    fn water_at_the_position_blocks_rain_like_the_heightmap() {
+        let mut world = raining_world();
+        world.set_block_state(1, 70, 1, states_of("minecraft:water")[0]);
+        assert!(!world.is_raining_at((1, 70, 1)));
+    }
+
+    #[test]
+    fn a_snowy_biome_is_not_rain() {
+        let mut world = raining_world();
+        world.biomes[0].temperature = 0.05;
+        assert!(!world.is_raining_at((1, 70, 1)));
+    }
+
+    /// The frozen temperature modifier's ice-patch noise is not modelled;
+    /// treating it as snowing keeps the riptide from predicting a launch the
+    /// server would refuse.
+    #[test]
+    fn a_frozen_biome_is_treated_as_snowing() {
+        let mut world = raining_world();
+        world.biomes[0].frozen = true;
+        assert!(!world.is_raining_at((1, 70, 1)));
     }
 
     #[test]

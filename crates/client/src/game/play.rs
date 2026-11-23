@@ -4,6 +4,7 @@ use rand::Rng;
 use rapidbot_auth::ChatKeys;
 use rapidbot_buf::{ByteArray, Decode, Identifier, VarInt};
 use rapidbot_physics::attributes::Operation;
+use rapidbot_physics::boat::{Boat, BoatInput};
 use rapidbot_physics::math::Vec3;
 use rapidbot_protocol::ids::play::clientbound as ids;
 use rapidbot_protocol::packets::play::{
@@ -59,6 +60,10 @@ pub(super) struct PlayState {
     pub game_type: GameType,
     pub world: World,
     pub entities: crate::entities::Entities,
+    /// `AbstractBoat` the local player controls: when the server says the
+    /// vehicle is locally authoritative and we are its first passenger, the
+    /// client simulates it (`isLocalInstanceAuthoritative`).
+    pub boat: Option<Boat>,
     /// The server's tags (the client uses these, not its built-in ones).
     pub tags: Tags,
     /// Size of `minecraft:worldgen/biome`, which fixes the width of global
@@ -158,6 +163,7 @@ impl PlayState {
             player,
             game_type: login.spawn.game_type,
             world: World::new(height),
+            boat: None,
             entities: Default::default(),
             tags,
             biome_count: registry_len(session, "minecraft:worldgen/biome"),
@@ -276,6 +282,50 @@ impl PlayState {
             public_key: ByteArray(keys.public_key_der),
             key_signature: ByteArray(keys.signature_v2),
         });
+    }
+
+    /// `AbstractBoat.tick` on the authoritative client, plus
+    /// `LocalPlayer.rideTick`: the boat the local player controls is
+    /// simulated here, its tracked entity follows the client's simulation so
+    /// the rider's seat and `serverbound_vehicle` agree with it, and the
+    /// paddle states go out every tick as the vanilla boat's client branch
+    /// does. `net` is passed in because the game loop owns the sender.
+    pub(super) fn tick_boat(&mut self, net: &PacketSender) {
+        let Some(id) = self.player.riding_vehicle() else {
+            self.boat = None;
+            return;
+        };
+        if !self.player.vehicle_authoritative() {
+            // A server-driven vehicle keeps its mirrored position.
+            self.boat = None;
+            return;
+        }
+        let Some(entity) = self.entities.get(id) else {
+            self.boat = None;
+            return;
+        };
+        if !entity.info().is("AbstractBoat") {
+            self.boat = None;
+            return;
+        }
+        let boat = self.boat.get_or_insert_with(|| Boat::new(entity.pos));
+        // `LocalPlayer.rideTick`: the movement keys are the paddle input.
+        let keys = &self.player.physics.held_keys;
+        boat.input = BoatInput {
+            left: keys.left,
+            right: keys.right,
+            up: keys.forward,
+            down: keys.backward,
+        };
+        // The status, the float, the control, and the move.
+        let colliders = self.entities.collision_boxes(boat.pos.y);
+        let (left, right) = boat.tick(&self.world, Registry::get(), &colliders);
+        net.send(&sb::PaddleBoat { left, right });
+        // The tracked vehicle follows the client's simulation: the player's
+        // seat and the `MoveVehicle` echo then describe the same state.
+        self.entities
+            .snap_vehicle(id, boat.pos, boat.y_rot, 0.0, boat.on_ground);
+        self.player.sync_vehicle(&self.entities);
     }
 
     /// `startWaitingForNewLevel` → `LevelLoadTracker.startClientLoad`.
@@ -912,9 +962,25 @@ impl Game {
                     && play
                         .player
                         .snap_vehicle(&mut play.entities, motion.moving_to)
-                    && let Some(echo) = play.player.serverbound_vehicle()
                 {
-                    self.net.send(&echo);
+                    // `Entity.recordMovement` →
+                    // `InterpolationHandler.applyPredictedMovement`: vanilla
+                    // advances its interpolation baseline by the client's own
+                    // moves and lets the server's packet re-target it. A
+                    // headless client has no render interpolation, so a
+                    // correction lands directly: the simulated boat takes the
+                    // server's position and yaw and goes on from there.
+                    let pos = Vec3::new(
+                        motion.moving_to.position.x,
+                        motion.moving_to.position.y,
+                        motion.moving_to.position.z,
+                    );
+                    if let Some(boat) = &mut play.boat {
+                        boat.set_corrected(pos, motion.moving_to.y_rot);
+                    }
+                    if let Some(echo) = play.player.serverbound_vehicle() {
+                        self.net.send(&echo);
+                    }
                 }
             }
             cb::Explode::ID => {

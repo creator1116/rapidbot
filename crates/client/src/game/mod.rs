@@ -808,6 +808,9 @@ impl Game {
                 // LocalPlayer.aiStep still advances KeyboardInput while the
                 // vehicle position itself remains server-driven.
                 play.player.physics.tick_riding_input();
+                // An authoritative boat is simulated by this client
+                // (AbstractBoat.tick) and reports its paddles every tick.
+                play.tick_boat(&self.net);
             } else {
                 play.player.physics.entity_colliders =
                     play.entities.collision_boxes(play.player.physics.pos.y);

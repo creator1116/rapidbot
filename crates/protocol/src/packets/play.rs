@@ -772,6 +772,15 @@ pub mod serverbound {
     }
     packet!(MoveVehicle, play, serverbound, MOVE_VEHICLE);
 
+    /// `ServerboundPaddleBoatPacket`: the paddle states the authoritative
+    /// client reports with the boat's tick.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+    pub struct PaddleBoat {
+        pub left: bool,
+        pub right: bool,
+    }
+    packet!(PaddleBoat, play, serverbound, PADDLE_BOAT);
+
     /// `ServerboundMovePlayerPacket.StatusOnly`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
     pub struct MovePlayerStatusOnly {

@@ -101,6 +101,15 @@ impl Boat {
         self.bb = Self::box_at(pos);
     }
 
+    /// A server correction (`ClientboundMoveVehiclePacket`): the position and
+    /// yaw are the server's from here on; the movement is left as the caller
+    /// left it, matching `Entity.absMoveTo`, which does not touch
+    /// `deltaMovement`.
+    pub fn set_corrected(&mut self, pos: Vec3, y_rot: f32) {
+        self.set_pos(pos);
+        self.y_rot = y_rot;
+    }
+
     /// The paddle states the tick ended with: what the ride loop reports
     /// with `ServerboundPaddleBoatPacket`.
     pub fn paddle_state(&self, side: usize) -> bool {

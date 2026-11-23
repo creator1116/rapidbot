@@ -91,6 +91,23 @@ impl Shape {
         self.is_full(x, y, z)
     }
 
+    /// The axis-aligned bounds of the shape's filled cells: the box form of
+    /// `Shapes.getBoundingBox`, for whole-shape overlap tests such as the
+    /// boat's ground-friction scan.
+    pub fn bounds(&self) -> Aabb {
+        if self.first_full[0] == usize::MAX {
+            return Aabb::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        Aabb::new(
+            self.coords[0][self.first_full[0]],
+            self.coords[1][self.first_full[1]],
+            self.coords[2][self.first_full[2]],
+            self.coords[0][self.last_full[0] + 1],
+            self.coords[1][self.last_full[1] + 1],
+            self.coords[2][self.last_full[2] + 1],
+        )
+    }
+
     /// `Block.isFaceFull(shape, direction)`: the shape's face slice is the
     /// full unit square. Slices are always a full cell thick, so only the
     /// two perpendicular axes need to be checked.

@@ -2349,7 +2349,7 @@ fn java_min_f32(a: f32, b: f32) -> f32 {
 }
 
 /// `Entity.collideWithShapes`.
-fn collide_with_shapes(
+pub(crate) fn collide_with_shapes(
     movement: Vec3,
     bbox: &Aabb,
     shapes: &[PlacedShape<'_>],

@@ -177,6 +177,13 @@ impl LocalPlayer {
         self.riding
     }
 
+    /// Whether this client simulates the vehicle it rides: the server told
+    /// us the vehicle is locally authoritative and we are the controlling
+    /// (first) passenger, which is `Entity.isLocalInstanceAuthoritative()`.
+    pub fn vehicle_authoritative(&self) -> bool {
+        self.vehicle.as_ref().is_some_and(|v| v.authoritative)
+    }
+
     /// The last health value the server reported for this player.
     /// `None` means the server hasn't sent a health update yet.
     pub fn health(&self) -> Option<f32> {

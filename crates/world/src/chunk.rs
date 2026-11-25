@@ -10,6 +10,9 @@ use crate::registry::{AIR, StateId};
 /// Blocks per section.
 const SECTION_VOLUME: usize = 4096;
 
+/// Biome cells per section: the 4×4×4 quart grid.
+const BIOME_CELLS: usize = 64;
+
 /// `Mth.ceillog2`.
 fn ceillog2(n: usize) -> u32 {
     if n <= 1 {
@@ -66,11 +69,19 @@ impl Container {
         }
     }
 
-    /// `PalettedContainer.read` with the block-state `Strategy`.
-    fn read_block_states(
+    /// `PalettedContainer.read` for one container kind. `entries` is the
+    /// container's cell count (4096 block states, 64 biome cells) and
+    /// `min_palette_bits`/`max_palette_bits` are the strategy's palette
+    /// bounds (`Strategy.createForBlockStates`: linear 4 bits, hash-map up
+    /// to 8, global from 9; `createForBiomes`: linear 1-3 bits at their
+    /// literal width, global from 4).
+    fn read_container(
         buf: &mut &[u8],
         global_bits: u32,
         state_count: usize,
+        entries: usize,
+        min_palette_bits: u32,
+        max_palette_bits: u32,
     ) -> Result<Self, DecodeError> {
         let bits = u8::decode(buf)? as u32;
         match bits {
@@ -79,11 +90,11 @@ impl Container {
                 // ZeroBitStorage: no longs follow.
                 Ok(Container::Single(value))
             }
-            // 1-4 bits all use a 4-bit linear palette; 5-8 a hash-map palette.
-            1..=8 => {
-                let storage_bits = if bits <= 4 { 4 } else { bits };
+            // Linear (1-4 bits) and hash-map (5-8 bits) palettes.
+            1..=8 if bits <= max_palette_bits => {
+                let storage_bits = bits.max(min_palette_bits);
                 let palette = read_palette(buf)?;
-                let data = read_longs(buf, storage_bits)?;
+                let data = read_longs_for(buf, storage_bits, entries)?;
                 Ok(Container::Packed {
                     palette: Some(palette),
                     bits: storage_bits,
@@ -92,8 +103,8 @@ impl Container {
             }
             // Global palette: stored at the in-memory width of the registry.
             _ => {
-                let data = read_longs(buf, global_bits)?;
-                validate_global_states(&data, global_bits, state_count)?;
+                let data = read_longs_for(buf, global_bits, entries)?;
+                validate_global_states(&data, global_bits, state_count, entries)?;
                 Ok(Container::Packed {
                     palette: None,
                     bits: global_bits,
@@ -104,7 +115,12 @@ impl Container {
     }
 }
 
-fn validate_global_states(data: &[u64], bits: u32, state_count: usize) -> Result<(), DecodeError> {
+fn validate_global_states(
+    data: &[u64],
+    bits: u32,
+    state_count: usize,
+    entries: usize,
+) -> Result<(), DecodeError> {
     if bits == 0 || bits > 64 {
         return Err(DecodeError::Custom(
             "invalid global block state bit width".into(),
@@ -112,7 +128,7 @@ fn validate_global_states(data: &[u64], bits: u32, state_count: usize) -> Result
     }
     let per_long = (64 / bits) as usize;
     let mask = u64::MAX >> (64 - bits);
-    for index in 0..SECTION_VOLUME {
+    for index in 0..entries {
         let word = data[index / per_long];
         let shift = (index % per_long) as u32 * bits;
         let raw = (word >> shift) & mask;
@@ -136,11 +152,9 @@ fn read_palette(buf: &mut &[u8]) -> Result<Vec<StateId>, DecodeError> {
         .collect()
 }
 
-/// `readFixedSizeLongArray` sized for `SimpleBitStorage(bits, 4096)`.
-fn read_longs(buf: &mut &[u8], bits: u32) -> Result<Vec<u64>, DecodeError> {
-    read_longs_for(buf, bits, SECTION_VOLUME)
-}
-
+/// `readFixedSizeLongArray` sized for `SimpleBitStorage(bits, entries)`:
+/// values never straddle two longs, so the count is
+/// `entries.div_ceil(64 / bits)`.
 fn read_longs_for(buf: &mut &[u8], bits: u32, entries: usize) -> Result<Vec<u64>, DecodeError> {
     if bits == 0 {
         return Ok(Vec::new());
@@ -225,10 +239,13 @@ impl Chunk {
         while !buf.is_empty() {
             let _non_empty = i16::decode(&mut buf)?;
             let _fluids = i16::decode(&mut buf)?;
-            let states = Container::read_block_states(&mut buf, state_bits, state_count)?;
+            let states =
+                Container::read_container(&mut buf, state_bits, state_count, SECTION_VOLUME, 4, 8)?;
             // The biome containers share the block containers' palette and
-            // packed-longs format over their 64 cells.
-            let biomes = Container::read_block_states(&mut buf, biome_bits, biome_count)?;
+            // packed-longs format, but over 64 quart cells and with the
+            // biome strategy's own palette bounds.
+            let biomes =
+                Container::read_container(&mut buf, biome_bits, biome_count, BIOME_CELLS, 1, 3)?;
             sections.push(Section { states, biomes });
         }
         Ok(Chunk {
@@ -427,6 +444,86 @@ mod tests {
             assert!(
                 matches!(read(invalid_index, 17), Err(DecodeError::Custom(_))),
                 "invalid state ID in packed slot {invalid_index} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn biome_linear_palettes_keep_literal_width() {
+        // `Strategy.createForBiomes` keeps 1-3 bit linear palettes at their
+        // literal width (no 4-bit floor) over the 64 quart cells. Two
+        // sections back to back prove the long count stays at the cells,
+        // so the next section does not misalign.
+        let section = |bits: u32| {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&[0, 0]); // blocks: single value
+            buf.push(bits as u8); // biome linear palette
+            buf.extend_from_slice(&[2, 1, 2]);
+            let per_long = (64 / bits) as usize;
+            let longs = BIOME_CELLS.div_ceil(per_long);
+            for word_index in 0..longs {
+                let mut word = 0u64;
+                for slot in 0..per_long {
+                    let cell = word_index * per_long + slot;
+                    if cell >= BIOME_CELLS {
+                        break;
+                    }
+                    // Raw 0 maps to palette entry 1, raw 1 to entry 2.
+                    let value = u64::from(cell >= BIOME_CELLS / 2);
+                    word |= value << (slot as u32 * bits);
+                }
+                buf.extend_from_slice(&word.to_be_bytes());
+            }
+            buf
+        };
+
+        for bits in [1u32, 2, 3] {
+            let mut buf = section(bits);
+            buf.extend_from_slice(&section(bits));
+            let chunk = Chunk::read_sections(&buf, 35723, 67).unwrap();
+            assert_eq!(chunk.sections.len(), 2, "bits {bits}");
+            for section in &chunk.sections {
+                assert_eq!(section.biome_at(0, 0, 0), 1, "bits {bits}");
+                assert_eq!(
+                    section.biome_at(0, 2, 0),
+                    2,
+                    "bits {bits}: cell 32 carries the palette's second value"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn biome_global_palette_uses_registry_width() {
+        // 4+ distinct biomes go global at ceillog2(67) = 7 bits over
+        // ceil(64 / 9) = 8 longs; ids outside the registry are rejected.
+        let read = |biome_id: u64| {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&0i16.to_be_bytes());
+            buf.extend_from_slice(&[0, 0]); // blocks: single value
+            buf.push(7); // biome global palette
+            let per_long = (64 / 7) as usize;
+            let longs = BIOME_CELLS.div_ceil(per_long);
+            for word_index in 0..longs {
+                let word = if word_index == 17 / per_long {
+                    biome_id << (((17 % per_long) as u32) * 7)
+                } else {
+                    0
+                };
+                buf.extend_from_slice(&word.to_be_bytes());
+            }
+            Chunk::read_sections(&buf, 35723, 67)
+        };
+
+        // Cell 17 is (x, y, z) = (1, 1, 0).
+        assert_eq!(read(66).unwrap().sections[0].biome_at(1, 1, 0), 66);
+        for invalid in [67u64, 100] {
+            assert!(
+                matches!(read(invalid), Err(DecodeError::Custom(_))),
+                "biome ID {invalid} outside the 67-entry registry was accepted"
             );
         }
     }

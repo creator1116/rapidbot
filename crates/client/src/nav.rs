@@ -128,7 +128,17 @@ const SPEED_BRIDGE_SNEAK_WITHIN: f64 = 1.1;
 /// turning the view around to place the first block; the forward key is let
 /// go only once the extension is in, and the full sprint arc carries the
 /// walker onto the last block of the extension.
-const TELE_JUMP_WITHIN: f64 = 2.5;
+const TELE_JUMP_WITHIN: f64 = 1.5;
+
+/// How far from the edge the telebridge approach starts aiming its view at
+/// the catch face, so the crosshair is on it when the flight begins.
+const TELE_AIM_WITHIN: f64 = 5.0;
+
+/// How far ahead of the bot the telebridge look-down holds the view, on the
+/// ground and through the flight: steep enough that the crosshair sweeps
+/// the catch face early, level enough that the ray crosses it instead of
+/// diving into the hole.
+const TELE_LOOK_AHEAD: f64 = 2.5;
 
 /// Telebridging: how many blocks one jump extends the bridge by.
 const TELE_EXTENSION: usize = 3;
@@ -938,16 +948,27 @@ impl Walker {
                 + (centre.z - ctx.player.pos.z).powi(2))
             .sqrt();
             if to_edge < TELE_JUMP_WITHIN {
-                println!(
-                    "TRACE tele JUMP to_edge {to_edge:.2} pos {:?} view {:.1}/{:.1}",
-                    ctx.player.pos, ctx.player.y_rot, ctx.player.x_rot
-                );
                 return TeleStep::Jump;
             }
-            println!(
-                "TRACE tele WALK to_edge {to_edge:.2} pos {:?} view {:.1}/{:.1} keys {:?}",
-                ctx.player.pos, ctx.player.y_rot, ctx.player.x_rot, ctx.player.key_presses
-            );
+            // Pre-aim, the telly look-down: walk the approach holding the
+            // view on the walkway a couple of blocks ahead, so the crosshair
+            // is already steep when the flight begins and sweeps across the
+            // catch face while the bot is still above the hole. From a level
+            // view the face is only met after the fall has carried the bot
+            // into the cell it is filling — where vanilla refuses the
+            // placement.
+            if to_edge < TELE_AIM_WITHIN {
+                let ahead = TELE_LOOK_AHEAD * (centre.x - ctx.player.pos.x).signum();
+                let look = Vec3::new(
+                    ctx.player.pos.x + ahead,
+                    first.1 as f64 - 0.5,
+                    ctx.player.pos.z,
+                );
+                return TeleStep::Place {
+                    aim: Some(look),
+                    advance: None,
+                };
+            }
             return TeleStep::Walk;
         }
 
@@ -977,12 +998,18 @@ impl Walker {
         }
         let cell = wait.cells[wait.index];
         let hole = (cell.0, cell.1 - 1, cell.2);
-        // One face at a time, trying the next every five ticks: the fall is
-        // short, so the face is switched sooner than the standing modes do.
-        let targets = path::place_targets(ctx.world, hole);
-        let aim = targets
-            .get((wait.ticks / 5) as usize % targets.len().max(1))
-            .copied();
+        // The telly look-down continues through the flight: the same point
+        // the approach held the view on, recomputed as the bot advances. The
+        // crosshair then sweeps across the catch face while the bot is still
+        // above the hole it is filling; aiming at the face itself from a
+        // level view only meets it after the fall has carried the box into
+        // the cell, where vanilla refuses the placement.
+        let aim = {
+            let dir = (cell.0 as f64 + 0.5 - ctx.player.pos.x)
+                .signum()
+                .mul_add(TELE_LOOK_AHEAD, ctx.player.pos.x);
+            Vec3::new(dir, hole.1 as f64 + 0.5, ctx.player.pos.z)
+        };
         let hit = ctx.crosshair;
         let on_face = !hit.miss
             && path::NEIGHBOURS.iter().any(|((dx, dy, dz), face)| {
@@ -992,7 +1019,10 @@ impl Walker {
             ctx.click_use();
             wait.clicked |= 1 << wait.index;
         }
-        TeleStep::Place { aim, advance }
+        TeleStep::Place {
+            aim: Some(aim),
+            advance,
+        }
     }
 
     /// Ticks the route past waypoint `i`: the telebridge flight carried the
